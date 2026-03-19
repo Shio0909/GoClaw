@@ -3,6 +3,10 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"strings"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
@@ -16,9 +20,27 @@ import (
 	"github.com/goclaw/goclaw/tools"
 )
 
+// loggingTransport 记录 HTTP 请求体大小
+type loggingTransport struct {
+	base http.RoundTripper
+}
+
+func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if req.Body != nil {
+		body, err := io.ReadAll(req.Body)
+		if err != nil {
+			return nil, err
+		}
+		log.Printf("[HTTP] %s %s — 请求体 %d 字节 (%.1f KB)", req.Method, req.URL.Path, len(body), float64(len(body))/1024)
+		req.Body = io.NopCloser(strings.NewReader(string(body)))
+		req.ContentLength = int64(len(body))
+	}
+	return t.base.RoundTrip(req)
+}
+
 // Config Agent 配置
 type Config struct {
-	Provider string // "openai" 或 "claude"
+	Provider string // "openai", "claude", "mimo", ...
 	APIKey   string
 	BaseURL  string
 	Model    string
@@ -47,6 +69,11 @@ func (a *Agent) SetExtraSystemPrompt(prompt string) {
 	a.extraSystemPrompt = prompt
 }
 
+// SetMemoryManager 替换记忆管理器（用于群聊中按用户切换记忆）
+func (a *Agent) SetMemoryManager(mgr *memory.Manager) {
+	a.memMgr = mgr
+}
+
 // createModel 根据 provider 配置创建 Eino 模型
 func (a *Agent) createModel(ctx context.Context) (model.ToolCallingChatModel, error) {
 	switch a.cfg.Provider {
@@ -57,16 +84,18 @@ func (a *Agent) createModel(ctx context.Context) (model.ToolCallingChatModel, er
 			baseURLPtr = &baseURL
 		}
 		return claudemodel.NewChatModel(ctx, &claudemodel.Config{
-			BaseURL:   baseURLPtr,
-			APIKey:    a.cfg.APIKey,
-			Model:     a.cfg.Model,
-			MaxTokens: 4096,
+			BaseURL:    baseURLPtr,
+			APIKey:     a.cfg.APIKey,
+			Model:      a.cfg.Model,
+			MaxTokens:  4096,
+			HTTPClient: &http.Client{Transport: &loggingTransport{base: http.DefaultTransport}},
 		})
 	default: // openai 兼容
 		return openaimodel.NewChatModel(ctx, &openaimodel.ChatModelConfig{
-			APIKey:  a.cfg.APIKey,
-			BaseURL: a.cfg.BaseURL,
-			Model:   a.cfg.Model,
+			APIKey:     a.cfg.APIKey,
+			BaseURL:    a.cfg.BaseURL,
+			Model:      a.cfg.Model,
+			HTTPClient: &http.Client{Transport: &loggingTransport{base: http.DefaultTransport}},
 		})
 	}
 }
@@ -161,7 +190,80 @@ func (a *Agent) AppendAssistantMessage(ctx context.Context, content string) {
 	a.memMgr.OnTurn(ctx, "assistant", content)
 }
 
+// ImageInput 图片输入（base64 编码）
+type ImageInput struct {
+	Base64Data string
+	MIMEType   string
+}
+
+// RunWithImages 带图片的对话（非流式）
+func (a *Agent) RunWithImages(ctx context.Context, text string, images []ImageInput) (string, error) {
+	agent, err := a.buildReactAgent(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	msgs, err := a.buildMultimodalMessages(ctx, text, images)
+	if err != nil {
+		return "", err
+	}
+
+	a.memMgr.OnTurn(ctx, "user", text)
+
+	resp, err := agent.Generate(ctx, msgs)
+	if err != nil {
+		return "", fmt.Errorf("agent generate: %w", err)
+	}
+
+	a.history = append(a.history, schema.UserMessage(text), resp)
+	a.memMgr.OnTurn(ctx, "assistant", resp.Content)
+	return resp.Content, nil
+}
+
+// buildMultimodalMessages 构建包含图片的消息列表
+func (a *Agent) buildMultimodalMessages(ctx context.Context, text string, images []ImageInput) ([]*schema.Message, error) {
+	systemPrompt, err := BuildSystemPrompt(a.memMgr, a.registry)
+	if err != nil {
+		return nil, fmt.Errorf("build system prompt: %w", err)
+	}
+	if a.extraSystemPrompt != "" {
+		systemPrompt += "\n\n" + a.extraSystemPrompt
+	}
+
+	// 构建多模态 content parts
+	parts := []schema.MessageInputPart{
+		{Type: schema.ChatMessagePartTypeText, Text: text},
+	}
+	for _, img := range images {
+		b64 := img.Base64Data
+		parts = append(parts, schema.MessageInputPart{
+			Type: schema.ChatMessagePartTypeImageURL,
+			Image: &schema.MessageInputImage{
+				MessagePartCommon: schema.MessagePartCommon{
+					Base64Data: &b64,
+					MIMEType:   img.MIMEType,
+				},
+			},
+		})
+	}
+
+	userMsg := &schema.Message{
+		Role:                  schema.User,
+		UserInputMultiContent: parts,
+	}
+
+	msgs := []*schema.Message{schema.SystemMessage(systemPrompt)}
+	msgs = append(msgs, a.history...)
+	msgs = append(msgs, userMsg)
+	return msgs, nil
+}
+
 // ClearHistory 清空对话历史
 func (a *Agent) ClearHistory() {
 	a.history = nil
+}
+
+// MemoryManager 返回记忆管理器
+func (a *Agent) MemoryManager() *memory.Manager {
+	return a.memMgr
 }

@@ -18,6 +18,11 @@ func NewStore(baseDir string) *Store {
 	return &Store{baseDir: baseDir}
 }
 
+// SubStore 创建子目录 Store（用于群聊中按用户隔离 user.md / memory.md）
+func (s *Store) SubStore(namespace string) *Store {
+	return &Store{baseDir: filepath.Join(s.baseDir, namespace)}
+}
+
 // ReadSoul 读取 soul.md
 func (s *Store) ReadSoul() (string, error) {
 	return s.readFile("soul.md")

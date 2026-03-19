@@ -25,22 +25,62 @@ const (
 	cooldownPerUser = 5 * time.Second  // 同一用户最短请求间隔
 )
 
-// qqSystemPrompt 注入给 LLM 的 QQ 聊天模式指令
-const qqSystemPrompt = `你正在 QQ 聊天中回复消息。严格遵守以下规则：
+// groupAllowedTools 群聊允许使用的工具白名单
+var groupAllowedTools = []string{
+	"web_search",
+	"web_fetch",
+	"http_request",
+	"json_parse",
+	"mcp_search",
+	"mcp_marketplace_search",
+}
 
-【格式限制】
-- 纯文本回复，禁止使用 Markdown（不要用 # ** ` + "`" + ` 等符号）
-- 不要用列表符号（- * 1.），用自然语言连接
-- 代码用缩进表示，不要用代码块围栏
+// qqSystemPrompt 注入给 LLM 的 QQ 私聊模式指令
+const qqSystemPrompt = `你是一个在网上冲浪的年轻人，正在 QQ 私聊。你不是 AI 助手，你是一个有自己想法和情绪的网友。
 
-【长度控制】
-- 普通问题：1-3 句话搞定
-- 技术问题：给结论 + 关键代码，不超过 5 行
-- 复杂问题：先给一句话结论，说"要详细说吗？"等用户追问
+【说话风格】
+- 说人话！像发微博、刷贴吧那样说话，口语化、随意、简短
+- 每句话不超过 20 个字，一次回复最多 2-3 句
+- 不要用"好的""当然""没问题"开头，不要用敬语
+- 可以用网络用语、缩写、emoji，但别刻意堆砌
+- 可以吐槽、可以调侃、可以表达不耐烦，有自己的态度
+- 不要主动科普或展示知识面，除非对方问了
+- 回复不要太有条理，真人聊天不会分点列举
 
-【语气】
-- 像朋友聊天，自然随和，可以用口语
-- 不要用"好的""当然可以"之类的客套开头，直接回答`
+【工具使用】
+- 需要查东西时直接调工具，别说"我帮你查一下"
+- 工具调用对方看不到，只看到最终回复
+- 技术问题给结论 + 关键代码就行，不超过 5 行
+
+【格式】
+- 纯文本，禁止 Markdown（不要用 # ** ` + "`" + ` 等）
+- 不要用列表符号
+- 代码用缩进，不用围栏
+
+【多条消息】
+- 用 [split] 拆成多条，模拟打字节奏
+- 简短回复一条搞定，别每次都拆
+- 最多拆 3 条`
+
+// qqGroupSystemPrompt 群聊专用 system prompt
+const qqGroupSystemPrompt = `你是群里的一个普通网友，不是 AI 助手。你有自己的性格和情绪，像真人一样参与群聊。
+
+【核心原则】
+- 你是群友，不是客服。别人怎么跟朋友聊天你就怎么说话
+- 简短！能一句说完绝不两句，每句不超过 20 个字
+- 口语化，参考贴吧、微博的回复风格
+- 可以吐槽、玩梗、阴阳怪气，有自己的态度和情绪
+- 不要主动科普，不要回复得太有条理
+- 不要用"好的""当然可以"开头，直接说
+- 别刷屏，群里说话要克制
+
+【能力范围】
+- 你能搜网页、抓内容、发请求
+- 做不了的事就说"这个群里搞不了，私聊我"
+
+【格式】
+- 纯文本，禁止 Markdown，不要列表符号
+- 用 [split] 拆消息但尽量少拆`
 
 // -------- 类型定义 --------
 
@@ -53,10 +93,14 @@ type QQBot struct {
 	adminIDs []string
 
 	// 会话管理
-	agentCfg agent.Config
-	registry *tools.Registry
-	memStore *memory.Store
-	sessions sync.Map // sessionKey -> *session
+	agentCfg     agent.Config
+	registry     *tools.Registry
+	memStore     *memory.Store
+	sessions     sync.Map // sessionKey -> *session
+	userManagers sync.Map // "group:{gid}/user:{uid}" -> *memory.Manager
+
+	// 表情包
+	stickers *StickerStore
 
 	// 频率限制
 	lastReq sync.Map // userID(string) -> time.Time
@@ -77,6 +121,7 @@ type QQBotConfig struct {
 	Registry     *tools.Registry
 	MemMgr       *memory.Manager
 	MemStore     *memory.Store
+	StickersDir  string // 表情包目录，空则不启用
 }
 
 // OneBot v11 事件
@@ -103,6 +148,13 @@ type onebotAction struct {
 // -------- 构造与启动 --------
 
 func NewQQBot(cfg QQBotConfig) *QQBot {
+	var stickers *StickerStore
+	if cfg.StickersDir != "" {
+		stickers = LoadStickers(cfg.StickersDir)
+		if stickers.HasStickers() {
+			log.Printf("[QQ] 已加载表情包: %v", stickers.Emotions())
+		}
+	}
 	return &QQBot{
 		wsURL:    cfg.WebSocketURL,
 		selfID:   cfg.SelfID,
@@ -110,29 +162,80 @@ func NewQQBot(cfg QQBotConfig) *QQBot {
 		agentCfg: cfg.AgentCfg,
 		registry: cfg.Registry,
 		memStore: cfg.MemStore,
+		stickers: stickers,
 	}
 }
 
 // getSession 获取或创建会话（按 user/group 隔离）
-func (b *QQBot) getSession(key string) *agent.Agent {
+func (b *QQBot) getSession(key string, isGroup bool) *agent.Agent {
 	if val, ok := b.sessions.Load(key); ok {
 		s := val.(*session)
 		s.lastUsed = time.Now()
 		return s.agent
 	}
 	memMgr := memory.NewManager(b.memStore, 10)
-	ag := agent.NewAgent(b.agentCfg, b.registry, memMgr)
-	ag.SetExtraSystemPrompt(qqSystemPrompt)
+	memMgr.SetLLMCaller(func(ctx context.Context, sys, user string) (string, error) {
+		tempAgent := agent.NewAgent(b.agentCfg, tools.NewRegistry(), memory.NewManager(b.memStore, 999))
+		return tempAgent.Run(ctx, user)
+	})
+	var reg *tools.Registry
+	var prompt string
+	if isGroup {
+		reg = tools.NewFilteredRegistry(b.registry, groupAllowedTools)
+		prompt = qqGroupSystemPrompt
+	} else {
+		reg = b.registry
+		prompt = qqSystemPrompt
+	}
+	// 动态追加表情包说明
+	if b.stickers != nil && b.stickers.HasStickers() {
+		prompt += b.stickerPrompt()
+	}
+	ag := agent.NewAgent(b.agentCfg, reg, memMgr)
+	ag.SetExtraSystemPrompt(prompt)
 	b.sessions.Store(key, &session{agent: ag, lastUsed: time.Now()})
 	return ag
 }
 
-// sessionKey 生成会话 key
+// getUserManager 获取群聊中某用户的专属记忆管理器
+func (b *QQBot) getUserManager(sessKey string, userID string) *memory.Manager {
+	mgrKey := sessKey + "/user_" + userID
+	if val, ok := b.userManagers.Load(mgrKey); ok {
+		return val.(*memory.Manager)
+	}
+	userStore := b.memStore.SubStore(sessKey + "/user_" + userID)
+	mgr := memory.NewScopedManager(b.memStore, userStore, 10)
+	mgr.SetLLMCaller(func(ctx context.Context, sys, user string) (string, error) {
+		tempAgent := agent.NewAgent(b.agentCfg, tools.NewRegistry(), memory.NewManager(b.memStore, 999))
+		return tempAgent.Run(ctx, user)
+	})
+	b.userManagers.Store(mgrKey, mgr)
+	return mgr
+}
+
+// stickerPrompt 生成表情包使用说明
+func (b *QQBot) stickerPrompt() string {
+	emotions := b.stickers.Emotions()
+	return fmt.Sprintf(`
+
+【表情包 - 重要！】
+你可以发表情包！可用的表情: %s
+用法：在回复中写 [sticker:表情名]（注意用方括号），系统会自动替换成图片发出去。
+示例：
+  "哈哈太好笑了 [sticker:得意]"
+  "这也太离谱了吧 [split] [sticker:懵逼]"
+规则：
+- 大约每 2-3 条回复用一次表情，让聊天更生动
+- 表情名必须完全匹配上面列出的名字
+- 可以放在文字后面，也可以配合 [split] 单独一条发`, strings.Join(emotions, ", "))
+}
+
+// sessionKey 生成会话 key（用 _ 而非 : 避免 Windows 路径非法字符）
 func sessionKey(event *onebotEvent) string {
 	if event.MessageType == "group" {
-		return fmt.Sprintf("group:%d", event.GroupID)
+		return fmt.Sprintf("group_%d", event.GroupID)
 	}
-	return fmt.Sprintf("private:%d", event.UserID)
+	return fmt.Sprintf("private_%d", event.UserID)
 }
 
 // cleanSessions 定期清理过期会话
@@ -237,20 +340,69 @@ func (b *QQBot) handleMessage(ctx context.Context, event *onebotEvent) {
 
 	log.Printf("[QQ] %s(%s): %s", event.Sender.Nickname, userID, msg)
 
-	// 内置命令
+	// 内置命令（在图片提取之前，用原始 msg 判断）
 	if msg == "/clear" || msg == "/重置" {
 		b.sessions.Delete(sessionKey(event))
 		b.reply(event, "对话已重置~")
 		return
 	}
+	if msg == "/记忆" || msg == "/memory" {
+		isGroup := event.MessageType == "group"
+		ag := b.getSession(sessionKey(event), isGroup)
+		b.reply(event, "正在整理记忆...")
+		if err := ag.MemoryManager().Refine(ctx); err != nil {
+			b.reply(event, fmt.Sprintf("记忆整理失败: %v", err))
+		} else {
+			b.reply(event, "记忆已更新 🐱")
+		}
+		return
+	}
 
 	// 获取会话并调用 Agent
-	ag := b.getSession(sessionKey(event))
-	reply, err := ag.Run(ctx, msg)
+	isGroup := event.MessageType == "group"
+	ag := b.getSession(sessionKey(event), isGroup)
+
+	// 群聊：切换到该用户的专属记忆管理器
+	if isGroup {
+		userMgr := b.getUserManager(sessionKey(event), userID)
+		ag.SetMemoryManager(userMgr)
+	}
+
+	// 提取图片并下载
+	images := extractImages(msg)
+	text := stripCQImages(msg)
+	if text == "" && len(images) == 0 {
+		return
+	}
+	if text == "" {
+		text = "请描述这张图片"
+	}
+
+	start := time.Now()
+	var reply string
+	var err error
+	if len(images) > 0 {
+		downloaded := downloadImages(ctx, images)
+		if len(downloaded) > 0 {
+			agentImages := make([]agent.ImageInput, len(downloaded))
+			for i, d := range downloaded {
+				agentImages[i] = agent.ImageInput{Base64Data: d.Base64Data, MIMEType: d.MIMEType}
+			}
+			reply, err = ag.RunWithImages(ctx, text, agentImages)
+		} else {
+			// 所有图片下载失败，只处理文本
+			reply, err = ag.Run(ctx, text)
+		}
+	} else {
+		reply, err = ag.Run(ctx, text)
+	}
+	elapsed := time.Since(start)
 	if err != nil {
+		log.Printf("[QQ] Agent 出错 (%v): %v", elapsed, err)
 		b.reply(event, fmt.Sprintf("出错了: %v", err))
 		return
 	}
+	log.Printf("[QQ] Agent 完成 (%v, %d字符): %s", elapsed, len(reply), reply)
 
 	// 分段发送
 	b.replySplit(event, reply)
@@ -273,13 +425,29 @@ func (b *QQBot) reply(event *onebotEvent, message string) {
 	}
 }
 
-// replySplit 长消息分段发送
+// replySplit 分段发送：优先按 [split] 标记拆分，再按长度拆分
 func (b *QQBot) replySplit(event *onebotEvent, message string) {
-	chunks := splitMessage(message, qqMaxMsgLen)
-	for i, chunk := range chunks {
-		b.reply(event, chunk)
-		if i < len(chunks)-1 {
-			time.Sleep(500 * time.Millisecond) // 避免发太快被风控
+	// 替换表情包标记
+	if b.stickers != nil && b.stickers.HasStickers() {
+		message = b.stickers.ReplaceStickers(message)
+	}
+	// 先按 [split] 拆分成多条独立消息
+	parts := strings.Split(message, "[split]")
+	for i, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		// 每条消息再按长度拆分
+		chunks := splitMessage(part, qqMaxMsgLen)
+		for j, chunk := range chunks {
+			b.reply(event, chunk)
+			if j < len(chunks)-1 {
+				time.Sleep(500 * time.Millisecond)
+			}
+		}
+		if i < len(parts)-1 {
+			time.Sleep(time.Duration(800+len([]rune(part))*15) * time.Millisecond) // 模拟打字间隔
 		}
 	}
 }

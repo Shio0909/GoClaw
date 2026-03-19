@@ -31,6 +31,14 @@ func RegisterBuiltins(r *Registry) {
 	// 网络工具 (对应 OpenClaw: web_fetch, http)
 	r.Register(NewWebFetchTool())
 	r.Register(NewHTTPRequestTool())
+
+	// MCP Server 管理
+	r.Register(NewMCPSearchTool())
+	r.Register(NewMCPInstallTool(r))
+	r.Register(NewMCPUninstallTool(r))
+
+	// 技能管理
+	r.Register(NewSkillInstallTool())
 }
 
 func fileReadTool() *ToolDef {

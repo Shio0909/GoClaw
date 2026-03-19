@@ -13,6 +13,7 @@ type LLMCaller func(ctx context.Context, systemPrompt, userPrompt string) (strin
 // Manager 记忆管理器
 type Manager struct {
 	store     *Store
+	rootStore *Store // 非 nil 时从 rootStore 读 soul（scoped 模式）
 	llmCall   LLMCaller
 	turnCount int
 	refineAt  int // 每 N 轮触发一次记忆精炼
@@ -29,6 +30,19 @@ func NewManager(store *Store, refineAt int) *Manager {
 	}
 }
 
+// NewScopedManager 创建带作用域的记忆管理器
+// rootStore 用于读取 soul.md（全局人格），userStore 用于读写 user.md / memory.md / logs
+func NewScopedManager(rootStore, userStore *Store, refineAt int) *Manager {
+	if refineAt <= 0 {
+		refineAt = 10
+	}
+	return &Manager{
+		store:     userStore,
+		rootStore: rootStore,
+		refineAt:  refineAt,
+	}
+}
+
 // SetLLMCaller 设置 LLM 调用函数
 func (m *Manager) SetLLMCaller(fn LLMCaller) {
 	m.llmCall = fn
@@ -41,7 +55,12 @@ func (m *Manager) Store() *Store {
 
 // BuildContext 构建记忆上下文（注入到 system prompt）
 func (m *Manager) BuildContext() (string, error) {
-	soul, err := m.store.ReadSoul()
+	// scoped 模式：soul 从 rootStore 读，user/memory 从 store（userStore）读
+	soulStore := m.store
+	if m.rootStore != nil {
+		soulStore = m.rootStore
+	}
+	soul, err := soulStore.ReadSoul()
 	if err != nil {
 		return "", fmt.Errorf("read soul: %w", err)
 	}
@@ -86,6 +105,15 @@ func (m *Manager) OnTurn(ctx context.Context, role, content string) {
 	if m.turnCount%m.refineAt == 0 && m.llmCall != nil {
 		go m.refine(ctx)
 	}
+}
+
+// Refine 手动触发记忆精炼
+func (m *Manager) Refine(ctx context.Context) error {
+	if m.llmCall == nil {
+		return fmt.Errorf("LLM caller not set")
+	}
+	m.refine(ctx)
+	return nil
 }
 
 // refine 记忆精炼：让 LLM 从日志中提炼重要信息

@@ -24,3 +24,7 @@ memory_data/
 # OS
 .DS_Store
 Thumbs.db
+
+
+# 表情
+stickers/

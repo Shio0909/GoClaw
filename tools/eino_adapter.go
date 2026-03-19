@@ -3,10 +3,15 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"log"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 )
+
+// maxToolResultBytes 工具结果最大字节数，超出则截断
+const maxToolResultBytes = 30 * 1024 // 30KB
 
 // EinoTool 将 ToolDef 适配为 Eino 的 InvokableTool 接口
 type EinoTool struct {
@@ -50,7 +55,30 @@ func (t *EinoTool) InvokableRun(ctx context.Context, argumentsInJSON string, opt
 	if args == nil {
 		args = make(map[string]interface{})
 	}
-	return t.def.Fn(ctx, args)
+	result, err := t.def.Fn(ctx, args)
+
+	// 截断过大的工具结果，防止后续请求体爆炸
+	if len(result) > maxToolResultBytes {
+		log.Printf("[Tool] %s 结果过大 (%d 字节)，截断到 %d 字节", t.def.Name, len(result), maxToolResultBytes)
+		runes := []rune(result)
+		if len(string(runes)) > maxToolResultBytes {
+			// 按 rune 截断避免切断 UTF-8
+			cut := 0
+			size := 0
+			for i, r := range runes {
+				size += len(string(r))
+				if size > maxToolResultBytes-200 { // 留 200 字节给截断提示
+					cut = i
+					break
+				}
+			}
+			if cut > 0 {
+				result = string(runes[:cut]) + fmt.Sprintf("\n\n... [结果过大，已截断。原始大小: %d 字节，显示前 %d 字节]", len(result), maxToolResultBytes)
+			}
+		}
+	}
+
+	return result, err
 }
 
 // toSchemaType 将字符串类型映射为 Eino schema.DataType

@@ -33,15 +33,17 @@ func main() {
 	// 自动加载 .env 文件
 	loadEnvFile(".env")
 
-	// 读取配置 - 支持 OpenAI 兼容 和 Claude 两种模式
-	provider := os.Getenv("GOCLAW_PROVIDER") // "openai" 或 "claude"
-	apiKey := os.Getenv("OPENAI_API_KEY")
-	baseURL := os.Getenv("OPENAI_BASE_URL")
+	// 读取配置 - 支持多种 LLM 提供方
+	provider := os.Getenv("GOCLAW_PROVIDER") // "claude", "openai", "mimo", ...
 	model := os.Getenv("GOCLAW_MODEL")
 	tavilyKey := os.Getenv("TAVILY_API_KEY")
+	smitheryKey := os.Getenv("SMITHERY_API_KEY")
 
-	// Claude 模式
-	if provider == "claude" || provider == "" {
+	var apiKey, baseURL string
+
+	// 根据 provider 选择对应的 API Key 和 Base URL
+	switch provider {
+	case "claude", "":
 		if claudeKey := os.Getenv("ANTHROPIC_API_KEY"); claudeKey != "" {
 			provider = "claude"
 			apiKey = claudeKey
@@ -50,12 +52,29 @@ func main() {
 				model = "claude-sonnet-4-20250514"
 			}
 		}
+	case "mimo":
+		apiKey = os.Getenv("MIMO_API_KEY")
+		baseURL = "https://api.xiaomimimo.com/v1"
+		if model == "" {
+			model = "mimo-v2-pro"
+		}
+	case "siliconflow":
+		apiKey = os.Getenv("SILICONFLOW_API_KEY")
+		baseURL = "https://api.siliconflow.cn/v1"
+		if model == "" {
+			model = "Pro/MiniMaxAI/MiniMax-M2.5"
+		}
+	default: // openai 兼容 (deepseek, doubao, ollama, ...)
+		apiKey = os.Getenv("OPENAI_API_KEY")
+		baseURL = os.Getenv("OPENAI_BASE_URL")
 	}
 
 	if apiKey == "" {
 		fmt.Printf("%s请设置 API Key 环境变量:%s\n", colorRed, colorReset)
-		fmt.Println("  OpenAI 兼容: OPENAI_API_KEY + OPENAI_BASE_URL")
-		fmt.Println("  Claude:      ANTHROPIC_API_KEY + ANTHROPIC_BASE_URL (可选)")
+		fmt.Println("  Claude:      GOCLAW_PROVIDER=claude      + ANTHROPIC_API_KEY")
+		fmt.Println("  MiMo:        GOCLAW_PROVIDER=mimo        + MIMO_API_KEY")
+		fmt.Println("  SiliconFlow: GOCLAW_PROVIDER=siliconflow + SILICONFLOW_API_KEY")
+		fmt.Println("  OpenAI 兼容: GOCLAW_PROVIDER=openai      + OPENAI_API_KEY + OPENAI_BASE_URL")
 		fmt.Println()
 		fmt.Println("可选: TAVILY_API_KEY (网络搜索), GOCLAW_MODEL (模型名)")
 		os.Exit(1)
@@ -89,11 +108,19 @@ func main() {
 		registry.Register(tools.NewWebSearchTool(tavilyKey))
 	}
 
+	// 注册 Smithery 市场搜索工具
+	if smitheryKey != "" {
+		registry.Register(tools.NewMCPMarketplaceSearchTool(smitheryKey))
+	}
+
 	// 连接 MCP Servers
 	mcpBridge := connectMCPServers(registry)
 	if mcpBridge != nil {
 		defer mcpBridge.Close()
+	} else {
+		mcpBridge = tools.NewMCPBridge()
 	}
+	registry.SetMCPBridge(mcpBridge)
 
 	agentCfg := agent.Config{
 		Provider: provider,
@@ -121,6 +148,7 @@ func main() {
 			AgentCfg:     agentCfg,
 			Registry:     registry,
 			MemStore:     store,
+			StickersDir:  os.Getenv("GOCLAW_STICKERS_DIR"),
 		})
 		if err := bot.Run(context.Background()); err != nil {
 			log.Fatalf("QQ 机器人退出: %v", err)
@@ -213,7 +241,7 @@ func printBanner(provider, model, baseURL string, hasSearch bool) {
 	}
 
 	// 显示能力
-	capabilities := []string{"文件操作", "Shell/进程", "网页抓取", "HTTP请求", "JSON解析", "定时提醒"}
+	capabilities := []string{"文件操作", "Shell/进程", "网页抓取", "HTTP请求", "JSON解析", "定时提醒", "MCP管理"}
 	if hasSearch {
 		capabilities = append(capabilities, "网络搜索")
 	}
@@ -229,12 +257,16 @@ func showHelp() {
 	fmt.Println("  /clear   - 清空对话历史")
 	fmt.Println("  /quit    - 退出")
 	fmt.Printf("\n%s环境变量:%s\n", colorYellow, colorReset)
-	fmt.Println("  OPENAI_API_KEY     - OpenAI 兼容 API Key")
-	fmt.Println("  OPENAI_BASE_URL    - API 地址 (DeepSeek/豆包/Ollama)")
-	fmt.Println("  ANTHROPIC_API_KEY  - Claude API Key")
-	fmt.Println("  ANTHROPIC_BASE_URL - Claude API 代理地址")
-	fmt.Println("  GOCLAW_MODEL       - 模型名称")
-	fmt.Println("  TAVILY_API_KEY     - Tavily 搜索 API Key")
+	fmt.Println("  GOCLAW_PROVIDER      - 提供方 (claude/mimo/siliconflow/openai)")
+	fmt.Println("  ANTHROPIC_API_KEY    - Claude API Key")
+	fmt.Println("  ANTHROPIC_BASE_URL   - Claude API 代理地址")
+	fmt.Println("  MIMO_API_KEY         - 小米 MiMo API Key")
+	fmt.Println("  SILICONFLOW_API_KEY  - 硅基流动 API Key")
+	fmt.Println("  OPENAI_API_KEY       - OpenAI 兼容 API Key")
+	fmt.Println("  OPENAI_BASE_URL      - API 地址 (DeepSeek/豆包/Ollama)")
+	fmt.Println("  GOCLAW_MODEL         - 模型名称")
+	fmt.Println("  TAVILY_API_KEY       - Tavily 搜索 API Key")
+	fmt.Println("  SMITHERY_API_KEY     - Smithery MCP 市场 API Key (可选)")
 	fmt.Printf("\n%sQQ 机器人:%s\n", colorYellow, colorReset)
 	fmt.Println("  GOCLAW_QQ_WS       - NapCatQQ WebSocket 地址 (如 ws://127.0.0.1:3001)")
 	fmt.Println("  GOCLAW_QQ_SELF_ID  - 机器人 QQ 号")
