@@ -180,6 +180,19 @@ func main() {
 			}
 		}
 
+		// 语音转文字配置
+		sttCfg := gateway.STTConfig{
+			BaseURL: os.Getenv("GOCLAW_STT_BASE_URL"),
+			APIKey:  os.Getenv("GOCLAW_STT_API_KEY"),
+			Model:   os.Getenv("GOCLAW_STT_MODEL"),
+		}
+		if sttCfg.APIKey == "" {
+			sttCfg.APIKey = apiKey // 默认复用主 API Key
+		}
+		if sttCfg.Enabled() {
+			log.Printf("   STT: %s (模型: %s)", sttCfg.BaseURL, sttCfg.Model)
+		}
+
 		bot := gateway.NewQQBot(gateway.QQBotConfig{
 			WebSocketURL:  qqWS,
 			SelfID:        qqSelfID,
@@ -190,6 +203,7 @@ func main() {
 			StickersDir:   os.Getenv("GOCLAW_STICKERS_DIR"),
 			ContextLength: contextLength,
 			RetryConfig:   retryCfg,
+			STTConfig:     sttCfg,
 		})
 
 		// 优雅关闭：监听 SIGINT/SIGTERM
@@ -355,6 +369,11 @@ func showHelp() {
 	fmt.Println("  GOCLAW_QQ_WS       - NapCatQQ WebSocket 地址 (如 ws://127.0.0.1:3001)")
 	fmt.Println("  GOCLAW_QQ_SELF_ID  - 机器人 QQ 号")
 	fmt.Println("  GOCLAW_QQ_ADMINS   - 允许使用的 QQ 号 (逗号分隔，空则不限)")
+	fmt.Println()
+	fmt.Println("  语音转文字 (可选):")
+	fmt.Println("  GOCLAW_STT_BASE_URL - STT API 地址 (如 https://api.openai.com/v1)")
+	fmt.Println("  GOCLAW_STT_API_KEY  - STT API Key (默认复用 GOCLAW_API_KEY)")
+	fmt.Println("  GOCLAW_STT_MODEL    - STT 模型名 (默认 whisper-1)")
 	fmt.Println()
 }
 
