@@ -48,11 +48,13 @@ type Config struct {
 
 // Agent 核心 Agent，基于 Eino react agent
 type Agent struct {
-	cfg              Config
-	registry         *tools.Registry
-	memMgr           *memory.Manager
-	history          []*schema.Message
-	extraSystemPrompt string // 额外的 system prompt（如 QQ 聊天模式指令）
+	cfg               Config
+	registry          *tools.Registry
+	memMgr            *memory.Manager
+	history           []*schema.Message
+	extraSystemPrompt string       // 额外的 system prompt（如 QQ 聊天模式指令）
+	compressor        *Compressor  // 上下文压缩器（可选）
+	retryConfig       *RetryConfig // 重试 + Key 轮换配置（可选）
 }
 
 // NewAgent 创建 Agent
@@ -72,6 +74,16 @@ func (a *Agent) SetExtraSystemPrompt(prompt string) {
 // SetMemoryManager 替换记忆管理器（用于群聊中按用户切换记忆）
 func (a *Agent) SetMemoryManager(mgr *memory.Manager) {
 	a.memMgr = mgr
+}
+
+// SetCompressor 设置上下文压缩器
+func (a *Agent) SetCompressor(c *Compressor) {
+	a.compressor = c
+}
+
+// SetRetryConfig 设置重试 + Key 轮换配置
+func (a *Agent) SetRetryConfig(cfg *RetryConfig) {
+	a.retryConfig = cfg
 }
 
 // createModel 根据 provider 配置创建 Eino 模型
@@ -133,18 +145,23 @@ func (a *Agent) buildMessages(ctx context.Context, userInput string) ([]*schema.
 	}
 
 	msgs := []*schema.Message{schema.SystemMessage(systemPrompt)}
-	msgs = append(msgs, a.history...)
+
+	// 压缩上下文（如果已配置压缩器）
+	history := a.history
+	if a.compressor != nil {
+		history = a.compressor.CompressIfNeeded(ctx, history)
+		if len(history) != len(a.history) {
+			a.history = history // 压缩后更新历史
+		}
+	}
+
+	msgs = append(msgs, history...)
 	msgs = append(msgs, schema.UserMessage(userInput))
 	return msgs, nil
 }
 
 // Run 执行一轮对话（非流式，用于记忆系统等内部调用）
 func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
-	agent, err := a.buildReactAgent(ctx)
-	if err != nil {
-		return "", err
-	}
-
 	msgs, err := a.buildMessages(ctx, userInput)
 	if err != nil {
 		return "", err
@@ -152,7 +169,29 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 
 	a.memMgr.OnTurn(ctx, "user", userInput)
 
-	resp, err := agent.Generate(ctx, msgs)
+	var resp *schema.Message
+	runFn := func(cfg Config) error {
+		origKey := a.cfg.APIKey
+		a.cfg.APIKey = cfg.APIKey
+		defer func() { a.cfg.APIKey = origKey }()
+
+		agent, err := a.buildReactAgent(ctx)
+		if err != nil {
+			return err
+		}
+		r, err := agent.Generate(ctx, msgs)
+		if err != nil {
+			return err
+		}
+		resp = r
+		return nil
+	}
+
+	if a.retryConfig != nil {
+		err = a.runWithRetry(ctx, runFn)
+	} else {
+		err = runFn(a.cfg)
+	}
 	if err != nil {
 		return "", fmt.Errorf("agent generate: %w", err)
 	}
@@ -164,11 +203,6 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 
 // RunStream 执行一轮对话（流式输出）
 func (a *Agent) RunStream(ctx context.Context, userInput string) (*schema.StreamReader[*schema.Message], error) {
-	agent, err := a.buildReactAgent(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	msgs, err := a.buildMessages(ctx, userInput)
 	if err != nil {
 		return nil, err
@@ -177,7 +211,29 @@ func (a *Agent) RunStream(ctx context.Context, userInput string) (*schema.Stream
 	a.memMgr.OnTurn(ctx, "user", userInput)
 	a.history = append(a.history, schema.UserMessage(userInput))
 
-	stream, err := agent.Stream(ctx, msgs)
+	var stream *schema.StreamReader[*schema.Message]
+	runFn := func(cfg Config) error {
+		origKey := a.cfg.APIKey
+		a.cfg.APIKey = cfg.APIKey
+		defer func() { a.cfg.APIKey = origKey }()
+
+		agent, err := a.buildReactAgent(ctx)
+		if err != nil {
+			return err
+		}
+		s, err := agent.Stream(ctx, msgs)
+		if err != nil {
+			return err
+		}
+		stream = s
+		return nil
+	}
+
+	if a.retryConfig != nil {
+		err = a.runWithRetry(ctx, runFn)
+	} else {
+		err = runFn(a.cfg)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("agent stream: %w", err)
 	}
@@ -198,11 +254,6 @@ type ImageInput struct {
 
 // RunWithImages 带图片的对话（非流式）
 func (a *Agent) RunWithImages(ctx context.Context, text string, images []ImageInput) (string, error) {
-	agent, err := a.buildReactAgent(ctx)
-	if err != nil {
-		return "", err
-	}
-
 	msgs, err := a.buildMultimodalMessages(ctx, text, images)
 	if err != nil {
 		return "", err
@@ -210,7 +261,29 @@ func (a *Agent) RunWithImages(ctx context.Context, text string, images []ImageIn
 
 	a.memMgr.OnTurn(ctx, "user", text)
 
-	resp, err := agent.Generate(ctx, msgs)
+	var resp *schema.Message
+	runFn := func(cfg Config) error {
+		origKey := a.cfg.APIKey
+		a.cfg.APIKey = cfg.APIKey
+		defer func() { a.cfg.APIKey = origKey }()
+
+		agent, err := a.buildReactAgent(ctx)
+		if err != nil {
+			return err
+		}
+		r, err := agent.Generate(ctx, msgs)
+		if err != nil {
+			return err
+		}
+		resp = r
+		return nil
+	}
+
+	if a.retryConfig != nil {
+		err = a.runWithRetry(ctx, runFn)
+	} else {
+		err = runFn(a.cfg)
+	}
 	if err != nil {
 		return "", fmt.Errorf("agent generate: %w", err)
 	}

@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"strings"
+	"sync"
 	"testing"
+	"time"
 )
 
 func TestSplitMessageShort(t *testing.T) {
@@ -48,5 +50,87 @@ func TestSplitMessageAtNewline(t *testing.T) {
 		if len([]rune(chunk)) > 100 {
 			t.Fatalf("chunk exceeds max: %d runes", len([]rune(chunk)))
 		}
+	}
+}
+
+// -------- 去重器测试 --------
+
+func TestDedupRingBasic(t *testing.T) {
+	d := newDedupRing(10)
+
+	// 第一次见到应返回 false
+	if d.seen(100) {
+		t.Fatal("first time should not be seen")
+	}
+	// 第二次应返回 true
+	if !d.seen(100) {
+		t.Fatal("second time should be seen")
+	}
+	// 不同 ID 应返回 false
+	if d.seen(200) {
+		t.Fatal("different ID should not be seen")
+	}
+}
+
+func TestDedupRingWraparound(t *testing.T) {
+	d := newDedupRing(5)
+
+	// 填满缓冲区
+	for i := int64(1); i <= 5; i++ {
+		d.seen(i)
+	}
+
+	// 所有应该都能找到
+	for i := int64(1); i <= 5; i++ {
+		if !d.seen(i) {
+			t.Fatalf("ID %d should be seen", i)
+		}
+	}
+
+	// 添加新的会覆盖最老的
+	d.seen(6)
+	// ID 1 应该被覆盖了
+	if d.seen(1) {
+		t.Fatal("ID 1 should have been evicted")
+	}
+}
+
+func TestDedupRingConcurrency(t *testing.T) {
+	d := newDedupRing(100)
+	var wg sync.WaitGroup
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func(base int64) {
+			defer wg.Done()
+			for j := int64(0); j < 20; j++ {
+				d.seen(base*100 + j)
+			}
+		}(int64(i))
+	}
+	wg.Wait()
+}
+
+func TestDedupRingZeroID(t *testing.T) {
+	d := newDedupRing(10)
+	// msgID 0 不应触发去重
+	if d.seen(0) {
+		t.Fatal("zero ID should not match empty entries")
+	}
+}
+
+// -------- 发送限流器测试 --------
+
+func TestSendLimiterPacing(t *testing.T) {
+	l := newSendLimiter(50 * time.Millisecond)
+
+	start := time.Now()
+	l.wait()
+	l.wait()
+	l.wait()
+	elapsed := time.Since(start)
+
+	// 3次调用应至少花 100ms（第一次不等待，后两次各等 50ms）
+	if elapsed < 80*time.Millisecond {
+		t.Fatalf("expected >= 80ms, got %v", elapsed)
 	}
 }

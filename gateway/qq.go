@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -20,9 +21,25 @@ import (
 // -------- 常量 --------
 
 const (
-	qqMaxMsgLen     = 1500           // QQ 单条消息安全长度（留余量）
+	qqMaxMsgLen     = 1500             // QQ 单条消息安全长度（留余量）
 	sessionTimeout  = 30 * time.Minute // 会话超时自动清理
 	cooldownPerUser = 5 * time.Second  // 同一用户最短请求间隔
+
+	// 重连退避
+	reconnectInitial = 2 * time.Second   // 初始重连等待
+	reconnectMax     = 120 * time.Second // 最大重连等待
+	reconnectFactor  = 2                 // 退避因子
+
+	// 心跳
+	pingInterval = 30 * time.Second // ping 发送间隔
+	pongTimeout  = 60 * time.Second // pong 超时（2倍 pingInterval）
+
+	// 发送限流
+	sendInterval = 200 * time.Millisecond // 两条消息之间最小间隔
+
+	// 消息去重
+	dedupCapacity = 200           // 去重缓冲区大小
+	dedupTTL      = 5 * time.Minute // 去重条目过期时间
 )
 
 // groupAllowedTools 群聊允许使用的工具白名单
@@ -33,6 +50,68 @@ var groupAllowedTools = []string{
 	"json_parse",
 	"mcp_search",
 	"mcp_marketplace_search",
+}
+
+// -------- 去重器 --------
+
+type dedupEntry struct {
+	msgID int64
+	ts    time.Time
+}
+
+// dedupRing 固定大小环形缓冲区，用于消息去重
+type dedupRing struct {
+	mu      sync.Mutex
+	entries []dedupEntry
+	pos     int
+	size    int
+}
+
+func newDedupRing(capacity int) *dedupRing {
+	return &dedupRing{
+		entries: make([]dedupEntry, capacity),
+		size:    capacity,
+	}
+}
+
+// seen 检查 msgID 是否已处理过，若未见过则记录并返回 false
+func (d *dedupRing) seen(msgID int64) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	now := time.Now()
+	for _, e := range d.entries {
+		if e.msgID == msgID && e.msgID != 0 && now.Sub(e.ts) < dedupTTL {
+			return true
+		}
+	}
+	d.entries[d.pos] = dedupEntry{msgID: msgID, ts: now}
+	d.pos = (d.pos + 1) % d.size
+	return false
+}
+
+// -------- 发送限流器 --------
+
+type sendLimiter struct {
+	mu       sync.Mutex
+	lastSend time.Time
+	interval time.Duration
+}
+
+func newSendLimiter(interval time.Duration) *sendLimiter {
+	return &sendLimiter{interval: interval}
+}
+
+func (l *sendLimiter) wait() {
+	l.mu.Lock()
+	elapsed := time.Since(l.lastSend)
+	if elapsed < l.interval {
+		l.mu.Unlock()
+		time.Sleep(l.interval - elapsed)
+		l.mu.Lock()
+	}
+	l.lastSend = time.Now()
+	l.mu.Unlock()
 }
 
 // qqSystemPrompt 注入给 LLM 的 QQ 私聊模式指令
@@ -104,6 +183,13 @@ type QQBot struct {
 
 	// 频率限制
 	lastReq sync.Map // userID(string) -> time.Time
+
+	// 可靠性
+	dedup   *dedupRing   // 消息去重
+	limiter *sendLimiter // 出站限流
+	wg      sync.WaitGroup // 等待处理中的消息
+	contextLength int     // 上下文窗口大小，用于压缩器
+	retryConfig   *agent.RetryConfig // 重试配置
 }
 
 // session 单个会话（按 user/group 隔离）
@@ -114,14 +200,16 @@ type session struct {
 
 // QQBotConfig QQ 机器人配置
 type QQBotConfig struct {
-	WebSocketURL string
-	SelfID       string
-	AdminIDs     []string
-	AgentCfg     agent.Config
-	Registry     *tools.Registry
-	MemMgr       *memory.Manager
-	MemStore     *memory.Store
-	StickersDir  string // 表情包目录，空则不启用
+	WebSocketURL  string
+	SelfID        string
+	AdminIDs      []string
+	AgentCfg      agent.Config
+	Registry      *tools.Registry
+	MemMgr        *memory.Manager
+	MemStore      *memory.Store
+	StickersDir   string             // 表情包目录，空则不启用
+	ContextLength int                // 上下文窗口大小，0 则使用默认 128000
+	RetryConfig   *agent.RetryConfig // 重试 + Key 轮换配置（可选）
 }
 
 // OneBot v11 事件
@@ -155,14 +243,22 @@ func NewQQBot(cfg QQBotConfig) *QQBot {
 			log.Printf("[QQ] 已加载表情包: %v", stickers.Emotions())
 		}
 	}
+	ctxLen := cfg.ContextLength
+	if ctxLen <= 0 {
+		ctxLen = 128000
+	}
 	return &QQBot{
-		wsURL:    cfg.WebSocketURL,
-		selfID:   cfg.SelfID,
-		adminIDs: cfg.AdminIDs,
-		agentCfg: cfg.AgentCfg,
-		registry: cfg.Registry,
-		memStore: cfg.MemStore,
-		stickers: stickers,
+		wsURL:         cfg.WebSocketURL,
+		selfID:        cfg.SelfID,
+		adminIDs:      cfg.AdminIDs,
+		agentCfg:      cfg.AgentCfg,
+		registry:      cfg.Registry,
+		memStore:      cfg.MemStore,
+		stickers:      stickers,
+		dedup:         newDedupRing(dedupCapacity),
+		limiter:       newSendLimiter(sendInterval),
+		contextLength: ctxLen,
+		retryConfig:   cfg.RetryConfig,
 	}
 }
 
@@ -174,10 +270,11 @@ func (b *QQBot) getSession(key string, isGroup bool) *agent.Agent {
 		return s.agent
 	}
 	memMgr := memory.NewManager(b.memStore, 10)
-	memMgr.SetLLMCaller(func(ctx context.Context, sys, user string) (string, error) {
+	llmCaller := func(ctx context.Context, sys, user string) (string, error) {
 		tempAgent := agent.NewAgent(b.agentCfg, tools.NewRegistry(), memory.NewManager(b.memStore, 999))
 		return tempAgent.Run(ctx, user)
-	})
+	}
+	memMgr.SetLLMCaller(llmCaller)
 	var reg *tools.Registry
 	var prompt string
 	if isGroup {
@@ -193,6 +290,18 @@ func (b *QQBot) getSession(key string, isGroup bool) *agent.Agent {
 	}
 	ag := agent.NewAgent(b.agentCfg, reg, memMgr)
 	ag.SetExtraSystemPrompt(prompt)
+
+	// 为 QQ 会话集成上下文压缩
+	compressor := agent.NewCompressor(agent.CompressorConfig{
+		ContextLength: b.contextLength,
+	}, llmCaller)
+	ag.SetCompressor(compressor)
+
+	// 设置重试 + Key 轮换
+	if b.retryConfig != nil {
+		ag.SetRetryConfig(b.retryConfig)
+	}
+
 	b.sessions.Store(key, &session{agent: ag, lastUsed: time.Now()})
 	return ag
 }
@@ -257,40 +366,103 @@ func (b *QQBot) cleanSessions() {
 // Run 启动 QQ 机器人，阻塞运行
 func (b *QQBot) Run(ctx context.Context) error {
 	go b.cleanSessions()
+
+	backoff := reconnectInitial
 	for {
-		err := b.connectAndListen(ctx)
+		uptime, err := b.connectAndListen(ctx)
 		if ctx.Err() != nil {
+			log.Printf("[QQ] 正在等待处理中的消息完成...")
+			b.wg.Wait()
+			log.Printf("[QQ] 所有消息处理完毕，退出")
 			return ctx.Err()
 		}
-		log.Printf("[QQ] 连接断开: %v，5秒后重连...", err)
-		time.Sleep(5 * time.Second)
+
+		// 连接存活超过 30 秒说明不是连接级别的错误，重置退避
+		if uptime > 30*time.Second {
+			backoff = reconnectInitial
+		}
+
+		// 添加 jitter: ±25% 随机偏移
+		jitter := time.Duration(rand.Int63n(int64(backoff) / 2))
+		wait := backoff + jitter - backoff/4
+		log.Printf("[QQ] 连接断开(存活%.0f秒): %v，%.1f秒后重连...", uptime.Seconds(), err, wait.Seconds())
+		select {
+		case <-time.After(wait):
+		case <-ctx.Done():
+			b.wg.Wait()
+			return ctx.Err()
+		}
+
+		// 指数退避（仅在快速失败时累积）
+		backoff *= reconnectFactor
+		if backoff > reconnectMax {
+			backoff = reconnectMax
+		}
 	}
 }
 
 // -------- WebSocket 监听 --------
 
-func (b *QQBot) connectAndListen(ctx context.Context) error {
+// connectAndListen 连接并监听消息，返回连接持续时间和错误
+func (b *QQBot) connectAndListen(ctx context.Context) (time.Duration, error) {
 	log.Printf("[QQ] 正在连接 %s ...", b.wsURL)
 	conn, _, err := websocket.DefaultDialer.DialContext(ctx, b.wsURL, nil)
 	if err != nil {
-		return fmt.Errorf("WebSocket 连接失败: %w", err)
+		return 0, fmt.Errorf("WebSocket 连接失败: %w", err)
 	}
+	connStart := time.Now()
 	b.connMu.Lock()
 	b.conn = conn
 	b.connMu.Unlock()
-	defer conn.Close()
+	defer func() {
+		conn.WriteMessage(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
+		conn.Close()
+		b.connMu.Lock()
+		b.conn = nil
+		b.connMu.Unlock()
+	}()
 	log.Printf("[QQ] 已连接")
+
+	// 心跳：设置 pong 处理器，刷新读超时
+	conn.SetReadDeadline(time.Now().Add(pongTimeout))
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(pongTimeout))
+		return nil
+	})
+
+	// 启动 ping goroutine
+	pingDone := make(chan struct{})
+	go func() {
+		defer close(pingDone)
+		ticker := time.NewTicker(pingInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				b.connMu.Lock()
+				err := conn.WriteMessage(websocket.PingMessage, nil)
+				b.connMu.Unlock()
+				if err != nil {
+					return
+				}
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	defer func() { <-pingDone }()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return time.Since(connStart), ctx.Err()
 		default:
 		}
 
 		_, message, err := conn.ReadMessage()
 		if err != nil {
-			return fmt.Errorf("读取消息失败: %w", err)
+			return time.Since(connStart), fmt.Errorf("读取消息失败: %w", err)
 		}
 
 		var event onebotEvent
@@ -306,8 +478,16 @@ func (b *QQBot) connectAndListen(ctx context.Context) error {
 // -------- 消息处理 --------
 
 func (b *QQBot) handleMessage(ctx context.Context, event *onebotEvent) {
+	b.wg.Add(1)
+	defer b.wg.Done()
+
 	userID := fmt.Sprintf("%d", event.UserID)
 	msg := strings.TrimSpace(event.RawMessage)
+
+	// 消息去重
+	if event.MessageID != 0 && b.dedup.seen(event.MessageID) {
+		return
+	}
 
 	// 权限检查
 	if len(b.adminIDs) > 0 && !contains(b.adminIDs, userID) {
@@ -493,6 +673,7 @@ func splitMessage(msg string, maxLen int) []string {
 }
 
 func (b *QQBot) sendAction(action string, params any) {
+	b.limiter.wait()
 	b.connMu.Lock()
 	defer b.connMu.Unlock()
 	if b.conn == nil {

@@ -8,8 +8,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/goclaw/goclaw/agent"
 	"github.com/goclaw/goclaw/gateway"
@@ -58,6 +60,15 @@ func main() {
 		if model == "" {
 			model = "mimo-v2-pro"
 		}
+	case "minimax":
+		apiKey = os.Getenv("MINIMAX_API_KEY")
+		baseURL = os.Getenv("MINIMAX_BASE_URL")
+		if baseURL == "" {
+			baseURL = "https://api.minimax.chat/v1"
+		}
+		if model == "" {
+			model = "MiniMax-M2.7"
+		}
 	case "siliconflow":
 		apiKey = os.Getenv("SILICONFLOW_API_KEY")
 		baseURL = "https://api.siliconflow.cn/v1"
@@ -73,6 +84,7 @@ func main() {
 		fmt.Printf("%s请设置 API Key 环境变量:%s\n", colorRed, colorReset)
 		fmt.Println("  Claude:      GOCLAW_PROVIDER=claude      + ANTHROPIC_API_KEY")
 		fmt.Println("  MiMo:        GOCLAW_PROVIDER=mimo        + MIMO_API_KEY")
+		fmt.Println("  MiniMax:     GOCLAW_PROVIDER=minimax     + MINIMAX_API_KEY")
 		fmt.Println("  SiliconFlow: GOCLAW_PROVIDER=siliconflow + SILICONFLOW_API_KEY")
 		fmt.Println("  OpenAI 兼容: GOCLAW_PROVIDER=openai      + OPENAI_API_KEY + OPENAI_BASE_URL")
 		fmt.Println()
@@ -129,6 +141,25 @@ func main() {
 		Model:    model,
 	}
 
+	// 构建重试 + 凭证池配置
+	retryCfg := &agent.RetryConfig{MaxAttempts: 3}
+
+	// 加载额外 API Key（逗号分隔，如 GOCLAW_API_KEYS=key1,key2,key3）
+	if extraKeys := os.Getenv("GOCLAW_API_KEYS"); extraKeys != "" {
+		pool := agent.NewCredentialPool(agent.StrategyRoundRobin)
+		pool.AddKey(apiKey, provider, baseURL) // 主 key
+		for _, k := range strings.Split(extraKeys, ",") {
+			k = strings.TrimSpace(k)
+			if k != "" && k != apiKey {
+				pool.AddKey(k, provider, baseURL)
+			}
+		}
+		if pool.Size() > 1 {
+			log.Printf("🔑 凭证池已加载 %d 个 API Key", pool.Size())
+		}
+		retryCfg.Pool = pool
+	}
+
 	// QQ 机器人模式
 	qqWS := os.Getenv("GOCLAW_QQ_WS")
 	qqSelfID := os.Getenv("GOCLAW_QQ_SELF_ID")
@@ -141,16 +172,37 @@ func main() {
 			adminIDs = strings.Split(ids, ",")
 		}
 
+		// 上下文窗口大小
+		contextLength := 128000
+		if cl := os.Getenv("GOCLAW_CONTEXT_LENGTH"); cl != "" {
+			if v, err := fmt.Sscanf(cl, "%d", &contextLength); err != nil || v != 1 {
+				contextLength = 128000
+			}
+		}
+
 		bot := gateway.NewQQBot(gateway.QQBotConfig{
-			WebSocketURL: qqWS,
-			SelfID:       qqSelfID,
-			AdminIDs:     adminIDs,
-			AgentCfg:     agentCfg,
-			Registry:     registry,
-			MemStore:     store,
-			StickersDir:  os.Getenv("GOCLAW_STICKERS_DIR"),
+			WebSocketURL:  qqWS,
+			SelfID:        qqSelfID,
+			AdminIDs:      adminIDs,
+			AgentCfg:      agentCfg,
+			Registry:      registry,
+			MemStore:      store,
+			StickersDir:   os.Getenv("GOCLAW_STICKERS_DIR"),
+			ContextLength: contextLength,
+			RetryConfig:   retryCfg,
 		})
-		if err := bot.Run(context.Background()); err != nil {
+
+		// 优雅关闭：监听 SIGINT/SIGTERM
+		ctx, cancel := context.WithCancel(context.Background())
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		go func() {
+			sig := <-sigCh
+			log.Printf("[QQ] 收到信号 %v，正在关闭...", sig)
+			cancel()
+		}()
+
+		if err := bot.Run(ctx); err != nil && err != context.Canceled {
 			log.Fatalf("QQ 机器人退出: %v", err)
 		}
 		return
@@ -158,12 +210,26 @@ func main() {
 
 	// CLI 模式
 	ag := agent.NewAgent(agentCfg, registry, memMgr)
+	ag.SetRetryConfig(retryCfg)
 
-	// 注入 LLM caller 给记忆管理器
-	memMgr.SetLLMCaller(func(ctx context.Context, sys, user string) (string, error) {
+	// LLM caller（记忆精炼 + 上下文压缩共用）
+	llmCaller := func(ctx context.Context, sys, user string) (string, error) {
 		tempAgent := agent.NewAgent(agentCfg, tools.NewRegistry(), memory.NewManager(memory.NewStore(memDir), 999))
 		return tempAgent.Run(ctx, user)
-	})
+	}
+	memMgr.SetLLMCaller(llmCaller)
+
+	// 设置上下文压缩器
+	contextLength := 128000 // 默认上下文窗口
+	if cl := os.Getenv("GOCLAW_CONTEXT_LENGTH"); cl != "" {
+		if v, err := fmt.Sscanf(cl, "%d", &contextLength); err != nil || v != 1 {
+			contextLength = 128000
+		}
+	}
+	compressor := agent.NewCompressor(agent.CompressorConfig{
+		ContextLength: contextLength,
+	}, llmCaller)
+	ag.SetCompressor(compressor)
 
 	// 打印欢迎信息
 	printBanner(provider, model, baseURL, tavilyKey != "")
@@ -257,10 +323,12 @@ func showHelp() {
 	fmt.Println("  /clear   - 清空对话历史")
 	fmt.Println("  /quit    - 退出")
 	fmt.Printf("\n%s环境变量:%s\n", colorYellow, colorReset)
-	fmt.Println("  GOCLAW_PROVIDER      - 提供方 (claude/mimo/siliconflow/openai)")
+	fmt.Println("  GOCLAW_PROVIDER      - 提供方 (claude/mimo/minimax/siliconflow/openai)")
 	fmt.Println("  ANTHROPIC_API_KEY    - Claude API Key")
 	fmt.Println("  ANTHROPIC_BASE_URL   - Claude API 代理地址")
 	fmt.Println("  MIMO_API_KEY         - 小米 MiMo API Key")
+	fmt.Println("  MINIMAX_API_KEY      - MiniMax API Key")
+	fmt.Println("  MINIMAX_BASE_URL     - MiniMax API 地址 (默认 api.minimax.chat)")
 	fmt.Println("  SILICONFLOW_API_KEY  - 硅基流动 API Key")
 	fmt.Println("  OPENAI_API_KEY       - OpenAI 兼容 API Key")
 	fmt.Println("  OPENAI_BASE_URL      - API 地址 (DeepSeek/豆包/Ollama)")
