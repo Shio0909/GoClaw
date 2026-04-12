@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
@@ -11,12 +12,27 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// authTransport 为 HTTP 请求注入 Authorization 头
+type authTransport struct {
+	base   http.RoundTripper
+	apiKey string
+}
+
+func (t *authTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	req.Header.Set("Authorization", "Bearer "+t.apiKey)
+	return t.base.RoundTrip(req)
+}
+
 // MCPServerConfig 一个 MCP Server 的配置
 type MCPServerConfig struct {
-	Name    string            `json:"name"`
-	Command string            `json:"command"`
-	Args    []string          `json:"args"`
-	Env     map[string]string `json:"env,omitempty"`
+	Name      string            `json:"name"`
+	Command   string            `json:"command,omitempty"`   // stdio 模式
+	Args      []string          `json:"args,omitempty"`      // stdio 模式
+	Env       map[string]string `json:"env,omitempty"`
+	Endpoint  string            `json:"endpoint,omitempty"`  // HTTP 模式（SSE 或 Streamable HTTP）
+	Transport string            `json:"transport,omitempty"` // "stdio"(默认), "sse", "streamable_http"
+	APIKey    string            `json:"api_key,omitempty"`   // HTTP 模式的认证 key
+	ToolNames []string          `json:"tool_names,omitempty"` // 只导入指定工具，空则全部导入
 }
 
 // MCPBridge 管理多个 MCP Server 连接，将远程工具桥接到本地 Registry
@@ -38,28 +54,49 @@ func NewMCPBridge() *MCPBridge {
 }
 
 // Connect 连接到一个 MCP Server 并注册其工具
+// 自动根据配置选择 stdio/sse/streamable_http 传输层
 func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *Registry) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	// 构建命令
-	cmd := exec.Command(cfg.Command, cfg.Args...)
-
-	// 设置环境变量
-	if len(cfg.Env) > 0 {
-		for k, v := range cfg.Env {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-		}
-	}
-
-	// 创建 MCP Client
 	client := mcp.NewClient(&mcp.Implementation{
 		Name:    "goclaw",
 		Version: "1.0.0",
 	}, nil)
 
-	// 通过 stdio 连接
-	transport := mcp.NewCommandTransport(cmd)
+	// 根据传输类型创建不同的 transport
+	var transport mcp.Transport
+	transportType := strings.ToLower(cfg.Transport)
+
+	switch transportType {
+	case "sse":
+		opts := &mcp.SSEClientTransportOptions{}
+		if cfg.APIKey != "" {
+			opts.HTTPClient = &http.Client{
+				Transport: &authTransport{base: http.DefaultTransport, apiKey: cfg.APIKey},
+			}
+		}
+		transport = mcp.NewSSEClientTransport(cfg.Endpoint, opts)
+
+	case "streamable_http":
+		opts := &mcp.StreamableClientTransportOptions{}
+		if cfg.APIKey != "" {
+			opts.HTTPClient = &http.Client{
+				Transport: &authTransport{base: http.DefaultTransport, apiKey: cfg.APIKey},
+			}
+		}
+		transport = mcp.NewStreamableClientTransport(cfg.Endpoint, opts)
+
+	default: // "stdio" 或空
+		cmd := exec.Command(cfg.Command, cfg.Args...)
+		if len(cfg.Env) > 0 {
+			for k, v := range cfg.Env {
+				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+			}
+		}
+		transport = mcp.NewCommandTransport(cmd)
+	}
+
 	session, err := client.Connect(ctx, transport)
 	if err != nil {
 		return fmt.Errorf("connect to MCP server %s: %w", cfg.Name, err)
@@ -73,15 +110,29 @@ func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *
 		return fmt.Errorf("list tools from %s: %w", cfg.Name, err)
 	}
 
+	// 构建工具名过滤集
+	allowedTools := make(map[string]bool)
+	for _, tn := range cfg.ToolNames {
+		allowedTools[tn] = true
+	}
+
 	var toolNames []string
 	for _, tool := range toolsResult.Tools {
+		// 如果指定了 ToolNames 过滤，只导入指定的工具
+		if len(allowedTools) > 0 && !allowedTools[tool.Name] {
+			continue
+		}
 		b.toolMap[tool.Name] = session
 		registry.Register(b.wrapMCPTool(cfg.Name, tool, session))
 		toolNames = append(toolNames, tool.Name)
 	}
 	b.serverTools[cfg.Name] = toolNames
 
-	fmt.Printf("  已连接 MCP Server: %s (%d 个工具)\n", cfg.Name, len(toolsResult.Tools))
+	label := transportType
+	if label == "" {
+		label = "stdio"
+	}
+	fmt.Printf("  已连接 MCP Server: %s [%s] (%d 个工具)\n", cfg.Name, label, len(toolNames))
 	return nil
 }
 

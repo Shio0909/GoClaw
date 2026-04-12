@@ -457,6 +457,7 @@ func loadEnvFile(path string) {
 }
 
 // connectMCPServers 从 mcp_servers.json 加载并连接 MCP Servers
+// 支持 stdio（command+args）、sse（endpoint）、streamable_http（endpoint）三种传输
 func connectMCPServers(registry *tools.Registry) *tools.MCPBridge {
 	data, err := os.ReadFile("mcp_servers.json")
 	if err != nil {
@@ -465,9 +466,13 @@ func connectMCPServers(registry *tools.Registry) *tools.MCPBridge {
 
 	var config struct {
 		MCPServers map[string]struct {
-			Command string            `json:"command"`
-			Args    []string          `json:"args"`
-			Env     map[string]string `json:"env"`
+			Command   string            `json:"command"`
+			Args      []string          `json:"args"`
+			Env       map[string]string `json:"env"`
+			Endpoint  string            `json:"endpoint"`
+			Transport string            `json:"transport"`
+			APIKey    string            `json:"api_key"`
+			ToolNames []string          `json:"tool_names"`
 		} `json:"mcpServers"`
 	}
 	if err := json.Unmarshal(data, &config); err != nil {
@@ -484,10 +489,14 @@ func connectMCPServers(registry *tools.Registry) *tools.MCPBridge {
 
 	for name, srv := range config.MCPServers {
 		err := bridge.Connect(ctx, tools.MCPServerConfig{
-			Name:    name,
-			Command: srv.Command,
-			Args:    srv.Args,
-			Env:     srv.Env,
+			Name:      name,
+			Command:   srv.Command,
+			Args:      srv.Args,
+			Env:       srv.Env,
+			Endpoint:  srv.Endpoint,
+			Transport: srv.Transport,
+			APIKey:    srv.APIKey,
+			ToolNames: srv.ToolNames,
 		}, registry)
 		if err != nil {
 			fmt.Printf("  %sMCP %s 连接失败: %v%s\n", colorRed, name, err, colorReset)
