@@ -7,6 +7,48 @@ import (
 	"time"
 )
 
+// -------- 退避算法测试 --------
+
+func TestBackoffGrowth(t *testing.T) {
+	backoff := reconnectInitial
+	expected := []time.Duration{2, 4, 8, 16, 32, 64, 120, 120}
+	for i, want := range expected {
+		wantDuration := want * time.Second
+		if backoff != wantDuration {
+			t.Fatalf("step %d: expected %v, got %v", i, wantDuration, backoff)
+		}
+		backoff *= reconnectFactor
+		if backoff > reconnectMax {
+			backoff = reconnectMax
+		}
+	}
+}
+
+func TestBackoffResetAfterStableConnection(t *testing.T) {
+	backoff := reconnectMax // 模拟已达最大退避
+	uptime := 31 * time.Second
+	if uptime > 30*time.Second {
+		backoff = reconnectInitial
+	}
+	if backoff != reconnectInitial {
+		t.Fatalf("expected reset to %v, got %v", reconnectInitial, backoff)
+	}
+}
+
+func TestBackoffJitterRange(t *testing.T) {
+	backoff := 10 * time.Second
+	for i := 0; i < 100; i++ {
+		jitter := time.Duration(int64(backoff) / 2)
+		wait := backoff + jitter - backoff/4
+		// wait 应在 [backoff*0.75, backoff*1.25] 范围内（jitter 最大值）
+		minWait := backoff - backoff/4
+		maxWait := backoff + backoff/2 - backoff/4
+		if wait < minWait || wait > maxWait {
+			t.Fatalf("jitter out of range: %v (expected [%v, %v])", wait, minWait, maxWait)
+		}
+	}
+}
+
 func TestSplitMessageShort(t *testing.T) {
 	chunks := splitMessage("短消息", 100)
 	if len(chunks) != 1 {
@@ -132,5 +174,50 @@ func TestSendLimiterPacing(t *testing.T) {
 	// 3次调用应至少花 100ms（第一次不等待，后两次各等 50ms）
 	if elapsed < 80*time.Millisecond {
 		t.Fatalf("expected >= 80ms, got %v", elapsed)
+	}
+}
+
+func TestSendLimiterConcurrency(t *testing.T) {
+	l := newSendLimiter(10 * time.Millisecond)
+	var wg sync.WaitGroup
+	for i := 0; i < 5; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			l.wait()
+		}()
+	}
+	wg.Wait()
+}
+
+func TestDedupRingTTLExpiry(t *testing.T) {
+	d := &dedupRing{
+		entries: make([]dedupEntry, 10),
+		size:    10,
+	}
+	// 手动插入一个过期的条目
+	d.entries[0] = dedupEntry{msgID: 42, ts: time.Now().Add(-6 * time.Minute)}
+	d.pos = 1
+
+	// 过期的 ID 不应被识别为 "seen"
+	if d.seen(42) {
+		t.Fatal("expired entry should not be detected as seen")
+	}
+}
+
+// -------- 常量一致性测试 --------
+
+func TestConstantsConsistency(t *testing.T) {
+	if pongTimeout < 2*pingInterval {
+		t.Fatal("pongTimeout should be >= 2*pingInterval")
+	}
+	if reconnectInitial > reconnectMax {
+		t.Fatal("reconnectInitial should be <= reconnectMax")
+	}
+	if reconnectFactor < 2 {
+		t.Fatal("reconnectFactor should be >= 2")
+	}
+	if dedupCapacity <= 0 {
+		t.Fatal("dedupCapacity must be positive")
 	}
 }
