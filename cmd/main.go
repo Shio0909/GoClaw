@@ -212,6 +212,22 @@ func main() {
 	ag := agent.NewAgent(agentCfg, registry, memMgr)
 	ag.SetRetryConfig(retryCfg)
 
+	// 配置智能模型路由（可选）
+	if simpleModel := os.Getenv("GOCLAW_SIMPLE_MODEL"); simpleModel != "" {
+		routerCfg := agent.RouterConfig{
+			SimpleModel:  simpleModel,
+			ComplexModel: model, // 复杂问题用主模型
+		}
+		if sp := os.Getenv("GOCLAW_SIMPLE_PROVIDER"); sp != "" {
+			routerCfg.SimpleProvider = sp
+		}
+		if sb := os.Getenv("GOCLAW_SIMPLE_BASE_URL"); sb != "" {
+			routerCfg.SimpleBaseURL = sb
+		}
+		ag.SetRouter(agent.NewModelRouter(routerCfg))
+		log.Printf("🧠 智能路由已启用: 简单→%s, 复杂→%s", simpleModel, model)
+	}
+
 	// LLM caller（记忆精炼 + 上下文压缩共用）
 	llmCaller := func(ctx context.Context, sys, user string) (string, error) {
 		tempAgent := agent.NewAgent(agentCfg, tools.NewRegistry(), memory.NewManager(memory.NewStore(memDir), 999))

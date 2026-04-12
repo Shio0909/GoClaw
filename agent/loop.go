@@ -55,6 +55,7 @@ type Agent struct {
 	extraSystemPrompt string       // 额外的 system prompt（如 QQ 聊天模式指令）
 	compressor        *Compressor  // 上下文压缩器（可选）
 	retryConfig       *RetryConfig // 重试 + Key 轮换配置（可选）
+	router            *ModelRouter // 智能模型路由器（可选）
 }
 
 // NewAgent 创建 Agent
@@ -84,6 +85,11 @@ func (a *Agent) SetCompressor(c *Compressor) {
 // SetRetryConfig 设置重试 + Key 轮换配置
 func (a *Agent) SetRetryConfig(cfg *RetryConfig) {
 	a.retryConfig = cfg
+}
+
+// SetRouter 设置智能模型路由器
+func (a *Agent) SetRouter(r *ModelRouter) {
+	a.router = r
 }
 
 // createModel 根据 provider 配置创建 Eino 模型
@@ -173,6 +179,7 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 	runFn := func(cfg Config) error {
 		origKey := a.cfg.APIKey
 		a.cfg.APIKey = cfg.APIKey
+		a.applyRoute(userInput)
 		defer func() { a.cfg.APIKey = origKey }()
 
 		agent, err := a.buildReactAgent(ctx)
@@ -215,6 +222,7 @@ func (a *Agent) RunStream(ctx context.Context, userInput string) (*schema.Stream
 	runFn := func(cfg Config) error {
 		origKey := a.cfg.APIKey
 		a.cfg.APIKey = cfg.APIKey
+		a.applyRoute(userInput)
 		defer func() { a.cfg.APIKey = origKey }()
 
 		agent, err := a.buildReactAgent(ctx)
@@ -265,6 +273,7 @@ func (a *Agent) RunWithImages(ctx context.Context, text string, images []ImageIn
 	runFn := func(cfg Config) error {
 		origKey := a.cfg.APIKey
 		a.cfg.APIKey = cfg.APIKey
+		a.applyRoute(text)
 		defer func() { a.cfg.APIKey = origKey }()
 
 		agent, err := a.buildReactAgent(ctx)
@@ -334,6 +343,23 @@ func (a *Agent) buildMultimodalMessages(ctx context.Context, text string, images
 // ClearHistory 清空对话历史
 func (a *Agent) ClearHistory() {
 	a.history = nil
+}
+
+// applyRoute 应用模型路由（如果配置了路由器）
+func (a *Agent) applyRoute(input string) {
+	if a.router == nil {
+		return
+	}
+	route := a.router.Route(input)
+	if route.Model != "" {
+		a.cfg.Model = route.Model
+	}
+	if route.Provider != "" {
+		a.cfg.Provider = route.Provider
+	}
+	if route.BaseURL != "" {
+		a.cfg.BaseURL = route.BaseURL
+	}
 }
 
 // MemoryManager 返回记忆管理器

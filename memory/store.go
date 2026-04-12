@@ -23,6 +23,11 @@ func (s *Store) SubStore(namespace string) *Store {
 	return &Store{baseDir: filepath.Join(s.baseDir, namespace)}
 }
 
+// SubProvider 实现 Provider 接口
+func (s *Store) SubProvider(namespace string) Provider {
+	return s.SubStore(namespace)
+}
+
 // ReadSoul 读取 soul.md
 func (s *Store) ReadSoul() (string, error) {
 	return s.readFile("soul.md")
