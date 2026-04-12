@@ -39,6 +39,7 @@ func RegisterBuiltins(r *Registry) {
 
 	// 技能管理
 	r.Register(NewSkillInstallTool())
+	RegisterSkillTools(r)
 }
 
 func fileReadTool() *ToolDef {

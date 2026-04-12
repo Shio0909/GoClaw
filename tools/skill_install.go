@@ -31,7 +31,11 @@ func NewSkillInstallTool() *ToolDef {
 			// 预览模式：首次调用展示内容，用户确认后才写入
 			confirmed, _ := args["confirmed"].(string)
 			if confirmed != "true" {
-				preview := fmt.Sprintf("📋 技能预览\n\n名称: %s\n描述: %s\n\n--- SKILL.md 内容 ---\n%s\n---\n\n⚠️ 技能会注入到系统提示词中，请确认内容安全。\n用户确认后，再次调用 skill_install 并设置 confirmed=\"true\"。", name, description, content)
+				var securityNote string
+				if issues := scanSkillContent(content); len(issues) > 0 {
+					securityNote = fmt.Sprintf("\n\n🔒 安全扫描发现问题：\n%s\n", strings.Join(issues, "\n"))
+				}
+				preview := fmt.Sprintf("📋 技能预览\n\n名称: %s\n描述: %s\n\n--- SKILL.md 内容 ---\n%s\n---%s\n\n⚠️ 技能会注入到系统提示词中，请确认内容安全。\n用户确认后，再次调用 skill_install 并设置 confirmed=\"true\"。", name, description, content, securityNote)
 				return preview, nil
 			}
 

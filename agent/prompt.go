@@ -49,6 +49,12 @@ func BuildSystemPrompt(memMgr *memory.Manager, registry *tools.Registry) (string
 	sb.WriteString("- 白名单包（@modelcontextprotocol/ 官方包和精选列表）会自动通过审查\n")
 	sb.WriteString("- 安装后当前对话立即可用新工具，无需重启\n")
 	sb.WriteString("- 技能安装同理：skill_install 会先预览完整内容，用户确认后才写入文件\n")
+	sb.WriteString("\n=== 技能自改进 ===\n")
+	sb.WriteString("- 当你注意到用户反复请求相同类型的任务时（如翻译、总结、代码模板），主动建议创建一个技能来自动化\n")
+	sb.WriteString("- 使用 skill_install 创建新技能，skill_update 改进现有技能，skill_list 查看已有技能\n")
+	sb.WriteString("- 如果用户给出了对某个技能的改进反馈（如'下次翻译时保留原文'），用 skill_update 更新相应技能\n")
+	sb.WriteString("- 技能内容应该是清晰的 Markdown 指令，告诉你如何一步步完成该任务\n")
+	sb.WriteString("- 好的技能应该有：触发条件、执行步骤、输出格式、注意事项\n")
 
 	// 沙箱限制
 	if tools.Sandbox != "" {
