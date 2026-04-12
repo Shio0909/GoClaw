@@ -6,8 +6,8 @@
       "env": {}
     },
     "eino-rag": {
-      "endpoint": "http://localhost:19094/mcp",
-      "transport": "streamable_http",
+      "endpoint": "http://localhost:19094/sse",
+      "transport": "sse",
       "api_key": "",
       "tool_names": []
     }

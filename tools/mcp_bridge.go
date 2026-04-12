@@ -53,6 +53,16 @@ func NewMCPBridge() *MCPBridge {
 	}
 }
 
+// newHTTPClient 创建带认证的 HTTP 客户端（如果需要）
+func newHTTPClient(apiKey string) *http.Client {
+	if apiKey == "" {
+		return nil
+	}
+	return &http.Client{
+		Transport: &authTransport{base: http.DefaultTransport, apiKey: apiKey},
+	}
+}
+
 // Connect 连接到一个 MCP Server 并注册其工具
 // 自动根据配置选择 stdio/sse/streamable_http 传输层
 func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *Registry) error {
@@ -70,22 +80,16 @@ func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *
 
 	switch transportType {
 	case "sse":
-		opts := &mcp.SSEClientTransportOptions{}
-		if cfg.APIKey != "" {
-			opts.HTTPClient = &http.Client{
-				Transport: &authTransport{base: http.DefaultTransport, apiKey: cfg.APIKey},
-			}
+		transport = &mcp.SSEClientTransport{
+			Endpoint:   cfg.Endpoint,
+			HTTPClient: newHTTPClient(cfg.APIKey),
 		}
-		transport = mcp.NewSSEClientTransport(cfg.Endpoint, opts)
 
 	case "streamable_http":
-		opts := &mcp.StreamableClientTransportOptions{}
-		if cfg.APIKey != "" {
-			opts.HTTPClient = &http.Client{
-				Transport: &authTransport{base: http.DefaultTransport, apiKey: cfg.APIKey},
-			}
+		transport = &mcp.StreamableClientTransport{
+			Endpoint:   cfg.Endpoint,
+			HTTPClient: newHTTPClient(cfg.APIKey),
 		}
-		transport = mcp.NewStreamableClientTransport(cfg.Endpoint, opts)
 
 	default: // "stdio" 或空
 		cmd := exec.Command(cfg.Command, cfg.Args...)
@@ -94,10 +98,10 @@ func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *
 				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
 			}
 		}
-		transport = mcp.NewCommandTransport(cmd)
+		transport = &mcp.CommandTransport{Command: cmd}
 	}
 
-	session, err := client.Connect(ctx, transport)
+	session, err := client.Connect(ctx, transport, nil)
 	if err != nil {
 		return fmt.Errorf("connect to MCP server %s: %w", cfg.Name, err)
 	}
@@ -118,12 +122,11 @@ func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *
 
 	var toolNames []string
 	for _, tool := range toolsResult.Tools {
-		// 如果指定了 ToolNames 过滤，只导入指定的工具
 		if len(allowedTools) > 0 && !allowedTools[tool.Name] {
 			continue
 		}
 		b.toolMap[tool.Name] = session
-		registry.Register(b.wrapMCPTool(cfg.Name, tool, session))
+		registry.Register(b.wrapMCPTool(cfg.Name, *tool, session))
 		toolNames = append(toolNames, tool.Name)
 	}
 	b.serverTools[cfg.Name] = toolNames
@@ -137,28 +140,35 @@ func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *
 }
 
 // wrapMCPTool 将 MCP 远程工具包装为本地 ToolDef
-func (b *MCPBridge) wrapMCPTool(serverName string, tool *mcp.Tool, session *mcp.ClientSession) *ToolDef {
-	// 从 JSON Schema 提取参数定义
+func (b *MCPBridge) wrapMCPTool(serverName string, tool mcp.Tool, session *mcp.ClientSession) *ToolDef {
+	// 从 InputSchema (any → map[string]any) 提取参数定义
 	var params []ParamDef
-	if tool.InputSchema != nil && tool.InputSchema.Properties != nil {
+	if schemaMap, ok := tool.InputSchema.(map[string]any); ok {
 		required := make(map[string]bool)
-		for _, r := range tool.InputSchema.Required {
-			required[r] = true
+		if reqList, ok := schemaMap["required"].([]any); ok {
+			for _, r := range reqList {
+				if s, ok := r.(string); ok {
+					required[s] = true
+				}
+			}
 		}
-		for name, prop := range tool.InputSchema.Properties {
-			p := ParamDef{
-				Name:     name,
-				Required: required[name],
+		if props, ok := schemaMap["properties"].(map[string]any); ok {
+			for name, propRaw := range props {
+				p := ParamDef{
+					Name:     name,
+					Required: required[name],
+					Type:     "string",
+				}
+				if propMap, ok := propRaw.(map[string]any); ok {
+					if t, ok := propMap["type"].(string); ok {
+						p.Type = t
+					}
+					if d, ok := propMap["description"].(string); ok {
+						p.Description = d
+					}
+				}
+				params = append(params, p)
 			}
-			if prop.Type != "" {
-				p.Type = string(prop.Type)
-			} else {
-				p.Type = "string"
-			}
-			if prop.Description != "" {
-				p.Description = prop.Description
-			}
-			params = append(params, p)
 		}
 	}
 
@@ -169,17 +179,18 @@ func (b *MCPBridge) wrapMCPTool(serverName string, tool *mcp.Tool, session *mcp.
 		desc = fmt.Sprintf("[MCP:%s] %s", serverName, desc)
 	}
 
+	toolName := tool.Name
 	return &ToolDef{
-		Name:        tool.Name,
+		Name:        toolName,
 		Description: desc,
 		Parameters:  params,
 		Fn: func(ctx context.Context, args map[string]any) (string, error) {
 			result, err := session.CallTool(ctx, &mcp.CallToolParams{
-				Name:      tool.Name,
+				Name:      toolName,
 				Arguments: args,
 			})
 			if err != nil {
-				return "", fmt.Errorf("MCP call %s/%s: %w", serverName, tool.Name, err)
+				return "", fmt.Errorf("MCP call %s/%s: %w", serverName, toolName, err)
 			}
 
 			// 提取文本内容
@@ -188,7 +199,6 @@ func (b *MCPBridge) wrapMCPTool(serverName string, tool *mcp.Tool, session *mcp.
 				if tc, ok := content.(*mcp.TextContent); ok {
 					parts = append(parts, tc.Text)
 				} else {
-					// 其他类型序列化为 JSON
 					data, _ := json.Marshal(content)
 					parts = append(parts, string(data))
 				}
@@ -208,7 +218,6 @@ func (b *MCPBridge) Disconnect(name string, registry *Registry) error {
 		return fmt.Errorf("MCP server %s 未连接", name)
 	}
 
-	// 移除该 server 注册的所有工具
 	for _, toolName := range b.serverTools[name] {
 		delete(b.toolMap, toolName)
 		registry.Unregister(toolName)
