@@ -56,6 +56,7 @@ type Agent struct {
 	compressor        *Compressor  // 上下文压缩器（可选）
 	retryConfig       *RetryConfig // 重试 + Key 轮换配置（可选）
 	router            *ModelRouter // 智能模型路由器（可选）
+	skillLearner      *SkillLearner // 技能自学习引擎（可选）
 }
 
 // NewAgent 创建 Agent
@@ -205,6 +206,7 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 
 	a.history = append(a.history, schema.UserMessage(userInput), resp)
 	a.memMgr.OnTurn(ctx, "assistant", resp.Content)
+	a.CheckSkillLearning(ctx, resp.Content)
 	return resp.Content, nil
 }
 
@@ -252,6 +254,7 @@ func (a *Agent) RunStream(ctx context.Context, userInput string) (*schema.Stream
 func (a *Agent) AppendAssistantMessage(ctx context.Context, content string) {
 	a.history = append(a.history, schema.AssistantMessage(content, nil))
 	a.memMgr.OnTurn(ctx, "assistant", content)
+	a.CheckSkillLearning(ctx, content)
 }
 
 // ImageInput 图片输入（base64 编码）
@@ -299,6 +302,7 @@ func (a *Agent) RunWithImages(ctx context.Context, text string, images []ImageIn
 
 	a.history = append(a.history, schema.UserMessage(text), resp)
 	a.memMgr.OnTurn(ctx, "assistant", resp.Content)
+	a.CheckSkillLearning(ctx, resp.Content)
 	return resp.Content, nil
 }
 

@@ -189,8 +189,9 @@ type QQBot struct {
 	limiter *sendLimiter // 出站限流
 	wg      sync.WaitGroup // 等待处理中的消息
 	contextLength int     // 上下文窗口大小，用于压缩器
-	retryConfig   *agent.RetryConfig // 重试配置
-	sttConfig     STTConfig          // 语音转文字配置
+	retryConfig     *agent.RetryConfig        // 重试配置
+	skillLearnerCfg *agent.SkillLearnerConfig // 技能自学习配置
+	sttConfig       STTConfig                 // 语音转文字配置
 	apiPending    *pendingRequests   // API 请求-响应路由
 }
 
@@ -211,8 +212,9 @@ type QQBotConfig struct {
 	MemStore      *memory.Store
 	StickersDir   string             // 表情包目录，空则不启用
 	ContextLength int                // 上下文窗口大小，0 则使用默认 128000
-	RetryConfig   *agent.RetryConfig // 重试 + Key 轮换配置（可选）
-	STTConfig     STTConfig          // 语音转文字配置（可选）
+	RetryConfig       *agent.RetryConfig        // 重试 + Key 轮换配置（可选）
+	SkillLearnerCfg   *agent.SkillLearnerConfig // 技能自学习配置（可选）
+	STTConfig         STTConfig                 // 语音转文字配置（可选）
 }
 
 // OneBot v11 事件
@@ -261,8 +263,9 @@ func NewQQBot(cfg QQBotConfig) *QQBot {
 		dedup:         newDedupRing(dedupCapacity),
 		limiter:       newSendLimiter(sendInterval),
 		contextLength: ctxLen,
-		retryConfig:   cfg.RetryConfig,
-		sttConfig:     cfg.STTConfig,
+		retryConfig:     cfg.RetryConfig,
+		skillLearnerCfg: cfg.SkillLearnerCfg,
+		sttConfig:       cfg.STTConfig,
 		apiPending:    newPendingRequests(),
 	}
 }
@@ -305,6 +308,12 @@ func (b *QQBot) getSession(key string, isGroup bool) *agent.Agent {
 	// 设置重试 + Key 轮换
 	if b.retryConfig != nil {
 		ag.SetRetryConfig(b.retryConfig)
+	}
+
+	// 技能自学习
+	if b.skillLearnerCfg != nil && b.skillLearnerCfg.NudgeInterval > 0 {
+		learner := agent.NewSkillLearner(*b.skillLearnerCfg, b.agentCfg, reg, b.memStore)
+		ag.SetSkillLearner(learner)
 	}
 
 	b.sessions.Store(key, &session{agent: ag, lastUsed: time.Now()})

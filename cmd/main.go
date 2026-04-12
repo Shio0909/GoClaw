@@ -193,17 +193,33 @@ func main() {
 			log.Printf("   STT: %s (模型: %s)", sttCfg.BaseURL, sttCfg.Model)
 		}
 
+		// 技能自学习配置
+		nudgeInterval := 8
+		if ni := os.Getenv("GOCLAW_SKILL_NUDGE_INTERVAL"); ni != "" {
+			if v, err := fmt.Sscanf(ni, "%d", &nudgeInterval); err != nil || v != 1 {
+				nudgeInterval = 8
+			}
+		}
+		var qqSkillLearnerCfg *agent.SkillLearnerConfig
+		if nudgeInterval > 0 {
+			qqSkillLearnerCfg = &agent.SkillLearnerConfig{
+				NudgeInterval: nudgeInterval,
+				SkillsDir:     "skills",
+			}
+		}
+
 		bot := gateway.NewQQBot(gateway.QQBotConfig{
-			WebSocketURL:  qqWS,
-			SelfID:        qqSelfID,
-			AdminIDs:      adminIDs,
-			AgentCfg:      agentCfg,
-			Registry:      registry,
-			MemStore:      store,
-			StickersDir:   os.Getenv("GOCLAW_STICKERS_DIR"),
-			ContextLength: contextLength,
-			RetryConfig:   retryCfg,
-			STTConfig:     sttCfg,
+			WebSocketURL:    qqWS,
+			SelfID:          qqSelfID,
+			AdminIDs:        adminIDs,
+			AgentCfg:        agentCfg,
+			Registry:        registry,
+			MemStore:        store,
+			StickersDir:     os.Getenv("GOCLAW_STICKERS_DIR"),
+			ContextLength:   contextLength,
+			RetryConfig:     retryCfg,
+			SkillLearnerCfg: qqSkillLearnerCfg,
+			STTConfig:       sttCfg,
 		})
 
 		// 优雅关闭：监听 SIGINT/SIGTERM
@@ -260,6 +276,21 @@ func main() {
 		ContextLength: contextLength,
 	}, llmCaller)
 	ag.SetCompressor(compressor)
+
+	// 技能自学习（可选，默认开启）
+	nudgeInterval := 8
+	if ni := os.Getenv("GOCLAW_SKILL_NUDGE_INTERVAL"); ni != "" {
+		if v, err := fmt.Sscanf(ni, "%d", &nudgeInterval); err != nil || v != 1 {
+			nudgeInterval = 8
+		}
+	}
+	if nudgeInterval > 0 {
+		learner := agent.NewSkillLearner(agent.SkillLearnerConfig{
+			NudgeInterval: nudgeInterval,
+			SkillsDir:     "skills",
+		}, agentCfg, registry, store)
+		ag.SetSkillLearner(learner)
+	}
 
 	// 打印欢迎信息
 	printBanner(provider, model, baseURL, tavilyKey != "")
