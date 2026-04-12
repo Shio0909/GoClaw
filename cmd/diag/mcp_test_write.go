@@ -39,8 +39,8 @@ func main() {
 	createResult, err := session.CallTool(ctx, &mcp.CallToolParams{
 		Name: "create_knowledge_base",
 		Arguments: map[string]any{
-			"name":        "mcp-test-kb",
-			"description": "MCP write tool test - can be deleted",
+			"name":        "mcp-write-test",
+			"description": "MCP write tool test - will be deleted",
 			"mode":        "vector",
 		},
 	})
@@ -70,7 +70,54 @@ func main() {
 		log.Fatalf("❌ import_url failed: %v", err)
 	}
 	fmt.Printf("  Result: %s\n", extractText(importResult))
-	fmt.Println("  ✅ URL imported successfully!")
+	fmt.Println("  ✅ URL imported!")
+
+	// Test 3: list_documents
+	fmt.Println("\n📋 Test 3: list_documents")
+	listResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "list_documents",
+		Arguments: map[string]any{
+			"knowledge_base_id": kbID,
+		},
+	})
+	if err != nil {
+		log.Fatalf("❌ list_documents failed: %v", err)
+	}
+	listText := extractText(listResult)
+	fmt.Printf("  Result: %s\n", truncate(listText, 300))
+	docID := extractDocID(listText)
+	fmt.Printf("  ✅ Found doc: %s\n", docID)
+
+	// Test 4: delete_document
+	if docID != "" {
+		fmt.Println("\n🗑️ Test 4: delete_document")
+		delDocResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+			Name: "delete_document",
+			Arguments: map[string]any{
+				"knowledge_base_id": kbID,
+				"document_id":       docID,
+			},
+		})
+		if err != nil {
+			log.Fatalf("❌ delete_document failed: %v", err)
+		}
+		fmt.Printf("  Result: %s\n", extractText(delDocResult))
+		fmt.Println("  ✅ Document deleted!")
+	}
+
+	// Test 5: delete_knowledge_base
+	fmt.Println("\n🗑️ Test 5: delete_knowledge_base")
+	delResult, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name: "delete_knowledge_base",
+		Arguments: map[string]any{
+			"knowledge_base_id": kbID,
+		},
+	})
+	if err != nil {
+		log.Fatalf("❌ delete_knowledge_base failed: %v", err)
+	}
+	fmt.Printf("  Result: %s\n", extractText(delResult))
+	fmt.Println("  ✅ Knowledge base deleted!")
 
 	fmt.Println("\n🎉 All MCP write tool tests passed!")
 }
@@ -95,4 +142,29 @@ func extractField(jsonStr, field string) string {
 		}
 	}
 	return ""
+}
+
+func extractDocID(jsonStr string) string {
+	var m map[string]any
+	if err := json.Unmarshal([]byte(jsonStr), &m); err != nil {
+		return ""
+	}
+	docs, ok := m["documents"].([]any)
+	if !ok || len(docs) == 0 {
+		return ""
+	}
+	if doc, ok := docs[0].(map[string]any); ok {
+		if id, ok := doc["id"].(string); ok {
+			return id
+		}
+	}
+	return ""
+}
+
+func truncate(s string, max int) string {
+	runes := []rune(s)
+	if len(runes) <= max {
+		return s
+	}
+	return string(runes[:max]) + "..."
 }
