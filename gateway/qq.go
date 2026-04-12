@@ -191,6 +191,7 @@ type QQBot struct {
 	contextLength int     // 上下文窗口大小，用于压缩器
 	retryConfig   *agent.RetryConfig // 重试配置
 	sttConfig     STTConfig          // 语音转文字配置
+	apiPending    *pendingRequests   // API 请求-响应路由
 }
 
 // session 单个会话（按 user/group 隔离）
@@ -262,6 +263,7 @@ func NewQQBot(cfg QQBotConfig) *QQBot {
 		contextLength: ctxLen,
 		retryConfig:   cfg.RetryConfig,
 		sttConfig:     cfg.STTConfig,
+		apiPending:    newPendingRequests(),
 	}
 }
 
@@ -468,6 +470,13 @@ func (b *QQBot) connectAndListen(ctx context.Context) (time.Duration, error) {
 			return time.Since(connStart), fmt.Errorf("读取消息失败: %w", err)
 		}
 
+		// 尝试路由 API 响应
+		var resp apiResponse
+		if json.Unmarshal(message, &resp) == nil && resp.Echo != "" {
+			b.apiPending.resolve(resp)
+			continue
+		}
+
 		var event onebotEvent
 		if err := json.Unmarshal(message, &event); err != nil {
 			continue
@@ -497,13 +506,19 @@ func (b *QQBot) handleMessage(ctx context.Context, event *onebotEvent) {
 		return
 	}
 
-	// 群聊触发：@机器人 或 "goclaw" 前缀
+	// 提取引用回复 ID（在触发检测之前，因为回复bot也是触发方式）
+	replyID := extractReplyID(msg)
+	msg = stripCQReply(msg)
+
+	// 群聊触发：@机器人 或 "goclaw" 前缀 或回复机器人的消息
 	if event.MessageType == "group" {
 		atTag := fmt.Sprintf("[CQ:at,qq=%s]", b.selfID)
 		if strings.Contains(msg, atTag) {
 			msg = strings.TrimSpace(strings.ReplaceAll(msg, atTag, ""))
 		} else if strings.HasPrefix(strings.ToLower(msg), "goclaw") {
 			msg = strings.TrimSpace(msg[6:])
+		} else if replyID != "" {
+			// 回复机器人的消息也触发（稍后获取上下文判断）
 		} else {
 			return
 		}
@@ -551,6 +566,12 @@ func (b *QQBot) handleMessage(ctx context.Context, event *onebotEvent) {
 		ag.SetMemoryManager(userMgr)
 	}
 
+	// 获取引用消息上下文
+	var quotedContext string
+	if replyID != "" {
+		quotedContext = b.fetchQuotedContext(ctx, replyID)
+	}
+
 	// 处理语音消息
 	voiceText := processVoiceMessages(ctx, b.sttConfig, msg)
 	msg = stripCQRecords(msg)
@@ -565,6 +586,15 @@ func (b *QQBot) handleMessage(ctx context.Context, event *onebotEvent) {
 			text = voiceText
 		} else {
 			text = voiceText + "\n" + text
+		}
+	}
+
+	// 合并引用上下文
+	if quotedContext != "" {
+		if text == "" {
+			text = quotedContext
+		} else {
+			text = quotedContext + "\n" + text
 		}
 	}
 
@@ -609,8 +639,8 @@ func (b *QQBot) handleMessage(ctx context.Context, event *onebotEvent) {
 	}
 	log.Printf("[QQ] Agent 完成 (%v, %d字符): %s", elapsed, len(reply), reply)
 
-	// 分段发送
-	b.replySplit(event, reply)
+	// 分段发送（群聊首条带引用）
+	b.replySplitWithQuote(event, reply)
 }
 
 // -------- 发送消息 --------
