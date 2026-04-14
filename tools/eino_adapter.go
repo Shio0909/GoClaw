@@ -107,11 +107,14 @@ func (t *EinoTool) InvokableRun(ctx context.Context, argumentsInJSON string, opt
 	if t.def.Retryable {
 		maxAttempts = toolRetryMax
 	}
+	start := time.Now()
+	retries := 0
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		result, err = t.def.Fn(ctx, args)
 		if err == nil || !t.def.Retryable || !isTransientError(err) {
 			break
 		}
+		retries++
 		if attempt < maxAttempts {
 			wait := time.Duration(toolRetryBaseMs*(1<<(attempt-1))) * time.Millisecond
 			log.Printf("[Tool] %s 瞬时错误 (尝试 %d/%d): %v — %v 后重试", t.def.Name, attempt, maxAttempts, err, wait)
@@ -122,6 +125,8 @@ func (t *EinoTool) InvokableRun(ctx context.Context, argumentsInJSON string, opt
 			}
 		}
 	}
+	duration := time.Since(start)
+	globalStats.RecordCall(t.def.Name, duration, err, retries)
 
 	// 头尾保留截断策略：保留开头和结尾，中间插入截断提示
 	if len(result) > maxToolResultBytes {

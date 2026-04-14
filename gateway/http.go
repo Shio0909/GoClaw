@@ -128,6 +128,7 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("DELETE /v1/chat/{session}", s.handleDeleteSession)
 	mux.HandleFunc("GET /v1/chat/{session}/export", s.handleExportSession)
 	mux.HandleFunc("GET /v1/tools", s.handleListTools)
+	mux.HandleFunc("GET /v1/tools/stats", s.handleToolStats)
 	mux.HandleFunc("GET /v1/memory/{session}", s.handleGetMemory)
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
@@ -394,6 +395,10 @@ func (s *HTTPServer) handleListTools(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{"tools": toolList, "count": len(toolList)})
 }
 
+func (s *HTTPServer) handleToolStats(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, tools.GetGlobalToolStats().Summary())
+}
+
 func (s *HTTPServer) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 	sessionID := r.PathValue("session")
 	_ = sessionID // 记忆目前是全局的，sessionID 用于未来扩展
@@ -438,6 +443,7 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"tools_loaded":    len(s.registry.Names()),
 		"model":           s.agentCfg.Model,
 		"provider":        s.agentCfg.Provider,
+		"tool_stats":      tools.GetGlobalToolStats().Summary(),
 	})
 }
 
