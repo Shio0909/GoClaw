@@ -36,6 +36,8 @@ type HTTPServer struct {
 	sessionTimeout time.Duration
 	requestTimeout time.Duration
 	sessionStore   *SessionStore // 会话持久化（可选）
+	startedAt      time.Time     // 服务启动时间
+	chatCount      atomic.Int64  // 已处理的 chat 请求数
 
 	server *http.Server
 }
@@ -118,14 +120,17 @@ func (s *HTTPServer) Name() string { return "http" }
 
 // Run 启动 HTTP 服务器，阻塞直到 ctx 取消
 func (s *HTTPServer) Run(ctx context.Context) error {
+	s.startedAt = time.Now()
 	mux := http.NewServeMux()
 	// GoClaw native API
 	mux.HandleFunc("POST /v1/chat", s.handleChat)
 	mux.HandleFunc("GET /v1/chat/{session}", s.handleGetHistory)
 	mux.HandleFunc("DELETE /v1/chat/{session}", s.handleDeleteSession)
+	mux.HandleFunc("GET /v1/chat/{session}/export", s.handleExportSession)
 	mux.HandleFunc("GET /v1/tools", s.handleListTools)
 	mux.HandleFunc("GET /v1/memory/{session}", s.handleGetMemory)
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
+	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -272,6 +277,7 @@ func (s *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ag := s.getOrCreateSession(req.Session)
+	s.chatCount.Add(1)
 
 	if req.Stream {
 		s.handleStreamChat(w, r, ag, req)
@@ -415,6 +421,66 @@ func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
+	sessionCount := 0
+	s.sessions.Range(func(_, _ any) bool {
+		sessionCount++
+		return true
+	})
+
+	uptime := time.Since(s.startedAt)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"uptime_seconds":  int(uptime.Seconds()),
+		"uptime_human":    uptime.Round(time.Second).String(),
+		"total_requests":  requestCounter.Load(),
+		"total_chats":     s.chatCount.Load(),
+		"active_sessions": sessionCount,
+		"tools_loaded":    len(s.registry.Names()),
+		"model":           s.agentCfg.Model,
+		"provider":        s.agentCfg.Provider,
+	})
+}
+
+func (s *HTTPServer) handleExportSession(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session")
+	val, ok := s.sessions.Load(sessionID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	history := sess.agent.GetHistory()
+
+	format := r.URL.Query().Get("format")
+	if format == "markdown" || format == "md" {
+		w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.md", sessionID))
+		fmt.Fprintf(w, "# Conversation: %s\n\n", sessionID)
+		for _, msg := range history {
+			role := string(msg.Role)
+			switch msg.Role {
+			case "user":
+				role = "🧑 User"
+			case "assistant":
+				role = "🤖 Assistant"
+			case "tool":
+				role = "🔧 Tool"
+			case "system":
+				role = "⚙️ System"
+			}
+			fmt.Fprintf(w, "## %s\n\n%s\n\n---\n\n", role, msg.Content)
+		}
+		return
+	}
+
+	// 默认 JSON
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":       sessionID,
+		"message_count": len(history),
+		"messages":      history,
+	})
+}
+
 // -------- OpenAI-Compatible Endpoints --------
 
 // openaiMessage OpenAI 格式的消息
@@ -488,6 +554,7 @@ func (s *HTTPServer) handleChatCompletions(w http.ResponseWriter, r *http.Reques
 	// 使用 model 字段作为 session ID（简单映射，保证同一 "model" 复用会话）
 	sessionID := fmt.Sprintf("openai-%s", hashStr(fmt.Sprintf("%v", req.Messages[:len(req.Messages)-1])))
 	ag := s.getOrCreateSession(sessionID)
+	s.chatCount.Add(1)
 
 	respID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
 

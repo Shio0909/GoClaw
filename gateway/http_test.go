@@ -344,3 +344,85 @@ func TestHashStr(t *testing.T) {
 		t.Error("different input should produce different hash")
 	}
 }
+
+func TestMetricsEndpoint(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/metrics", srv.handleMetrics)
+
+	req := httptest.NewRequest("GET", "/v1/metrics", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if _, ok := resp["uptime_seconds"]; !ok {
+		t.Error("expected uptime_seconds in response")
+	}
+	if _, ok := resp["active_sessions"]; !ok {
+		t.Error("expected active_sessions in response")
+	}
+	if _, ok := resp["total_chats"]; !ok {
+		t.Error("expected total_chats in response")
+	}
+}
+
+func TestExportSessionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/chat/{session}/export", srv.handleExportSession)
+
+	req := httptest.NewRequest("GET", "/v1/chat/nonexistent/export", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestExportSessionJSON(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	ag := srv.getOrCreateSession("export-test")
+	_ = ag
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/chat/{session}/export", srv.handleExportSession)
+
+	req := httptest.NewRequest("GET", "/v1/chat/export-test/export", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["session"] != "export-test" {
+		t.Errorf("expected session=export-test, got %v", resp["session"])
+	}
+}
+
+func TestExportSessionMarkdown(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	ag := srv.getOrCreateSession("md-test")
+	_ = ag
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/chat/{session}/export", srv.handleExportSession)
+
+	req := httptest.NewRequest("GET", "/v1/chat/md-test/export?format=markdown", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	contentType := w.Header().Get("Content-Type")
+	if !strings.Contains(contentType, "text/markdown") {
+		t.Errorf("expected markdown content type, got %s", contentType)
+	}
+}
