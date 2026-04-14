@@ -56,6 +56,7 @@ type HTTPServer struct {
 	endpointStats  sync.Map         // endpoint -> *endpointStat，端点延迟统计
 	pluginMgr      *tools.PluginManager // 插件管理器（可选）
 	cronJobs       sync.Map             // jobID -> *cronJob
+	toolAliases    sync.Map             // alias -> realName
 
 	server *http.Server
 }
@@ -66,6 +67,7 @@ type httpSession struct {
 	lastUsed    time.Time
 	tags        map[string]bool // 会话标签
 	annotations []sessionNote   // 会话备注
+	customTTL   time.Duration   // 自定义存活时间（0 = 使用全局默认）
 }
 
 type sessionNote struct {
@@ -249,6 +251,14 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/cron", s.handleListCronJobs)
 	mux.HandleFunc("POST /v1/cron", s.handleAddCronJob)
 	mux.HandleFunc("DELETE /v1/cron/{id}", s.handleDeleteCronJob)
+	// Session TTL
+	mux.HandleFunc("PUT /v1/sessions/{session}/ttl", s.handleSetSessionTTL)
+	// Tool aliases
+	mux.HandleFunc("GET /v1/tools/aliases", s.handleListToolAliases)
+	mux.HandleFunc("PUT /v1/tools/aliases", s.handleSetToolAlias)
+	mux.HandleFunc("DELETE /v1/tools/aliases/{alias}", s.handleDeleteToolAlias)
+	// Debug
+	mux.HandleFunc("GET /v1/debug/routes", s.handleDebugRoutes)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -1483,7 +1493,11 @@ func (s *HTTPServer) cleanSessions(ctx context.Context) {
 		case <-ticker.C:
 			s.sessions.Range(func(key, val any) bool {
 				sess := val.(*httpSession)
-				if time.Since(sess.lastUsed) > s.sessionTimeout {
+				ttl := s.sessionTimeout
+				if sess.customTTL > 0 {
+					ttl = sess.customTTL
+				}
+				if time.Since(sess.lastUsed) > ttl {
 					s.saveSession(key.(string), sess) // 过期前持久化
 					s.sessions.Delete(key)
 					log.Printf("[HTTP] 清理过期会话: %s", key)
@@ -2193,6 +2207,112 @@ func (s *HTTPServer) runCronJob(cj *cronJob) {
 			return
 		}
 	}
+}
+
+// -------- Session TTL --------
+
+// handleSetSessionTTL PUT /v1/sessions/{session}/ttl — 设置会话自定义存活时间
+func (s *HTTPServer) handleSetSessionTTL(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session")
+	val, ok := s.sessions.Load(sessionID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	var req struct {
+		TTLMinutes int `json:"ttl_minutes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.TTLMinutes < 1 || req.TTLMinutes > 10080 { // 1 分钟 ~ 7 天
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ttl_minutes must be 1-10080 (7 days)"})
+		return
+	}
+	sess := val.(*httpSession)
+	sess.customTTL = time.Duration(req.TTLMinutes) * time.Minute
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":     sessionID,
+		"ttl_minutes": req.TTLMinutes,
+	})
+}
+
+// -------- Tool Aliases --------
+
+// handleListToolAliases GET /v1/tools/aliases — 列出工具别名
+func (s *HTTPServer) handleListToolAliases(w http.ResponseWriter, r *http.Request) {
+	aliases := make(map[string]string)
+	s.toolAliases.Range(func(key, val any) bool {
+		aliases[key.(string)] = val.(string)
+		return true
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{"aliases": aliases, "count": len(aliases)})
+}
+
+// handleSetToolAlias PUT /v1/tools/aliases — 设置工具别名
+func (s *HTTPServer) handleSetToolAlias(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Alias string `json:"alias"`
+		Tool  string `json:"tool"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Alias == "" || req.Tool == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "alias and tool are required"})
+		return
+	}
+	if _, ok := s.registry.Get(req.Tool); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool not found: " + req.Tool})
+		return
+	}
+	s.toolAliases.Store(req.Alias, req.Tool)
+	writeJSON(w, http.StatusOK, map[string]string{"alias": req.Alias, "tool": req.Tool})
+}
+
+// handleDeleteToolAlias DELETE /v1/tools/aliases/{alias} — 删除工具别名
+func (s *HTTPServer) handleDeleteToolAlias(w http.ResponseWriter, r *http.Request) {
+	alias := r.PathValue("alias")
+	if _, ok := s.toolAliases.LoadAndDelete(alias); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "alias not found: " + alias})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "alias deleted", "alias": alias})
+}
+
+// -------- Debug Routes --------
+
+// handleDebugRoutes GET /v1/debug/routes — 列出所有注册的路由
+func (s *HTTPServer) handleDebugRoutes(w http.ResponseWriter, r *http.Request) {
+	routes := []string{
+		"POST /v1/chat", "GET /v1/chat/{session}", "DELETE /v1/chat/{session}",
+		"GET /v1/chat/{session}/export", "GET /v1/tools", "GET /v1/tools/stats",
+		"GET /v1/memory/{session}", "GET /v1/health", "GET /v1/metrics",
+		"GET /v1/sessions", "POST /v1/sessions/{session}/fork", "GET /v1/config",
+		"GET /v1/openapi.json", "POST /v1/config/reload", "GET /v1/sessions/search",
+		"GET /v1/audit", "GET /v1/webhooks", "POST /v1/webhooks", "DELETE /v1/webhooks",
+		"GET /v1/rate-limit",
+		"PUT /v1/sessions/{session}/tags", "GET /v1/sessions/{session}/tags",
+		"DELETE /v1/sessions/{session}/tags",
+		"POST /v1/sessions/{session}/annotate", "GET /v1/sessions/{session}/annotations",
+		"POST /v1/batch/chat", "POST /v1/admin/gc", "GET /v1/analytics",
+		"GET /v1/health/deep",
+		"POST /v1/tools/{name}/disable", "POST /v1/tools/{name}/enable",
+		"GET /v1/tools/disabled", "GET /v1/latency",
+		"GET /v1/plugins", "POST /v1/plugins/reload", "DELETE /v1/plugins/{name}",
+		"GET /v1/cron", "POST /v1/cron", "DELETE /v1/cron/{id}",
+		"PUT /v1/sessions/{session}/ttl",
+		"GET /v1/tools/aliases", "PUT /v1/tools/aliases", "DELETE /v1/tools/aliases/{alias}",
+		"GET /v1/debug/routes",
+		"POST /v1/chat/completions", "GET /v1/models",
+		"GET /v1/ws",
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"routes": routes,
+		"count":  len(routes),
+	})
 }
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {

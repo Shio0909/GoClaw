@@ -1975,3 +1975,158 @@ func TestDisabledToolEnforced(t *testing.T) {
 		t.Fatalf("expected 'executed' after re-enable, got %q", result)
 	}
 }
+
+// -------- Session TTL Tests --------
+
+func TestSetSessionTTL(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	// create session
+	srv.sessions.Store("ttl-test", &httpSession{
+		agent:    nil,
+		lastUsed: time.Now(),
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/ttl", srv.handleSetSessionTTL)
+
+	body := `{"ttl_minutes":120}`
+	req := httptest.NewRequest("PUT", "/v1/sessions/ttl-test/ttl", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	sess, _ := srv.sessions.Load("ttl-test")
+	if sess.(*httpSession).customTTL != 120*time.Minute {
+		t.Fatalf("expected 120min TTL, got %v", sess.(*httpSession).customTTL)
+	}
+}
+
+func TestSetSessionTTLNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/ttl", srv.handleSetSessionTTL)
+
+	body := `{"ttl_minutes":60}`
+	req := httptest.NewRequest("PUT", "/v1/sessions/nonexistent/ttl", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestSetSessionTTLValidation(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.sessions.Store("s1", &httpSession{lastUsed: time.Now()})
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/ttl", srv.handleSetSessionTTL)
+
+	// too small
+	body := `{"ttl_minutes":0}`
+	req := httptest.NewRequest("PUT", "/v1/sessions/s1/ttl", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for ttl=0, got %d", w.Code)
+	}
+}
+
+// -------- Tool Alias Tests --------
+
+func TestToolAliasesCRUD(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.registry.Register(&tools.ToolDef{
+		Name:        "file_read",
+		Description: "read a file",
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			return "ok", nil
+		},
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/tools/aliases", srv.handleListToolAliases)
+	mux.HandleFunc("PUT /v1/tools/aliases", srv.handleSetToolAlias)
+	mux.HandleFunc("DELETE /v1/tools/aliases/{alias}", srv.handleDeleteToolAlias)
+
+	// empty list
+	req := httptest.NewRequest("GET", "/v1/tools/aliases", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if int(resp["count"].(float64)) != 0 {
+		t.Fatal("expected 0 aliases")
+	}
+
+	// add alias
+	body := `{"alias":"fr","tool":"file_read"}`
+	req = httptest.NewRequest("PUT", "/v1/tools/aliases", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// list shows 1 alias
+	req = httptest.NewRequest("GET", "/v1/tools/aliases", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&resp)
+	if int(resp["count"].(float64)) != 1 {
+		t.Fatal("expected 1 alias")
+	}
+
+	// delete alias
+	req = httptest.NewRequest("DELETE", "/v1/tools/aliases/fr", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 on delete, got %d", w.Code)
+	}
+
+	// delete nonexistent
+	req = httptest.NewRequest("DELETE", "/v1/tools/aliases/nonexistent", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestToolAliasToolNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/tools/aliases", srv.handleSetToolAlias)
+
+	body := `{"alias":"x","tool":"nonexistent"}`
+	req := httptest.NewRequest("PUT", "/v1/tools/aliases", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// -------- Debug Routes Test --------
+
+func TestDebugRoutes(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/debug/routes", srv.handleDebugRoutes)
+
+	req := httptest.NewRequest("GET", "/v1/debug/routes", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	count := int(resp["count"].(float64))
+	if count < 40 {
+		t.Fatalf("expected >= 40 routes, got %d", count)
+	}
+}
