@@ -41,6 +41,7 @@ type HTTPServer struct {
 	startedAt      time.Time     // 服务启动时间
 	chatCount      atomic.Int64  // 已处理的 chat 请求数
 	rateLimiter    *RateLimiter  // 速率限制（可选）
+	fallbackCfg    *agent.FallbackConfig // 模型回退（可选）
 
 	server *http.Server
 }
@@ -66,6 +67,7 @@ type HTTPServerConfig struct {
 	RequestTimeout int      // 请求超时（秒），默认 300
 	SessionDir     string   // 会话持久化目录，空则不持久化
 	RateLimit      int      // 每分钟请求限制（0 = 不限制）
+	FallbackCfg    *agent.FallbackConfig // 模型回退配置（可选）
 }
 
 // 编译期检查 HTTPServer 实现 Gateway 接口
@@ -123,6 +125,12 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		log.Printf("[HTTP] 速率限制: %d 请求/分钟", cfg.RateLimit)
 	}
 
+	// 模型回退
+	if cfg.FallbackCfg != nil && cfg.FallbackCfg.Model != "" {
+		srv.fallbackCfg = cfg.FallbackCfg
+		log.Printf("[HTTP] 模型回退: %s/%s", cfg.FallbackCfg.Provider, cfg.FallbackCfg.Model)
+	}
+
 	return srv
 }
 
@@ -142,6 +150,7 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/memory/{session}", s.handleGetMemory)
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
+	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -459,6 +468,39 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		"model":           s.agentCfg.Model,
 		"provider":        s.agentCfg.Provider,
 		"tool_stats":      tools.GetGlobalToolStats().Summary(),
+	})
+}
+
+// handleListSessions 列出所有活跃会话
+func (s *HTTPServer) handleListSessions(w http.ResponseWriter, r *http.Request) {
+	type sessionInfo struct {
+		ID          string `json:"id"`
+		MessageCount int   `json:"message_count"`
+		LastUsed    string `json:"last_used"`
+		IdleSeconds int    `json:"idle_seconds"`
+	}
+
+	var sessions []sessionInfo
+	s.sessions.Range(func(key, val any) bool {
+		id := key.(string)
+		sess := val.(*httpSession)
+		idle := time.Since(sess.lastUsed)
+		sessions = append(sessions, sessionInfo{
+			ID:           id,
+			MessageCount: len(sess.agent.GetHistory()),
+			LastUsed:     sess.lastUsed.Format(time.RFC3339),
+			IdleSeconds:  int(idle.Seconds()),
+		})
+		return true
+	})
+
+	if sessions == nil {
+		sessions = []sessionInfo{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"count":    len(sessions),
+		"sessions": sessions,
 	})
 }
 
@@ -858,6 +900,9 @@ func (s *HTTPServer) getOrCreateSession(id string) *agent.Agent {
 	}
 	if s.ragMgr != nil {
 		ag.SetRAGManager(s.ragMgr)
+	}
+	if s.fallbackCfg != nil {
+		ag.SetFallbackConfig(s.fallbackCfg)
 	}
 
 	s.sessions.Store(id, &httpSession{

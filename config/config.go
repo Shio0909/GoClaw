@@ -36,6 +36,10 @@ type AgentConfig struct {
 	SimpleModel   string   `yaml:"simple_model"`
 	SimpleProvider string  `yaml:"simple_provider"`
 	SimpleBaseURL string   `yaml:"simple_base_url"`
+	FallbackModel    string `yaml:"fallback_model"`    // 主模型失败时的备用模型
+	FallbackProvider string `yaml:"fallback_provider"` // 备用模型 provider
+	FallbackBaseURL  string `yaml:"fallback_base_url"` // 备用模型 base URL
+	FallbackAPIKey   string `yaml:"fallback_api_key"`  // 备用模型 API Key（留空则复用主 Key）
 	MaxStep       int      `yaml:"max_step"`        // Agent 最大工具调用步数（默认 25）
 	ToolMaxBytes  int      `yaml:"tool_max_bytes"`  // 工具结果最大字节数（默认 30KB）
 	SystemPrompt  string   `yaml:"system_prompt"`   // 自定义 system prompt（追加到默认 prompt）

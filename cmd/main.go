@@ -282,6 +282,14 @@ func runServe(cfg *config.Config, inf *infra) {
 			httpCfg.SessionDir = cfg.Gateway.HTTP.SessionDir
 			httpCfg.RateLimit = cfg.Gateway.HTTP.RateLimit
 		}
+		if cfg.Agent.FallbackModel != "" {
+			httpCfg.FallbackCfg = &agent.FallbackConfig{
+				Provider: cfg.Agent.FallbackProvider,
+				APIKey:   cfg.Agent.FallbackAPIKey,
+				BaseURL:  cfg.Agent.FallbackBaseURL,
+				Model:    cfg.Agent.FallbackModel,
+			}
+		}
 		httpSrv := gateway.NewHTTPServer(httpCfg)
 		gateways = append(gateways, httpSrv)
 	}
@@ -352,6 +360,17 @@ func runCLI(cfg *config.Config, inf *infra) {
 	ag.SetRetryConfig(inf.retryCfg)
 	if inf.ragMgr != nil {
 		ag.SetRAGManager(inf.ragMgr)
+	}
+
+	// 模型回退
+	if cfg.Agent.FallbackModel != "" {
+		ag.SetFallbackConfig(&agent.FallbackConfig{
+			Provider: cfg.Agent.FallbackProvider,
+			APIKey:   cfg.Agent.FallbackAPIKey,
+			BaseURL:  cfg.Agent.FallbackBaseURL,
+			Model:    cfg.Agent.FallbackModel,
+		})
+		log.Printf("🔄 模型回退已启用: %s → %s", cfg.Agent.Model, cfg.Agent.FallbackModel)
 	}
 
 	// 智能模型路由

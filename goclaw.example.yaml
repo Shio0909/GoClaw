@@ -31,6 +31,12 @@ agent:
   # simple_provider: openai
   # simple_base_url: https://api.deepseek.com/v1
 
+  # 模型回退（可选，主模型失败时自动切换）
+  # fallback_model: gpt-4o-mini
+  # fallback_provider: openai
+  # fallback_base_url: https://api.openai.com/v1
+  # fallback_api_key: ${FALLBACK_API_KEY}  # 留空则复用主 Key
+
 gateways:
   http:
     # api_token: ${GOCLAW_API_TOKEN}   # Bearer Token 认证（留空则无需认证）

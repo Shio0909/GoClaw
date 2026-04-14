@@ -64,6 +64,7 @@ type Agent struct {
 	retryConfig       *RetryConfig // 重试 + Key 轮换配置（可选）
 	router            *ModelRouter // 智能模型路由器（可选）
 	skillLearner      *SkillLearner // 技能自学习引擎（可选）
+	fallbackCfg       *FallbackConfig // 模型回退配置（可选）
 	maxStep           int          // 最大工具调用步数
 }
 
@@ -272,7 +273,32 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 		err = runFn(a.cfg)
 	}
 	if err != nil {
-		return "", fmt.Errorf("agent generate: %w", err)
+		// 尝试回退到备用模型
+		fbErr := a.runWithFallback(ctx, err, func(fbModel model.ToolCallingChatModel) error {
+			einoTools := a.registry.ToEinoTools()
+			baseTools := make([]tool.BaseTool, len(einoTools))
+			for i, t := range einoTools {
+				baseTools[i] = t
+			}
+			fbAgent, e := react.NewAgent(ctx, &react.AgentConfig{
+				ToolCallingModel: fbModel,
+				ToolsConfig:      compose.ToolsNodeConfig{Tools: baseTools},
+				MaxStep:          a.maxStep,
+				StreamToolCallChecker: allChunksToolCallChecker,
+			})
+			if e != nil {
+				return e
+			}
+			r, e := fbAgent.Generate(ctx, msgs)
+			if e != nil {
+				return e
+			}
+			resp = r
+			return nil
+		})
+		if fbErr != nil {
+			return "", fmt.Errorf("agent generate: %w", fbErr)
+		}
 	}
 
 	content := StripThinkTags(resp.Content)
@@ -318,7 +344,32 @@ func (a *Agent) RunStream(ctx context.Context, userInput string) (*schema.Stream
 		err = runFn(a.cfg)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("agent stream: %w", err)
+		// 尝试回退到备用模型（流式）
+		fbErr := a.runWithFallback(ctx, err, func(fbModel model.ToolCallingChatModel) error {
+			einoTools := a.registry.ToEinoTools()
+			baseTools := make([]tool.BaseTool, len(einoTools))
+			for i, t := range einoTools {
+				baseTools[i] = t
+			}
+			fbAgent, e := react.NewAgent(ctx, &react.AgentConfig{
+				ToolCallingModel: fbModel,
+				ToolsConfig:      compose.ToolsNodeConfig{Tools: baseTools},
+				MaxStep:          a.maxStep,
+				StreamToolCallChecker: allChunksToolCallChecker,
+			})
+			if e != nil {
+				return e
+			}
+			s, e := fbAgent.Stream(ctx, msgs)
+			if e != nil {
+				return e
+			}
+			stream = s
+			return nil
+		})
+		if fbErr != nil {
+			return nil, fmt.Errorf("agent stream: %w", fbErr)
+		}
 	}
 	return stream, nil
 }
@@ -370,7 +421,32 @@ func (a *Agent) RunWithImages(ctx context.Context, text string, images []ImageIn
 		err = runFn(a.cfg)
 	}
 	if err != nil {
-		return "", fmt.Errorf("agent generate: %w", err)
+		// 尝试回退到备用模型
+		fbErr := a.runWithFallback(ctx, err, func(fbModel model.ToolCallingChatModel) error {
+			einoTools := a.registry.ToEinoTools()
+			baseTools := make([]tool.BaseTool, len(einoTools))
+			for i, t := range einoTools {
+				baseTools[i] = t
+			}
+			fbAgent, e := react.NewAgent(ctx, &react.AgentConfig{
+				ToolCallingModel: fbModel,
+				ToolsConfig:      compose.ToolsNodeConfig{Tools: baseTools},
+				MaxStep:          a.maxStep,
+				StreamToolCallChecker: allChunksToolCallChecker,
+			})
+			if e != nil {
+				return e
+			}
+			r, e := fbAgent.Generate(ctx, msgs)
+			if e != nil {
+				return e
+			}
+			resp = r
+			return nil
+		})
+		if fbErr != nil {
+			return "", fmt.Errorf("agent generate: %w", fbErr)
+		}
 	}
 
 	content := StripThinkTags(resp.Content)

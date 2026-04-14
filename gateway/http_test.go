@@ -372,6 +372,53 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestListSessionsEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions", srv.handleListSessions)
+
+	req := httptest.NewRequest("GET", "/v1/sessions", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	count := resp["count"].(float64)
+	if count != 0 {
+		t.Errorf("expected 0 sessions, got %v", count)
+	}
+	sessions := resp["sessions"].([]interface{})
+	if len(sessions) != 0 {
+		t.Errorf("expected empty sessions array, got %d", len(sessions))
+	}
+}
+
+func TestListSessionsWithSessions(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.getOrCreateSession("session-1")
+	srv.getOrCreateSession("session-2")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions", srv.handleListSessions)
+
+	req := httptest.NewRequest("GET", "/v1/sessions", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	count := resp["count"].(float64)
+	if count != 2 {
+		t.Errorf("expected 2 sessions, got %v", count)
+	}
+}
+
 func TestExportSessionNotFound(t *testing.T) {
 	srv := newTestHTTPServer(t)
 	mux := http.NewServeMux()
