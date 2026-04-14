@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -1746,5 +1747,231 @@ func TestLatencyStatsRecorded(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("expected GET /v1/health in latency stats")
+	}
+}
+
+// -------- Plugin Management Tests --------
+
+func TestListPluginsNoManager(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/plugins", srv.handleListPlugins)
+
+	req := httptest.NewRequest("GET", "/v1/plugins", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["enabled"] != false {
+		t.Fatal("expected enabled=false when no plugin manager")
+	}
+}
+
+func TestListPluginsWithManager(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	dir := t.TempDir()
+	pm := tools.NewPluginManager(dir)
+	srv.pluginMgr = pm
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/plugins", srv.handleListPlugins)
+
+	req := httptest.NewRequest("GET", "/v1/plugins", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["enabled"] != true {
+		t.Fatal("expected enabled=true")
+	}
+	if int(resp["count"].(float64)) != 0 {
+		t.Fatal("expected 0 plugins")
+	}
+}
+
+func TestUnloadPluginNoManager(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /v1/plugins/{name}", srv.handleUnloadPlugin)
+
+	req := httptest.NewRequest("DELETE", "/v1/plugins/test", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestReloadPluginsNoManager(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/plugins/reload", srv.handleReloadPlugins)
+
+	req := httptest.NewRequest("POST", "/v1/plugins/reload", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// -------- Cron Tests --------
+
+func TestCronJobsEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/cron", srv.handleListCronJobs)
+
+	req := httptest.NewRequest("GET", "/v1/cron", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if int(resp["count"].(float64)) != 0 {
+		t.Fatal("expected 0 jobs")
+	}
+}
+
+func TestCronAddValidation(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/cron", srv.handleAddCronJob)
+
+	// missing session
+	body := `{"message":"hello","interval_seconds":60}`
+	req := httptest.NewRequest("POST", "/v1/cron", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing session, got %d", w.Code)
+	}
+
+	// interval too small
+	body = `{"session":"s1","message":"hello","interval_seconds":5}`
+	req = httptest.NewRequest("POST", "/v1/cron", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for small interval, got %d", w.Code)
+	}
+}
+
+func TestCronAddAndDelete(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.requestTimeout = 5 * time.Second
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/cron", srv.handleAddCronJob)
+	mux.HandleFunc("DELETE /v1/cron/{id}", srv.handleDeleteCronJob)
+	mux.HandleFunc("GET /v1/cron", srv.handleListCronJobs)
+
+	body := `{"session":"cron-test","message":"ping","interval_seconds":3600}`
+	req := httptest.NewRequest("POST", "/v1/cron", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+	var created map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&created)
+	id := created["id"].(string)
+
+	// list shows 1 job
+	req = httptest.NewRequest("GET", "/v1/cron", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var listed map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&listed)
+	if int(listed["count"].(float64)) != 1 {
+		t.Fatalf("expected 1 job, got %v", listed["count"])
+	}
+
+	// delete
+	req = httptest.NewRequest("DELETE", "/v1/cron/"+id, nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// list empty again
+	req = httptest.NewRequest("GET", "/v1/cron", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&listed)
+	if int(listed["count"].(float64)) != 0 {
+		t.Fatalf("expected 0 jobs after delete")
+	}
+}
+
+func TestCronDeleteNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /v1/cron/{id}", srv.handleDeleteCronJob)
+
+	req := httptest.NewRequest("DELETE", "/v1/cron/nonexistent", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// -------- Disabled Tool Enforcement Test --------
+
+func TestDisabledToolEnforced(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	// Register a dummy tool
+	srv.registry.Register(&tools.ToolDef{
+		Name:        "dummy_tool",
+		Description: "test tool",
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			return "executed", nil
+		},
+	})
+
+	// Before disabling, execute should work
+	result, err := srv.registry.Execute(context.Background(), "dummy_tool", nil)
+	if err != nil {
+		t.Fatalf("expected no error, got %v", err)
+	}
+	if result != "executed" {
+		t.Fatalf("expected 'executed', got %q", result)
+	}
+
+	// Disable the tool
+	srv.disabledTools.Store("dummy_tool", true)
+
+	// After disabling, execute should fail
+	_, err = srv.registry.Execute(context.Background(), "dummy_tool", nil)
+	if err == nil {
+		t.Fatal("expected error for disabled tool")
+	}
+	if !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("expected disabled error, got: %v", err)
+	}
+
+	// Re-enable
+	srv.disabledTools.Delete("dummy_tool")
+	result, err = srv.registry.Execute(context.Background(), "dummy_tool", nil)
+	if err != nil {
+		t.Fatalf("expected no error after re-enable, got %v", err)
+	}
+	if result != "executed" {
+		t.Fatalf("expected 'executed' after re-enable, got %q", result)
 	}
 }

@@ -54,6 +54,8 @@ type HTTPServer struct {
 	webhookMgr     *webhook.Manager // Webhook 管理器
 	disabledTools  sync.Map         // toolName -> bool，运行时禁用的工具
 	endpointStats  sync.Map         // endpoint -> *endpointStat，端点延迟统计
+	pluginMgr      *tools.PluginManager // 插件管理器（可选）
+	cronJobs       sync.Map             // jobID -> *cronJob
 
 	server *http.Server
 }
@@ -96,6 +98,7 @@ type HTTPServerConfig struct {
 	ConfigPath     string                // 配置文件路径（用于热重载）
 	AuditLog       *audit.Log            // 审计日志（可选）
 	WebhookMgr     *webhook.Manager      // Webhook 管理器（可选）
+	PluginDir      string                // 插件目录（可选）
 }
 
 // 编译期检查 HTTPServer 实现 Gateway 接口
@@ -163,6 +166,25 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		log.Printf("[HTTP] 模型回退: %s/%s", cfg.FallbackCfg.Provider, cfg.FallbackCfg.Model)
 	}
 
+	// 工具运行时禁用检查：让 Registry 感知 disabledTools
+	srv.registry.SetDisabledChecker(func(name string) bool {
+		_, disabled := srv.disabledTools.Load(name)
+		return disabled
+	})
+
+	// 加载插件
+	if cfg.PluginDir != "" {
+		pm := tools.NewPluginManager(cfg.PluginDir)
+		n, err := pm.LoadDir()
+		if err != nil {
+			log.Printf("[HTTP] 插件目录加载失败: %v", err)
+		} else if n > 0 {
+			pm.RegisterAll(srv.registry)
+			log.Printf("[HTTP] 已加载 %d 个插件", n)
+		}
+		srv.pluginMgr = pm
+	}
+
 	return srv
 }
 
@@ -219,6 +241,14 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/tools/{name}/enable", s.handleEnableTool)
 	mux.HandleFunc("GET /v1/tools/disabled", s.handleListDisabledTools)
 	mux.HandleFunc("GET /v1/latency", s.handleLatencyStats)
+	// Plugin management
+	mux.HandleFunc("GET /v1/plugins", s.handleListPlugins)
+	mux.HandleFunc("POST /v1/plugins/reload", s.handleReloadPlugins)
+	mux.HandleFunc("DELETE /v1/plugins/{name}", s.handleUnloadPlugin)
+	// Cron / scheduled tasks
+	mux.HandleFunc("GET /v1/cron", s.handleListCronJobs)
+	mux.HandleFunc("POST /v1/cron", s.handleAddCronJob)
+	mux.HandleFunc("DELETE /v1/cron/{id}", s.handleDeleteCronJob)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -1990,7 +2020,180 @@ func (s *HTTPServer) handleLatencyStats(w http.ResponseWriter, r *http.Request) 
 	})
 }
 
-// -------- 工具函数 --------
+// -------- Plugin Management --------
+
+// handleListPlugins GET /v1/plugins — 列出所有已加载的插件
+func (s *HTTPServer) handleListPlugins(w http.ResponseWriter, r *http.Request) {
+	if s.pluginMgr == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"plugins": []string{}, "count": 0, "enabled": false})
+		return
+	}
+	list := s.pluginMgr.List()
+	type pluginInfo struct {
+		Name        string `json:"name"`
+		Description string `json:"description,omitempty"`
+		Type        string `json:"type"`
+		Timeout     int    `json:"timeout,omitempty"`
+	}
+	items := make([]pluginInfo, 0, len(list))
+	for _, p := range list {
+		items = append(items, pluginInfo{Name: p.Name, Description: p.Description, Type: string(p.Type), Timeout: p.Timeout})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"plugins": items, "count": len(items), "enabled": true})
+}
+
+// handleReloadPlugins POST /v1/plugins/reload — 重新加载插件目录
+func (s *HTTPServer) handleReloadPlugins(w http.ResponseWriter, r *http.Request) {
+	if s.pluginMgr == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "plugin system not configured"})
+		return
+	}
+	n, err := s.pluginMgr.LoadDir()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	registered := s.pluginMgr.RegisterAll(s.registry)
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, "", fmt.Sprintf("plugins reloaded: %d loaded, %d registered", n, registered), clientIP(r), nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"loaded": n, "registered": registered})
+}
+
+// handleUnloadPlugin DELETE /v1/plugins/{name} — 卸载插件
+func (s *HTTPServer) handleUnloadPlugin(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if s.pluginMgr == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "plugin system not configured"})
+		return
+	}
+	if !s.pluginMgr.Unload(name) {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "plugin not found: " + name})
+		return
+	}
+	s.registry.Unregister(name)
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, "", "plugin unloaded: "+name, clientIP(r), nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "plugin unloaded", "name": name})
+}
+
+// -------- Cron / Scheduled Tasks --------
+
+type cronJob struct {
+	ID       string `json:"id"`
+	Session  string `json:"session"`
+	Message  string `json:"message"`
+	Interval int    `json:"interval_seconds"` // 执行间隔（秒）
+	NextRun  string `json:"next_run"`
+	RunCount int64  `json:"run_count"`
+
+	ticker  *time.Ticker
+	stopCh  chan struct{}
+	runCnt  atomic.Int64
+	nextRun atomic.Value // time.Time
+}
+
+func (s *HTTPServer) handleListCronJobs(w http.ResponseWriter, r *http.Request) {
+	var jobs []map[string]interface{}
+	s.cronJobs.Range(func(key, val any) bool {
+		cj := val.(*cronJob)
+		nr, _ := cj.nextRun.Load().(time.Time)
+		jobs = append(jobs, map[string]interface{}{
+			"id":               cj.ID,
+			"session":          cj.Session,
+			"message":          cj.Message,
+			"interval_seconds": cj.Interval,
+			"next_run":         nr.Format(time.RFC3339),
+			"run_count":        cj.runCnt.Load(),
+		})
+		return true
+	})
+	if jobs == nil {
+		jobs = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"jobs": jobs, "count": len(jobs)})
+}
+
+func (s *HTTPServer) handleAddCronJob(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session  string `json:"session"`
+		Message  string `json:"message"`
+		Interval int    `json:"interval_seconds"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Session == "" || req.Message == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session and message required"})
+		return
+	}
+	if req.Interval < 10 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "interval must be >= 10 seconds"})
+		return
+	}
+	if req.Interval > 86400 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "interval must be <= 86400 seconds (1 day)"})
+		return
+	}
+
+	id := fmt.Sprintf("cron_%d", time.Now().UnixNano())
+	cj := &cronJob{
+		ID:       id,
+		Session:  req.Session,
+		Message:  req.Message,
+		Interval: req.Interval,
+		ticker:   time.NewTicker(time.Duration(req.Interval) * time.Second),
+		stopCh:   make(chan struct{}),
+	}
+	cj.nextRun.Store(time.Now().Add(time.Duration(req.Interval) * time.Second))
+	s.cronJobs.Store(id, cj)
+
+	go s.runCronJob(cj)
+
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, req.Session, fmt.Sprintf("cron added: %s every %ds", id, req.Interval), clientIP(r), nil)
+	}
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"id": id, "session": req.Session, "interval_seconds": req.Interval,
+	})
+}
+
+func (s *HTTPServer) handleDeleteCronJob(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	val, ok := s.cronJobs.LoadAndDelete(id)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "cron job not found"})
+		return
+	}
+	cj := val.(*cronJob)
+	close(cj.stopCh)
+	cj.ticker.Stop()
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, cj.Session, "cron deleted: "+id, clientIP(r), nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "cron job deleted", "id": id})
+}
+
+func (s *HTTPServer) runCronJob(cj *cronJob) {
+	for {
+		select {
+		case <-cj.ticker.C:
+			cj.nextRun.Store(time.Now().Add(time.Duration(cj.Interval) * time.Second))
+			ag := s.getOrCreateSession(cj.Session)
+			ctx, cancel := context.WithTimeout(context.Background(), s.requestTimeout)
+			_, err := ag.Run(ctx, cj.Message)
+			cancel()
+			cj.runCnt.Add(1)
+			if err != nil {
+				log.Printf("[Cron] %s 执行失败: %v", cj.ID, err)
+			}
+		case <-cj.stopCh:
+			return
+		}
+	}
+}
 
 func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")

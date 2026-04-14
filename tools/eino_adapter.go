@@ -54,12 +54,18 @@ func SetMaxToolResultBytes(n int) {
 
 // EinoTool 将 ToolDef 适配为 Eino 的 InvokableTool 接口
 type EinoTool struct {
-	def *ToolDef
+	def             *ToolDef
+	disabledChecker DisabledChecker
 }
 
 // NewEinoTool 包装一个 ToolDef 为 Eino InvokableTool
 func NewEinoTool(def *ToolDef) tool.InvokableTool {
 	return &EinoTool{def: def}
+}
+
+// NewEinoToolWithChecker 包装一个 ToolDef 并附加运行时禁用检查
+func NewEinoToolWithChecker(def *ToolDef, checker DisabledChecker) tool.InvokableTool {
+	return &EinoTool{def: def, disabledChecker: checker}
 }
 
 // Info 返回工具的元信息（名称、描述、参数 schema）
@@ -85,6 +91,11 @@ func (t *EinoTool) Info(ctx context.Context) (*schema.ToolInfo, error) {
 
 // InvokableRun 执行工具，接收 JSON 参数字符串，返回结果字符串
 func (t *EinoTool) InvokableRun(ctx context.Context, argumentsInJSON string, opts ...tool.Option) (string, error) {
+	// 运行时禁用检查
+	if t.disabledChecker != nil && t.disabledChecker(t.def.Name) {
+		return fmt.Sprintf("Tool %q is currently disabled by the administrator.", t.def.Name), nil
+	}
+
 	var args map[string]interface{}
 	if argumentsInJSON != "" && argumentsInJSON != "{}" {
 		if err := json.Unmarshal([]byte(argumentsInJSON), &args); err != nil {
@@ -195,7 +206,11 @@ func (r *Registry) ToEinoTools() []tool.InvokableTool {
 
 	result := make([]tool.InvokableTool, 0, len(r.tools))
 	for _, def := range r.tools {
-		result = append(result, NewEinoTool(def))
+		if r.disabledChecker != nil {
+			result = append(result, NewEinoToolWithChecker(def, r.disabledChecker))
+		} else {
+			result = append(result, NewEinoTool(def))
+		}
 	}
 	return result
 }

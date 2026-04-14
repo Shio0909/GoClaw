@@ -124,3 +124,44 @@ func TestToolTimeoutOverridesDefault(t *testing.T) {
 		t.Errorf("expected ok, got %s", result)
 	}
 }
+
+func TestDisabledChecker(t *testing.T) {
+	r := NewRegistry()
+	disabled := make(map[string]bool)
+	r.SetDisabledChecker(func(name string) bool { return disabled[name] })
+
+	r.Register(&ToolDef{
+		Name: "guarded_tool",
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			return "ok", nil
+		},
+	})
+
+	// works when not disabled
+	result, err := r.Execute(context.Background(), "guarded_tool", nil)
+	if err != nil || result != "ok" {
+		t.Fatalf("expected ok, got err=%v result=%q", err, result)
+	}
+
+	// block when disabled
+	disabled["guarded_tool"] = true
+	_, err = r.Execute(context.Background(), "guarded_tool", nil)
+	if err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("expected disabled error, got %v", err)
+	}
+
+	// IsDisabled check
+	if !r.IsDisabled("guarded_tool") {
+		t.Fatal("expected IsDisabled=true")
+	}
+
+	// re-enable
+	delete(disabled, "guarded_tool")
+	if r.IsDisabled("guarded_tool") {
+		t.Fatal("expected IsDisabled=false after re-enable")
+	}
+	result, err = r.Execute(context.Background(), "guarded_tool", nil)
+	if err != nil || result != "ok" {
+		t.Fatalf("expected ok after re-enable, got err=%v", err)
+	}
+}

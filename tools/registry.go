@@ -28,12 +28,16 @@ type ParamDef struct {
 	Required    bool
 }
 
+// DisabledChecker 返回指定工具是否被禁用
+type DisabledChecker func(name string) bool
+
 // Registry 工具注册中心
 type Registry struct {
-	mu             sync.RWMutex
-	tools          map[string]*ToolDef
-	mcpBridge      *MCPBridge
-	defaultTimeout time.Duration // 全局默认超时
+	mu              sync.RWMutex
+	tools           map[string]*ToolDef
+	mcpBridge       *MCPBridge
+	defaultTimeout  time.Duration   // 全局默认超时
+	disabledChecker DisabledChecker // 可选：运行时禁用检查
 }
 
 // NewRegistry 创建工具注册中心
@@ -65,8 +69,30 @@ func (r *Registry) Get(name string) (*ToolDef, bool) {
 	return t, ok
 }
 
+// SetDisabledChecker 设置运行时工具禁用检查函数
+func (r *Registry) SetDisabledChecker(fn DisabledChecker) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.disabledChecker = fn
+}
+
+// IsDisabled 检查工具是否被禁用
+func (r *Registry) IsDisabled(name string) bool {
+	r.mu.RLock()
+	fn := r.disabledChecker
+	r.mu.RUnlock()
+	if fn == nil {
+		return false
+	}
+	return fn(name)
+}
+
 // Execute 执行工具，自动应用超时配置
 func (r *Registry) Execute(ctx context.Context, name string, args map[string]interface{}) (string, error) {
+	if r.IsDisabled(name) {
+		return "", fmt.Errorf("tool %q is disabled by runtime policy", name)
+	}
+
 	tool, ok := r.Get(name)
 	if !ok {
 		return "", fmt.Errorf("tool not found: %s", name)
