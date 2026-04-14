@@ -40,6 +40,7 @@ type HTTPServer struct {
 	sessionStore   *SessionStore // 会话持久化（可选）
 	startedAt      time.Time     // 服务启动时间
 	chatCount      atomic.Int64  // 已处理的 chat 请求数
+	rateLimiter    *RateLimiter  // 速率限制（可选）
 
 	server *http.Server
 }
@@ -64,6 +65,7 @@ type HTTPServerConfig struct {
 	SessionTimeout int      // 会话超时（分钟），默认 30
 	RequestTimeout int      // 请求超时（秒），默认 300
 	SessionDir     string   // 会话持久化目录，空则不持久化
+	RateLimit      int      // 每分钟请求限制（0 = 不限制）
 }
 
 // 编译期检查 HTTPServer 实现 Gateway 接口
@@ -115,6 +117,12 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		srv.restoreSessions()
 	}
 
+	// 速率限制
+	if cfg.RateLimit > 0 {
+		srv.rateLimiter = NewRateLimiter(cfg.RateLimit, time.Minute)
+		log.Printf("[HTTP] 速率限制: %d 请求/分钟", cfg.RateLimit)
+	}
+
 	return srv
 }
 
@@ -140,8 +148,11 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	// WebSocket
 	mux.HandleFunc("GET /v1/ws", s.handleWebSocket)
 
-	// 中间件链：CORS → 请求日志 → 认证
-	handler := s.withAuth(s.withRequestLog(mux))
+	// 中间件链：CORS → 速率限制 → 请求日志 → 认证
+	var handler http.Handler = s.withAuth(s.withRequestLog(mux))
+	if s.rateLimiter != nil {
+		handler = s.rateLimiter.Middleware(handler)
+	}
 	handler = s.withCORS(handler)
 
 	s.server = &http.Server{

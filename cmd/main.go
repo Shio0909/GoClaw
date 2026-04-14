@@ -280,6 +280,7 @@ func runServe(cfg *config.Config, inf *infra) {
 			httpCfg.SessionTimeout = cfg.Gateway.HTTP.SessionTimeout
 			httpCfg.RequestTimeout = cfg.Gateway.HTTP.RequestTimeout
 			httpCfg.SessionDir = cfg.Gateway.HTTP.SessionDir
+			httpCfg.RateLimit = cfg.Gateway.HTTP.RateLimit
 		}
 		httpSrv := gateway.NewHTTPServer(httpCfg)
 		gateways = append(gateways, httpSrv)
