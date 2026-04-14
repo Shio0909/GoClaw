@@ -21,7 +21,9 @@ type Config struct {
 }
 
 type ServerConfig struct {
-	Listen string `yaml:"listen"` // HTTP 监听地址，如 ":8080"
+	Listen   string `yaml:"listen"`    // HTTP 监听地址，如 ":8080"
+	LogLevel string `yaml:"log_level"` // 日志级别: debug, info, warn, error（默认 info）
+	LogJSON  bool   `yaml:"log_json"`  // 是否使用 JSON 格式日志（默认 false = text）
 }
 
 type AgentConfig struct {

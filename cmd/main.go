@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -80,6 +81,9 @@ func main() {
 		os.Exit(1)
 	}
 
+	// 初始化结构化日志
+	initLogging(cfg.Server.LogLevel, cfg.Server.LogJSON)
+
 	// 共享基础设施
 	infra := setupInfra(cfg)
 	defer infra.cleanup()
@@ -98,6 +102,37 @@ func main() {
 			runCLI(cfg, infra)
 		}
 	}
+}
+
+// initLogging 初始化结构化日志（slog）
+// 设置 slog 为默认 logger，所有现有 log.Printf 调用自动受益
+func initLogging(level string, jsonFormat bool) {
+	var slogLevel slog.Level
+	switch strings.ToLower(level) {
+	case "debug":
+		slogLevel = slog.LevelDebug
+	case "warn", "warning":
+		slogLevel = slog.LevelWarn
+	case "error":
+		slogLevel = slog.LevelError
+	default:
+		slogLevel = slog.LevelInfo
+	}
+
+	opts := &slog.HandlerOptions{Level: slogLevel}
+
+	var handler slog.Handler
+	if jsonFormat {
+		handler = slog.NewJSONHandler(os.Stderr, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stderr, opts)
+	}
+
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+
+	// Bridge stdlib log to slog so all existing log.Printf calls use structured output
+	slog.SetLogLoggerLevel(slogLevel)
 }
 
 // infra 共享基础设施

@@ -3,6 +3,8 @@
 
 server:
   listen: ":8080"  # HTTP API 监听地址（留空则不启动 HTTP API）
+  log_level: info   # 日志级别: debug, info, warn, error
+  # log_json: true  # JSON 格式日志（适合生产环境 + ELK）
 
 agent:
   provider: minimax         # claude / openai / minimax / mimo / siliconflow
