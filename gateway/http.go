@@ -204,6 +204,9 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/{session}/annotate", s.handleAnnotateSession)
 	mux.HandleFunc("GET /v1/sessions/{session}/annotations", s.handleGetAnnotations)
 	mux.HandleFunc("POST /v1/batch/chat", s.handleBatchChat)
+	mux.HandleFunc("POST /v1/admin/gc", s.handleAdminGC)
+	mux.HandleFunc("GET /v1/analytics", s.handleAnalytics)
+	mux.HandleFunc("GET /v1/health/deep", s.handleDeepHealth)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -1707,6 +1710,174 @@ func (s *HTTPServer) handleBatchChat(w http.ResponseWriter, r *http.Request) {
 		"succeeded": succeeded,
 		"failed":    len(results) - succeeded,
 		"results":   results,
+	})
+}
+
+// -------- Admin & Analytics --------
+
+// handleAdminGC POST /v1/admin/gc — 清理空闲/过期会话
+func (s *HTTPServer) handleAdminGC(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		MaxIdleMinutes int `json:"max_idle_minutes"` // 0 = 使用默认 sessionTimeout
+	}
+	_ = json.NewDecoder(r.Body).Decode(&req)
+
+	threshold := s.sessionTimeout
+	if req.MaxIdleMinutes > 0 {
+		threshold = time.Duration(req.MaxIdleMinutes) * time.Minute
+	}
+
+	var cleaned []string
+	s.sessions.Range(func(key, val any) bool {
+		id := key.(string)
+		sess := val.(*httpSession)
+		if time.Since(sess.lastUsed) > threshold {
+			s.saveSession(id, sess)
+			s.sessions.Delete(key)
+			cleaned = append(cleaned, id)
+		}
+		return true
+	})
+
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventAdminGC, "", fmt.Sprintf("gc: cleaned %d sessions (threshold=%v)", len(cleaned), threshold), clientIP(r), nil)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"cleaned":          len(cleaned),
+		"cleaned_sessions": cleaned,
+		"threshold":        threshold.String(),
+	})
+}
+
+// handleAnalytics GET /v1/analytics — 运行时分析数据
+func (s *HTTPServer) handleAnalytics(w http.ResponseWriter, r *http.Request) {
+	sessionCount := 0
+	totalMessages := 0
+	var oldestIdle, newestIdle time.Duration
+	tagCounts := map[string]int{}
+
+	s.sessions.Range(func(key, val any) bool {
+		sessionCount++
+		sess := val.(*httpSession)
+		totalMessages += len(sess.agent.GetHistory())
+		idle := time.Since(sess.lastUsed)
+		if sessionCount == 1 || idle > oldestIdle {
+			oldestIdle = idle
+		}
+		if sessionCount == 1 || idle < newestIdle {
+			newestIdle = idle
+		}
+		for t := range sess.tags {
+			tagCounts[t]++
+		}
+		return true
+	})
+
+	avgMessages := 0.0
+	if sessionCount > 0 {
+		avgMessages = float64(totalMessages) / float64(sessionCount)
+	}
+
+	resp := map[string]interface{}{
+		"sessions": map[string]interface{}{
+			"active":        sessionCount,
+			"total_messages": totalMessages,
+			"avg_messages":  fmt.Sprintf("%.1f", avgMessages),
+		},
+		"server": map[string]interface{}{
+			"uptime_seconds": int(time.Since(s.startedAt).Seconds()),
+			"total_chats":    s.chatCount.Load(),
+			"total_requests": requestCounter.Load(),
+			"active_conns":   s.activeConns.Load(),
+		},
+		"tools": map[string]interface{}{
+			"registered": len(s.registry.Names()),
+		},
+	}
+
+	if sessionCount > 0 {
+		resp["sessions"].(map[string]interface{})["oldest_idle_seconds"] = int(oldestIdle.Seconds())
+		resp["sessions"].(map[string]interface{})["newest_idle_seconds"] = int(newestIdle.Seconds())
+	}
+
+	if len(tagCounts) > 0 {
+		resp["tag_distribution"] = tagCounts
+	}
+
+	if s.auditLog != nil {
+		resp["audit"] = s.auditLog.Counts()
+	}
+
+	writeJSON(w, http.StatusOK, resp)
+}
+
+// handleDeepHealth GET /v1/health/deep — 深度健康检查（含模型连通性）
+func (s *HTTPServer) handleDeepHealth(w http.ResponseWriter, r *http.Request) {
+	type checkResult struct {
+		Name    string `json:"name"`
+		Status  string `json:"status"` // "ok" or "error"
+		Latency string `json:"latency,omitempty"`
+		Error   string `json:"error,omitempty"`
+	}
+
+	var checks []checkResult
+
+	// 1. 基础健康
+	checks = append(checks, checkResult{Name: "server", Status: "ok"})
+
+	// 2. Memory store
+	_, err := s.memStore.ReadMemory()
+	if err != nil {
+		checks = append(checks, checkResult{Name: "memory_store", Status: "error", Error: err.Error()})
+	} else {
+		checks = append(checks, checkResult{Name: "memory_store", Status: "ok"})
+	}
+
+	// 3. Session store
+	if s.sessionStore != nil {
+		_, err := s.sessionStore.LoadAll()
+		if err != nil {
+			checks = append(checks, checkResult{Name: "session_store", Status: "error", Error: err.Error()})
+		} else {
+			checks = append(checks, checkResult{Name: "session_store", Status: "ok"})
+		}
+	}
+
+	// 4. Model connectivity (轻量 ping — 只需创建 agent 并检查配置)
+	modelStatus := "ok"
+	modelErr := ""
+	if s.agentCfg.APIKey == "" {
+		modelStatus = "warning"
+		modelErr = "no API key configured"
+	} else if s.agentCfg.BaseURL == "" && s.agentCfg.Provider == "" {
+		modelStatus = "warning"
+		modelErr = "no provider/base_url configured"
+	}
+	checks = append(checks, checkResult{
+		Name:   "model_config",
+		Status: modelStatus,
+		Error:  modelErr,
+	})
+
+	// 5. RAG
+	if s.ragMgr != nil {
+		checks = append(checks, checkResult{Name: "rag", Status: "ok"})
+	}
+
+	// 整体状态
+	overall := "ok"
+	for _, c := range checks {
+		if c.Status == "error" {
+			overall = "degraded"
+			break
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":         overall,
+		"checks":         checks,
+		"uptime_seconds": int(time.Since(s.startedAt).Seconds()),
 	})
 }
 

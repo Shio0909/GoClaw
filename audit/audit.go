@@ -21,6 +21,7 @@ const (
 	EventRateLimit     EventType = "rate_limit"
 	EventError         EventType = "error"
 	EventShutdown      EventType = "shutdown"
+	EventAdminGC       EventType = "admin_gc"
 )
 
 // Event 审计事件

@@ -1450,3 +1450,157 @@ func TestBatchChatTooManySessions(t *testing.T) {
 		t.Fatalf("expected 400, got %d", w.Code)
 	}
 }
+
+// ====== Admin GC Tests ======
+
+func TestAdminGCNoExpired(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/admin/gc", srv.handleAdminGC)
+
+	// 创建一个新鲜的会话
+	srv.getOrCreateSession("fresh")
+
+	body := `{"max_idle_minutes":60}`
+	req := httptest.NewRequest("POST", "/v1/admin/gc", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if int(resp["cleaned"].(float64)) != 0 {
+		t.Fatalf("expected 0 cleaned, got %v", resp["cleaned"])
+	}
+}
+
+func TestAdminGCWithExpired(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/admin/gc", srv.handleAdminGC)
+
+	// 创建一个过期会话
+	srv.getOrCreateSession("old-session")
+	if val, ok := srv.sessions.Load("old-session"); ok {
+		sess := val.(*httpSession)
+		sess.lastUsed = time.Now().Add(-2 * time.Hour)
+	}
+
+	body := `{"max_idle_minutes":30}`
+	req := httptest.NewRequest("POST", "/v1/admin/gc", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if int(resp["cleaned"].(float64)) != 1 {
+		t.Fatalf("expected 1 cleaned, got %v", resp["cleaned"])
+	}
+}
+
+// ====== Analytics Tests ======
+
+func TestAnalyticsEndpoint(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/analytics", srv.handleAnalytics)
+
+	srv.getOrCreateSession("a1")
+	srv.getOrCreateSession("a2")
+
+	req := httptest.NewRequest("GET", "/v1/analytics", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	sessions := resp["sessions"].(map[string]interface{})
+	if int(sessions["active"].(float64)) != 2 {
+		t.Fatalf("expected 2 active sessions, got %v", sessions["active"])
+	}
+	server := resp["server"].(map[string]interface{})
+	if server["uptime_seconds"] == nil {
+		t.Fatal("expected uptime_seconds in server")
+	}
+}
+
+func TestAnalyticsWithAudit(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.auditLog = audit.NewLog(100)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/analytics", srv.handleAnalytics)
+
+	req := httptest.NewRequest("GET", "/v1/analytics", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["audit"] == nil {
+		t.Fatal("expected audit counts in analytics")
+	}
+}
+
+// ====== Deep Health Tests ======
+
+func TestDeepHealthOK(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/health/deep", srv.handleDeepHealth)
+
+	req := httptest.NewRequest("GET", "/v1/health/deep", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["status"] != "ok" {
+		t.Fatalf("expected status=ok, got %v", resp["status"])
+	}
+	checks := resp["checks"].([]interface{})
+	if len(checks) < 3 {
+		t.Fatalf("expected at least 3 checks, got %d", len(checks))
+	}
+}
+
+func TestDeepHealthNoAPIKey(t *testing.T) {
+	store := memory.NewStore(t.TempDir())
+	registry := tools.NewRegistry()
+	srv := NewHTTPServer(HTTPServerConfig{
+		Addr:     ":0",
+		AgentCfg: agent.Config{Provider: "openai", BaseURL: "http://fake", Model: "test"},
+		Registry: registry,
+		MemStore: store,
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/health/deep", srv.handleDeepHealth)
+
+	req := httptest.NewRequest("GET", "/v1/health/deep", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	// model_config should be "warning"
+	checks := resp["checks"].([]interface{})
+	found := false
+	for _, c := range checks {
+		cm := c.(map[string]interface{})
+		if cm["name"] == "model_config" && cm["status"] == "warning" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected model_config check with warning status")
+	}
+}
