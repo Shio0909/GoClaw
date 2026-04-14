@@ -4,12 +4,15 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 
+	"github.com/cloudwego/eino/schema"
 	"github.com/gorilla/websocket"
 
 	"github.com/goclaw/goclaw/agent"
+	"github.com/goclaw/goclaw/audit"
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/tools"
 )
@@ -741,5 +744,324 @@ func TestWebSocketClearSession(t *testing.T) {
 	json.Unmarshal(respBytes, &resp)
 	if resp.Type != "done" {
 		t.Errorf("expected done, got %s", resp.Type)
+	}
+}
+
+// ====== Config Reload Tests ======
+
+func TestConfigReloadNoPath(t *testing.T) {
+	srv := newTestHTTPServer(t) // configPath is empty
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/config/reload", srv.handleConfigReload)
+
+	req := httptest.NewRequest("POST", "/v1/config/reload", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestConfigReloadBadPath(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.configPath = "/nonexistent/path/config.yaml"
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/config/reload", srv.handleConfigReload)
+
+	req := httptest.NewRequest("POST", "/v1/config/reload", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// config.Load returns empty config on missing file (no error), so we expect 200 with 0 changes
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestConfigReloadSuccess(t *testing.T) {
+	dir := t.TempDir()
+	cfgFile := dir + "/test.yaml"
+
+	// 写入测试配置
+	cfgContent := `agent:
+  provider: openai
+  api_key: test-key
+  model: gpt-4o
+  max_step: 50
+`
+	if err := writeFile(cfgFile, cfgContent); err != nil {
+		t.Fatal(err)
+	}
+
+	srv := newTestHTTPServer(t)
+	srv.configPath = cfgFile
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/config/reload", srv.handleConfigReload)
+
+	req := httptest.NewRequest("POST", "/v1/config/reload", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["reloaded"] != true {
+		t.Fatal("expected reloaded=true")
+	}
+
+	// 验证 model 被更新
+	if srv.agentCfg.Model != "gpt-4o" {
+		t.Fatalf("model not updated: %s", srv.agentCfg.Model)
+	}
+	if srv.agentCfg.MaxStep != 50 {
+		t.Fatalf("max_step not updated: %d", srv.agentCfg.MaxStep)
+	}
+}
+
+func writeFile(path, content string) error {
+	return os.WriteFile(path, []byte(content), 0644)
+}
+
+// ====== Session Search Tests ======
+
+func TestSessionSearchNoQuery(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/search", srv.handleSessionSearch)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/search", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestSessionSearchNoResults(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.getOrCreateSession("s1")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/search", srv.handleSessionSearch)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/search?q=nonexistent", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	count := int(resp["count"].(float64))
+	if count != 0 {
+		t.Fatalf("expected 0 results, got %d", count)
+	}
+}
+
+func TestSessionSearchWithResults(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	ag := srv.getOrCreateSession("search-hit")
+	ag.SetHistory([]*schema.Message{
+		{Role: schema.User, Content: "hello world"},
+		{Role: schema.Assistant, Content: "hi there"},
+	})
+
+	// 另一个不匹配的会话
+	ag2 := srv.getOrCreateSession("search-miss")
+	ag2.SetHistory([]*schema.Message{
+		{Role: schema.User, Content: "goodbye"},
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/search", srv.handleSessionSearch)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/search?q=hello", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	count := int(resp["count"].(float64))
+	if count != 1 {
+		t.Fatalf("expected 1 result, got %d", count)
+	}
+
+	results := resp["results"].([]interface{})
+	first := results[0].(map[string]interface{})
+	if first["session_id"] != "search-hit" {
+		t.Fatalf("expected session_id=search-hit, got %v", first["session_id"])
+	}
+}
+
+func TestSessionSearchCaseInsensitive(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	ag := srv.getOrCreateSession("ci-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: schema.User, Content: "Hello WORLD"},
+	})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/search", srv.handleSessionSearch)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/search?q=hello+world", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if int(resp["count"].(float64)) != 1 {
+		t.Fatal("case-insensitive search should match")
+	}
+}
+
+func TestSessionSearchWithLimit(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	for i := 0; i < 5; i++ {
+		ag := srv.getOrCreateSession("limit-" + strings.Repeat("x", i+1))
+		ag.SetHistory([]*schema.Message{
+			{Role: schema.User, Content: "common keyword"},
+		})
+	}
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/search", srv.handleSessionSearch)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/search?q=common&limit=2", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	count := int(resp["count"].(float64))
+	if count > 2 {
+		t.Fatalf("expected <=2 results with limit, got %d", count)
+	}
+}
+
+// ====== Audit Endpoint Tests ======
+
+func TestAuditEndpointDisabled(t *testing.T) {
+	srv := newTestHTTPServer(t) // auditLog is nil
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/audit", srv.handleAuditQuery)
+
+	req := httptest.NewRequest("GET", "/v1/audit", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["enabled"] != false {
+		t.Fatal("expected enabled=false when auditLog is nil")
+	}
+}
+
+func TestAuditEndpointWithEvents(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.auditLog = audit.NewLog(100)
+
+	srv.auditLog.Emit(audit.EventChatStart, "s1", "start", "127.0.0.1", nil)
+	srv.auditLog.Emit(audit.EventToolCall, "s1", "shell", "127.0.0.1", nil)
+	srv.auditLog.Emit(audit.EventChatEnd, "s1", "end", "127.0.0.1", nil)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/audit", srv.handleAuditQuery)
+
+	req := httptest.NewRequest("GET", "/v1/audit", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["enabled"] != true {
+		t.Fatal("expected enabled=true")
+	}
+	if int(resp["total"].(float64)) != 3 {
+		t.Fatalf("expected total=3, got %v", resp["total"])
+	}
+	events := resp["events"].([]interface{})
+	if len(events) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(events))
+	}
+}
+
+func TestAuditEndpointFilterByType(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.auditLog = audit.NewLog(100)
+
+	srv.auditLog.Emit(audit.EventChatStart, "s1", "", "", nil)
+	srv.auditLog.Emit(audit.EventToolCall, "s1", "shell", "", nil)
+	srv.auditLog.Emit(audit.EventToolCall, "s1", "file_read", "", nil)
+	srv.auditLog.Emit(audit.EventChatEnd, "s1", "", "", nil)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/audit", srv.handleAuditQuery)
+
+	req := httptest.NewRequest("GET", "/v1/audit?type=tool_call", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	events := resp["events"].([]interface{})
+	if len(events) != 2 {
+		t.Fatalf("expected 2 tool_call events, got %d", len(events))
+	}
+}
+
+func TestAuditEndpointSinceID(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.auditLog = audit.NewLog(100)
+
+	srv.auditLog.Emit(audit.EventChatStart, "s1", "", "", nil)
+	srv.auditLog.Emit(audit.EventChatEnd, "s1", "", "", nil)
+	srv.auditLog.Emit(audit.EventError, "s1", "err", "", nil)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/audit", srv.handleAuditQuery)
+
+	req := httptest.NewRequest("GET", "/v1/audit?since_id=1", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	events := resp["events"].([]interface{})
+	if len(events) != 2 {
+		t.Fatalf("expected 2 events after id=1, got %d", len(events))
+	}
+}
+
+func TestClientIP(t *testing.T) {
+	// Standard request
+	req := httptest.NewRequest("GET", "/", nil)
+	req.RemoteAddr = "192.168.1.1:1234"
+	if ip := clientIP(req); ip != "192.168.1.1" {
+		t.Fatalf("expected 192.168.1.1, got %s", ip)
+	}
+
+	// With X-Forwarded-For
+	req2 := httptest.NewRequest("GET", "/", nil)
+	req2.RemoteAddr = "proxy:5678"
+	req2.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
+	if ip := clientIP(req2); ip != "10.0.0.1" {
+		t.Fatalf("expected 10.0.0.1, got %s", ip)
 	}
 }

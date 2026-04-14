@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -16,6 +17,8 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/goclaw/goclaw/agent"
+	"github.com/goclaw/goclaw/audit"
+	"github.com/goclaw/goclaw/config"
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/rag"
 	"github.com/goclaw/goclaw/tools"
@@ -45,6 +48,8 @@ type HTTPServer struct {
 	fallbackCfg    *agent.FallbackConfig // 模型回退（可选）
 	activeConns    atomic.Int64  // 当前活跃请求数
 	shutdownCh     chan struct{} // 触发优雅关闭
+	configPath     string        // 配置文件路径（用于热重载）
+	auditLog       *audit.Log   // 审计日志
 
 	server *http.Server
 }
@@ -71,6 +76,8 @@ type HTTPServerConfig struct {
 	SessionDir     string   // 会话持久化目录，空则不持久化
 	RateLimit      int      // 每分钟请求限制（0 = 不限制）
 	FallbackCfg    *agent.FallbackConfig // 模型回退配置（可选）
+	ConfigPath     string                // 配置文件路径（用于热重载）
+	AuditLog       *audit.Log            // 审计日志（可选）
 }
 
 // 编译期检查 HTTPServer 实现 Gateway 接口
@@ -116,6 +123,8 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		requestTimeout: reqTimeout,
 		sessionStore:   store,
 		shutdownCh:     make(chan struct{}),
+		configPath:     cfg.ConfigPath,
+		auditLog:       cfg.AuditLog,
 	}
 
 	// 从磁盘恢复会话
@@ -171,6 +180,9 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/{session}/fork", s.handleForkSession)
 	mux.HandleFunc("GET /v1/config", s.handleGetConfig)
 	mux.HandleFunc("GET /v1/openapi.json", s.handleOpenAPISpec)
+	mux.HandleFunc("POST /v1/config/reload", s.handleConfigReload)
+	mux.HandleFunc("GET /v1/sessions/search", s.handleSessionSearch)
+	mux.HandleFunc("GET /v1/audit", s.handleAuditQuery)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -336,6 +348,10 @@ func (s *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	ag := s.getOrCreateSession(req.Session)
 	s.chatCount.Add(1)
 
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventChatStart, req.Session, "", clientIP(r), nil)
+	}
+
 	if req.Stream {
 		s.handleStreamChat(w, r, ag, req)
 		return
@@ -344,8 +360,14 @@ func (s *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	// 非流式
 	resp, err := ag.Run(r.Context(), req.Message)
 	if err != nil {
+		if s.auditLog != nil {
+			s.auditLog.Emit(audit.EventError, req.Session, err.Error(), clientIP(r), nil)
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
+	}
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventChatEnd, req.Session, "", clientIP(r), nil)
 	}
 	writeJSON(w, http.StatusOK, chatResponse{Session: req.Session, Content: resp})
 }
@@ -431,6 +453,9 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	s.sessions.Delete(sessionID)
 	if s.sessionStore != nil {
 		_ = s.sessionStore.Delete(sessionID)
+	}
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventSessionDelete, sessionID, "", clientIP(r), nil)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "session deleted"})
 }
@@ -626,6 +651,10 @@ func (s *HTTPServer) handleForkSession(w http.ResponseWriter, r *http.Request) {
 	copy(copied, history)
 	newAgent.SetHistory(copied)
 
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventSessionFork, sourceID, req.NewSession, clientIP(r), nil)
+	}
+
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"source":        sourceID,
 		"new_session":   req.NewSession,
@@ -674,6 +703,190 @@ func (s *HTTPServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		"config":   cfg,
 		"features": features,
 		"tools":    len(s.registry.Names()),
+	})
+}
+
+// handleConfigReload POST /v1/config/reload — 热重载配置文件
+func (s *HTTPServer) handleConfigReload(w http.ResponseWriter, r *http.Request) {
+	if s.configPath == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no config path set"})
+		return
+	}
+
+	newCfg, err := config.Load(s.configPath)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{
+			"error": fmt.Sprintf("reload failed: %v", err),
+		})
+		return
+	}
+
+	// 记录变更
+	changes := map[string]interface{}{}
+	if newCfg.Agent.Model != s.agentCfg.Model {
+		changes["model"] = map[string]string{"old": s.agentCfg.Model, "new": newCfg.Agent.Model}
+		s.agentCfg.Model = newCfg.Agent.Model
+	}
+	if newCfg.Agent.MaxStep != s.agentCfg.MaxStep {
+		changes["max_step"] = map[string]int{"old": s.agentCfg.MaxStep, "new": newCfg.Agent.MaxStep}
+		s.agentCfg.MaxStep = newCfg.Agent.MaxStep
+	}
+	if newCfg.Agent.MaxTokens != s.agentCfg.MaxTokens {
+		changes["max_tokens"] = map[string]int{"old": s.agentCfg.MaxTokens, "new": newCfg.Agent.MaxTokens}
+		s.agentCfg.MaxTokens = newCfg.Agent.MaxTokens
+	}
+	if newCfg.Agent.Temperature != nil && s.agentCfg.Temperature != nil {
+		if *newCfg.Agent.Temperature != *s.agentCfg.Temperature {
+			changes["temperature"] = map[string]float32{"old": *s.agentCfg.Temperature, "new": *newCfg.Agent.Temperature}
+			s.agentCfg.Temperature = newCfg.Agent.Temperature
+		}
+	} else if newCfg.Agent.Temperature != nil && s.agentCfg.Temperature == nil {
+		changes["temperature"] = map[string]interface{}{"old": nil, "new": *newCfg.Agent.Temperature}
+		s.agentCfg.Temperature = newCfg.Agent.Temperature
+	}
+	if newCfg.Agent.ReasoningEffort != s.agentCfg.ReasoningEffort {
+		changes["reasoning_effort"] = map[string]string{"old": s.agentCfg.ReasoningEffort, "new": newCfg.Agent.ReasoningEffort}
+		s.agentCfg.ReasoningEffort = newCfg.Agent.ReasoningEffort
+	}
+	if newCfg.Agent.SystemPrompt != s.agentCfg.SystemPrompt {
+		changes["system_prompt"] = "updated"
+		s.agentCfg.SystemPrompt = newCfg.Agent.SystemPrompt
+	}
+
+	// 审计日志
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, "", fmt.Sprintf("%d changes", len(changes)), clientIP(r), nil)
+	}
+
+	log.Printf("[HTTP] 配置热重载: %d 项变更", len(changes))
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"reloaded": true,
+		"changes":  changes,
+	})
+}
+
+// handleSessionSearch GET /v1/sessions/search?q=keyword&limit=20 — 搜索会话内容
+func (s *HTTPServer) handleSessionSearch(w http.ResponseWriter, r *http.Request) {
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "q parameter is required"})
+		return
+	}
+
+	limit := 20
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 {
+			limit = v
+		}
+	}
+
+	queryLower := strings.ToLower(query)
+
+	type matchResult struct {
+		SessionID    string `json:"session_id"`
+		MessageCount int    `json:"message_count"`
+		MatchCount   int    `json:"match_count"`
+		Snippet      string `json:"snippet"`
+		LastUsed     string `json:"last_used"`
+	}
+
+	var results []matchResult
+	s.sessions.Range(func(key, val any) bool {
+		if len(results) >= limit {
+			return false
+		}
+
+		id := key.(string)
+		sess := val.(*httpSession)
+		history := sess.agent.GetHistory()
+
+		matchCount := 0
+		snippet := ""
+
+		for _, msg := range history {
+			content := msg.Content
+			if content == "" {
+				continue
+			}
+			contentLower := strings.ToLower(content)
+			if idx := strings.Index(contentLower, queryLower); idx >= 0 {
+				matchCount++
+				if snippet == "" {
+					// 提取匹配上下文（前后各 50 字符）
+					start := idx - 50
+					if start < 0 {
+						start = 0
+					}
+					end := idx + len(query) + 50
+					if end > len(content) {
+						end = len(content)
+					}
+					snippet = content[start:end]
+					if start > 0 {
+						snippet = "..." + snippet
+					}
+					if end < len(content) {
+						snippet = snippet + "..."
+					}
+				}
+			}
+		}
+
+		if matchCount > 0 {
+			results = append(results, matchResult{
+				SessionID:    id,
+				MessageCount: len(history),
+				MatchCount:   matchCount,
+				Snippet:      snippet,
+				LastUsed:     sess.lastUsed.Format(time.RFC3339),
+			})
+		}
+
+		return true
+	})
+
+	if results == nil {
+		results = []matchResult{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"query":   query,
+		"count":   len(results),
+		"results": results,
+	})
+}
+
+// handleAuditQuery GET /v1/audit?type=chat_end&limit=50&since_id=0
+func (s *HTTPServer) handleAuditQuery(w http.ResponseWriter, r *http.Request) {
+	if s.auditLog == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"enabled": false,
+			"events":  []interface{}{},
+		})
+		return
+	}
+
+	typ := audit.EventType(r.URL.Query().Get("type"))
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if v, err := strconv.Atoi(l); err == nil && v > 0 {
+			limit = v
+		}
+	}
+	var sinceID int64
+	if s := r.URL.Query().Get("since_id"); s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+			sinceID = v
+		}
+	}
+
+	events := s.auditLog.Query(typ, limit, sinceID)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled": true,
+		"total":   s.auditLog.Count(),
+		"count":   len(events),
+		"events":  events,
 	})
 }
 
@@ -1175,4 +1388,17 @@ func writeJSON(w http.ResponseWriter, status int, data interface{}) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	json.NewEncoder(w).Encode(data)
+}
+
+// clientIP 提取客户端真实 IP（支持 X-Forwarded-For）
+func clientIP(r *http.Request) string {
+	if fwd := r.Header.Get("X-Forwarded-For"); fwd != "" {
+		if parts := strings.SplitN(fwd, ",", 2); len(parts) > 0 {
+			return strings.TrimSpace(parts[0])
+		}
+	}
+	if host, _, ok := strings.Cut(r.RemoteAddr, ":"); ok {
+		return host
+	}
+	return r.RemoteAddr
 }
