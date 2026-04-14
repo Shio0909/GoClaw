@@ -13,6 +13,7 @@ import (
 
 	"github.com/goclaw/goclaw/agent"
 	"github.com/goclaw/goclaw/memory"
+	"github.com/goclaw/goclaw/rag"
 	"github.com/goclaw/goclaw/tools"
 )
 
@@ -25,6 +26,7 @@ type HTTPServer struct {
 
 	sessions   sync.Map // sessionID -> *httpSession
 	retryConfig     *agent.RetryConfig
+	ragMgr          *rag.Manager
 	contextLength   int
 	apiToken        string // 可选的 Bearer Token 认证
 
@@ -44,6 +46,7 @@ type HTTPServerConfig struct {
 	Registry      *tools.Registry
 	MemStore      *memory.Store
 	RetryConfig   *agent.RetryConfig
+	RAGManager    *rag.Manager
 	ContextLength int
 	APIToken      string // 可选，设置后需 Bearer Token 认证
 }
@@ -63,6 +66,7 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		registry:      cfg.Registry,
 		memStore:      cfg.MemStore,
 		retryConfig:   cfg.RetryConfig,
+		ragMgr:        cfg.RAGManager,
 		contextLength: ctxLen,
 		apiToken:      cfg.APIToken,
 	}
@@ -310,6 +314,9 @@ func (s *HTTPServer) getOrCreateSession(id string) *agent.Agent {
 
 	if s.retryConfig != nil {
 		ag.SetRetryConfig(s.retryConfig)
+	}
+	if s.ragMgr != nil {
+		ag.SetRAGManager(s.ragMgr)
 	}
 
 	s.sessions.Store(id, &httpSession{

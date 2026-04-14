@@ -52,3 +52,11 @@ tools:
 #     args: ["-y", "@modelcontextprotocol/server-github"]
 #     env:
 #       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
+
+# RAG 检索增强配置（连接外部知识库）
+# rag:
+#   providers:
+#     - name: "My Knowledge Base"
+#       type: http
+#       base_url: http://localhost:8000/api/search
+#       api_key: ${RAG_API_KEY}

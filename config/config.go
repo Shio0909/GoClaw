@@ -17,6 +17,7 @@ type Config struct {
 	Gateway GatewayConfig           `yaml:"gateways"`
 	Tools   ToolsConfig             `yaml:"tools"`
 	MCP     map[string]MCPServer    `yaml:"mcp_servers"`
+	RAG     RAGConfig               `yaml:"rag"`
 }
 
 type ServerConfig struct {
@@ -72,6 +73,18 @@ type MCPServer struct {
 	Transport string            `yaml:"transport"`
 	APIKey    string            `yaml:"api_key"`
 	ToolNames []string          `yaml:"tool_names"`
+}
+
+// RAGConfig 检索增强生成配置
+type RAGConfig struct {
+	Providers []RAGProvider `yaml:"providers"`
+}
+
+type RAGProvider struct {
+	Name    string `yaml:"name"`     // 显示名称
+	Type    string `yaml:"type"`     // "http" (目前只支持 HTTP)
+	BaseURL string `yaml:"base_url"` // API 端点 URL
+	APIKey  string `yaml:"api_key"`  // 可选 Bearer token
 }
 
 // Load 加载配置，优先 YAML 文件，环境变量作为回退/覆盖
