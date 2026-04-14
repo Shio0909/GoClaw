@@ -106,34 +106,43 @@ func TestAuthMiddleware(t *testing.T) {
 	srv := newTestHTTPServer(t)
 	srv.apiToken = "secret-token"
 
-	handler := srv.withAuth(func(w http.ResponseWriter, r *http.Request) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 	})
+	handler := srv.withAuth(inner)
 
 	// No token
-	req := httptest.NewRequest("GET", "/", nil)
+	req := httptest.NewRequest("GET", "/v1/tools", nil)
 	w := httptest.NewRecorder()
-	handler(w, req)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 without token, got %d", w.Code)
 	}
 
 	// Wrong token
-	req = httptest.NewRequest("GET", "/", nil)
+	req = httptest.NewRequest("GET", "/v1/tools", nil)
 	req.Header.Set("Authorization", "Bearer wrong")
 	w = httptest.NewRecorder()
-	handler(w, req)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusUnauthorized {
 		t.Errorf("expected 401 with wrong token, got %d", w.Code)
 	}
 
 	// Correct token
-	req = httptest.NewRequest("GET", "/", nil)
+	req = httptest.NewRequest("GET", "/v1/tools", nil)
 	req.Header.Set("Authorization", "Bearer secret-token")
 	w = httptest.NewRecorder()
-	handler(w, req)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 with correct token, got %d", w.Code)
+	}
+
+	// Health endpoint bypasses auth
+	req = httptest.NewRequest("GET", "/v1/health", nil)
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200 for health (no auth), got %d", w.Code)
 	}
 }
 
@@ -183,14 +192,92 @@ func TestMemoryEndpoint(t *testing.T) {
 func TestNoAuthWhenTokenEmpty(t *testing.T) {
 	srv := newTestHTTPServer(t)
 	// apiToken is empty, auth should be skipped
-	handler := srv.withAuth(func(w http.ResponseWriter, r *http.Request) {
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{"ok": "true"})
 	})
+	handler := srv.withAuth(inner)
 
-	req := httptest.NewRequest("GET", "/", nil)
+	req := httptest.NewRequest("GET", "/v1/tools", nil)
 	w := httptest.NewRecorder()
-	handler(w, req)
+	handler.ServeHTTP(w, req)
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 when no token configured, got %d", w.Code)
+	}
+}
+
+func TestCORSMiddleware(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.corsOrigins = []string{"*"}
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := srv.withCORS(inner)
+
+	// Preflight OPTIONS
+	req := httptest.NewRequest("OPTIONS", "/v1/chat", nil)
+	req.Header.Set("Origin", "http://example.com")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusNoContent {
+		t.Errorf("expected 204 for OPTIONS, got %d", w.Code)
+	}
+	if w.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("expected CORS origin *, got %q", w.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	// Normal request with CORS
+	req = httptest.NewRequest("GET", "/v1/health", nil)
+	req.Header.Set("Origin", "http://example.com")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
+	}
+	if w.Header().Get("Access-Control-Allow-Origin") != "*" {
+		t.Errorf("expected CORS header on response")
+	}
+}
+
+func TestCORSSpecificOrigins(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.corsOrigins = []string{"http://allowed.com", "http://also-ok.com"}
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := srv.withCORS(inner)
+
+	// Allowed origin
+	req := httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Origin", "http://allowed.com")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Header().Get("Access-Control-Allow-Origin") != "http://allowed.com" {
+		t.Errorf("expected specific origin, got %q", w.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	// Disallowed origin
+	req = httptest.NewRequest("GET", "/", nil)
+	req.Header.Set("Origin", "http://evil.com")
+	w = httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Header().Get("Access-Control-Allow-Origin") != "" {
+		t.Errorf("expected no CORS header for disallowed origin, got %q", w.Header().Get("Access-Control-Allow-Origin"))
+	}
+}
+
+func TestRequestLogMiddleware(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := srv.withRequestLog(inner)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Errorf("expected 200, got %d", w.Code)
 	}
 }

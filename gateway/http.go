@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/goclaw/goclaw/agent"
@@ -17,6 +18,8 @@ import (
 	"github.com/goclaw/goclaw/tools"
 )
 
+var requestCounter atomic.Int64
+
 // HTTPServer 提供 RESTful API 的网关，支持 SSE 流式输出
 type HTTPServer struct {
 	addr     string
@@ -24,11 +27,14 @@ type HTTPServer struct {
 	registry *tools.Registry
 	memStore *memory.Store
 
-	sessions   sync.Map // sessionID -> *httpSession
-	retryConfig     *agent.RetryConfig
-	ragMgr          *rag.Manager
-	contextLength   int
-	apiToken        string // 可选的 Bearer Token 认证
+	sessions       sync.Map // sessionID -> *httpSession
+	retryConfig    *agent.RetryConfig
+	ragMgr         *rag.Manager
+	contextLength  int
+	apiToken       string   // 可选的 Bearer Token 认证
+	corsOrigins    []string // CORS 允许的域名
+	sessionTimeout time.Duration
+	requestTimeout time.Duration
 
 	server *http.Server
 }
@@ -41,14 +47,17 @@ type httpSession struct {
 
 // HTTPServerConfig HTTP API 服务器配置
 type HTTPServerConfig struct {
-	Addr          string             // 监听地址，如 ":8080"
-	AgentCfg      agent.Config
-	Registry      *tools.Registry
-	MemStore      *memory.Store
-	RetryConfig   *agent.RetryConfig
-	RAGManager    *rag.Manager
-	ContextLength int
-	APIToken      string // 可选，设置后需 Bearer Token 认证
+	Addr           string             // 监听地址，如 ":8080"
+	AgentCfg       agent.Config
+	Registry       *tools.Registry
+	MemStore       *memory.Store
+	RetryConfig    *agent.RetryConfig
+	RAGManager     *rag.Manager
+	ContextLength  int
+	APIToken       string   // 可选，设置后需 Bearer Token 认证
+	CORSOrigins    []string // CORS 允许的域名，["*"] 为全部
+	SessionTimeout int      // 会话超时（分钟），默认 30
+	RequestTimeout int      // 请求超时（秒），默认 300
 }
 
 // 编译期检查 HTTPServer 实现 Gateway 接口
@@ -60,15 +69,26 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 	if ctxLen <= 0 {
 		ctxLen = 128000
 	}
+	sessTimeout := time.Duration(cfg.SessionTimeout) * time.Minute
+	if sessTimeout <= 0 {
+		sessTimeout = 30 * time.Minute
+	}
+	reqTimeout := time.Duration(cfg.RequestTimeout) * time.Second
+	if reqTimeout <= 0 {
+		reqTimeout = 5 * time.Minute
+	}
 	return &HTTPServer{
-		addr:          cfg.Addr,
-		agentCfg:      cfg.AgentCfg,
-		registry:      cfg.Registry,
-		memStore:      cfg.MemStore,
-		retryConfig:   cfg.RetryConfig,
-		ragMgr:        cfg.RAGManager,
-		contextLength: ctxLen,
-		apiToken:      cfg.APIToken,
+		addr:           cfg.Addr,
+		agentCfg:       cfg.AgentCfg,
+		registry:       cfg.Registry,
+		memStore:       cfg.MemStore,
+		retryConfig:    cfg.RetryConfig,
+		ragMgr:         cfg.RAGManager,
+		contextLength:  ctxLen,
+		apiToken:       cfg.APIToken,
+		corsOrigins:    cfg.CORSOrigins,
+		sessionTimeout: sessTimeout,
+		requestTimeout: reqTimeout,
 	}
 }
 
@@ -77,16 +97,23 @@ func (s *HTTPServer) Name() string { return "http" }
 // Run 启动 HTTP 服务器，阻塞直到 ctx 取消
 func (s *HTTPServer) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/chat", s.withAuth(s.handleChat))
-	mux.HandleFunc("GET /v1/chat/{session}", s.withAuth(s.handleGetHistory))
-	mux.HandleFunc("DELETE /v1/chat/{session}", s.withAuth(s.handleDeleteSession))
-	mux.HandleFunc("GET /v1/tools", s.withAuth(s.handleListTools))
-	mux.HandleFunc("GET /v1/memory/{session}", s.withAuth(s.handleGetMemory))
+	mux.HandleFunc("POST /v1/chat", s.handleChat)
+	mux.HandleFunc("GET /v1/chat/{session}", s.handleGetHistory)
+	mux.HandleFunc("DELETE /v1/chat/{session}", s.handleDeleteSession)
+	mux.HandleFunc("GET /v1/tools", s.handleListTools)
+	mux.HandleFunc("GET /v1/memory/{session}", s.handleGetMemory)
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 
+	// 中间件链：CORS → 请求日志 → 认证
+	handler := s.withAuth(s.withRequestLog(mux))
+	handler = s.withCORS(handler)
+
 	s.server = &http.Server{
-		Addr:    s.addr,
-		Handler: mux,
+		Addr:         s.addr,
+		Handler:      handler,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: s.requestTimeout + 10*time.Second, // 留 10s buffer
+		IdleTimeout:  120 * time.Second,
 	}
 
 	// 会话清理
@@ -100,26 +127,94 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 		s.server.Shutdown(shutdownCtx)
 	}()
 
-	log.Printf("[HTTP] API 服务器启动: %s", s.addr)
+	log.Printf("[HTTP] API 服务器启动: %s (CORS=%v, 会话超时=%v)", s.addr, s.corsOrigins, s.sessionTimeout)
 	if err := s.server.ListenAndServe(); err != http.ErrServerClosed {
 		return fmt.Errorf("http server: %w", err)
 	}
 	return nil
 }
 
-// -------- 认证中间件 --------
+// -------- 中间件 --------
 
-func (s *HTTPServer) withAuth(handler http.HandlerFunc) http.HandlerFunc {
+// withAuth Bearer Token 认证（health 端点豁免）
+func (s *HTTPServer) withAuth(next http.Handler) http.Handler {
 	if s.apiToken == "" {
-		return handler
+		return next
 	}
-	return func(w http.ResponseWriter, r *http.Request) {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/health" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		auth := r.Header.Get("Authorization")
 		if auth != "Bearer "+s.apiToken {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
-		handler(w, r)
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withCORS 处理跨域请求
+func (s *HTTPServer) withCORS(next http.Handler) http.Handler {
+	if len(s.corsOrigins) == 0 {
+		return next
+	}
+	allowAll := len(s.corsOrigins) == 1 && s.corsOrigins[0] == "*"
+	originSet := make(map[string]bool, len(s.corsOrigins))
+	for _, o := range s.corsOrigins {
+		originSet[o] = true
+	}
+
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		origin := r.Header.Get("Origin")
+		if origin != "" && (allowAll || originSet[origin]) {
+			allowed := origin
+			if allowAll {
+				allowed = "*"
+			}
+			w.Header().Set("Access-Control-Allow-Origin", allowed)
+			w.Header().Set("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+			w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+			w.Header().Set("Access-Control-Max-Age", "86400")
+		}
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// withRequestLog 记录每个请求的方法、路径和耗时
+func (s *HTTPServer) withRequestLog(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := requestCounter.Add(1)
+		start := time.Now()
+		rw := &responseWriter{ResponseWriter: w, status: 200}
+		next.ServeHTTP(rw, r)
+		log.Printf("[HTTP] #%d %s %s → %d (%v)", reqID, r.Method, r.URL.Path, rw.status, time.Since(start).Round(time.Millisecond))
+	})
+}
+
+// responseWriter 包装 http.ResponseWriter 以捕获 status code
+type responseWriter struct {
+	http.ResponseWriter
+	status int
+	wrote  bool
+}
+
+func (rw *responseWriter) WriteHeader(code int) {
+	if !rw.wrote {
+		rw.status = code
+		rw.wrote = true
+	}
+	rw.ResponseWriter.WriteHeader(code)
+}
+
+func (rw *responseWriter) Flush() {
+	if f, ok := rw.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
 	}
 }
 
@@ -335,7 +430,7 @@ func (s *HTTPServer) cleanSessions(ctx context.Context) {
 		case <-ticker.C:
 			s.sessions.Range(func(key, val any) bool {
 				sess := val.(*httpSession)
-				if time.Since(sess.lastUsed) > 30*time.Minute {
+				if time.Since(sess.lastUsed) > s.sessionTimeout {
 					s.sessions.Delete(key)
 					log.Printf("[HTTP] 清理过期会话: %s", key)
 				}

@@ -264,7 +264,7 @@ func runServe(cfg *config.Config, inf *infra) {
 
 	// HTTP API Server
 	if cfg.Server.Listen != "" {
-		httpSrv := gateway.NewHTTPServer(gateway.HTTPServerConfig{
+		httpCfg := gateway.HTTPServerConfig{
 			Addr:          cfg.Server.Listen,
 			AgentCfg:      inf.agentCfg,
 			Registry:      inf.registry,
@@ -272,7 +272,14 @@ func runServe(cfg *config.Config, inf *infra) {
 			RetryConfig:   inf.retryCfg,
 			RAGManager:    inf.ragMgr,
 			ContextLength: cfg.Agent.ContextLength,
-		})
+		}
+		if cfg.Gateway.HTTP != nil {
+			httpCfg.APIToken = cfg.Gateway.HTTP.APIToken
+			httpCfg.CORSOrigins = cfg.Gateway.HTTP.CORS
+			httpCfg.SessionTimeout = cfg.Gateway.HTTP.SessionTimeout
+			httpCfg.RequestTimeout = cfg.Gateway.HTTP.RequestTimeout
+		}
+		httpSrv := gateway.NewHTTPServer(httpCfg)
 		gateways = append(gateways, httpSrv)
 	}
 

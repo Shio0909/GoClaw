@@ -29,6 +29,11 @@ agent:
   # simple_base_url: https://api.deepseek.com/v1
 
 gateways:
+  http:
+    # api_token: ${GOCLAW_API_TOKEN}   # Bearer Token 认证（留空则无需认证）
+    cors_origins: ["*"]                 # CORS 允许域名，["*"] 为全部
+    session_timeout: 30                 # 会话超时（分钟）
+    request_timeout: 300                # 请求超时（秒）
   qq:
     enabled: false
     websocket: ws://127.0.0.1:3001

@@ -44,7 +44,16 @@ type AgentConfig struct {
 }
 
 type GatewayConfig struct {
-	QQ  *QQConfig  `yaml:"qq"`
+	QQ   *QQConfig   `yaml:"qq"`
+	HTTP *HTTPConfig `yaml:"http"`
+}
+
+// HTTPConfig HTTP API 网关配置
+type HTTPConfig struct {
+	APIToken       string   `yaml:"api_token"`        // 可选 Bearer Token 认证
+	CORS           []string `yaml:"cors_origins"`     // CORS 允许的域名，["*"] 为全部
+	SessionTimeout int      `yaml:"session_timeout"`  // 会话超时（分钟），默认 30
+	RequestTimeout int      `yaml:"request_timeout"`  // 请求超时（秒），默认 300
 }
 
 type QQConfig struct {
