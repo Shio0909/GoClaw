@@ -155,6 +155,13 @@ func applyEnvFallback(cfg *Config) {
 	envStr(&cfg.Agent.SimpleModel, "GOCLAW_SIMPLE_MODEL")
 	envStr(&cfg.Agent.SimpleProvider, "GOCLAW_SIMPLE_PROVIDER")
 	envStr(&cfg.Agent.SimpleBaseURL, "GOCLAW_SIMPLE_BASE_URL")
+	envStr(&cfg.Agent.FallbackModel, "GOCLAW_FALLBACK_MODEL")
+	envStr(&cfg.Agent.FallbackProvider, "GOCLAW_FALLBACK_PROVIDER")
+	envStr(&cfg.Agent.FallbackBaseURL, "GOCLAW_FALLBACK_BASE_URL")
+	envStr(&cfg.Agent.FallbackAPIKey, "GOCLAW_FALLBACK_API_KEY")
+	envStr(&cfg.Agent.SystemPrompt, "GOCLAW_SYSTEM_PROMPT")
+	envStr(&cfg.Agent.ReasoningEffort, "GOCLAW_REASONING_EFFORT")
+	envInt(&cfg.Agent.MaxTokens, "GOCLAW_MAX_TOKENS")
 	envInt(&cfg.Agent.MaxStep, "GOCLAW_MAX_STEP")
 	envInt(&cfg.Agent.ToolMaxBytes, "GOCLAW_TOOL_MAX_BYTES")
 
@@ -195,6 +202,29 @@ func applyEnvFallback(cfg *Config) {
 	envStr(&cfg.Tools.SmitheryKey, "SMITHERY_API_KEY")
 	envStr(&cfg.Tools.SkillsDir, "GOCLAW_SKILLS_DIR")
 	envInt(&cfg.Tools.SkillNudge, "GOCLAW_SKILL_NUDGE_INTERVAL")
+
+	// HTTP Gateway
+	if cfg.Gateway.HTTP == nil {
+		apiToken := os.Getenv("GOCLAW_API_TOKEN")
+		sessionDir := os.Getenv("GOCLAW_SESSION_DIR")
+		rateLimitStr := os.Getenv("GOCLAW_RATE_LIMIT")
+		if apiToken != "" || sessionDir != "" || rateLimitStr != "" {
+			cfg.Gateway.HTTP = &HTTPConfig{}
+		}
+		if cfg.Gateway.HTTP != nil {
+			envStr(&cfg.Gateway.HTTP.APIToken, "GOCLAW_API_TOKEN")
+			envStr(&cfg.Gateway.HTTP.SessionDir, "GOCLAW_SESSION_DIR")
+			envInt(&cfg.Gateway.HTTP.RateLimit, "GOCLAW_RATE_LIMIT")
+			envInt(&cfg.Gateway.HTTP.SessionTimeout, "GOCLAW_SESSION_TIMEOUT")
+			envInt(&cfg.Gateway.HTTP.RequestTimeout, "GOCLAW_REQUEST_TIMEOUT")
+		}
+	} else {
+		envStr(&cfg.Gateway.HTTP.APIToken, "GOCLAW_API_TOKEN")
+		envStr(&cfg.Gateway.HTTP.SessionDir, "GOCLAW_SESSION_DIR")
+		envInt(&cfg.Gateway.HTTP.RateLimit, "GOCLAW_RATE_LIMIT")
+		envInt(&cfg.Gateway.HTTP.SessionTimeout, "GOCLAW_SESSION_TIMEOUT")
+		envInt(&cfg.Gateway.HTTP.RequestTimeout, "GOCLAW_REQUEST_TIMEOUT")
+	}
 
 	// QQ Gateway
 	if cfg.Gateway.QQ == nil {
