@@ -22,6 +22,7 @@ import (
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/rag"
 	"github.com/goclaw/goclaw/tools"
+	"github.com/goclaw/goclaw/webhook"
 )
 
 var requestCounter atomic.Int64
@@ -50,6 +51,7 @@ type HTTPServer struct {
 	shutdownCh     chan struct{} // 触发优雅关闭
 	configPath     string        // 配置文件路径（用于热重载）
 	auditLog       *audit.Log   // 审计日志
+	webhookMgr     *webhook.Manager // Webhook 管理器
 
 	server *http.Server
 }
@@ -78,6 +80,7 @@ type HTTPServerConfig struct {
 	FallbackCfg    *agent.FallbackConfig // 模型回退配置（可选）
 	ConfigPath     string                // 配置文件路径（用于热重载）
 	AuditLog       *audit.Log            // 审计日志（可选）
+	WebhookMgr     *webhook.Manager      // Webhook 管理器（可选）
 }
 
 // 编译期检查 HTTPServer 实现 Gateway 接口
@@ -125,6 +128,7 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		shutdownCh:     make(chan struct{}),
 		configPath:     cfg.ConfigPath,
 		auditLog:       cfg.AuditLog,
+		webhookMgr:     cfg.WebhookMgr,
 	}
 
 	// 从磁盘恢复会话
@@ -183,6 +187,9 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/config/reload", s.handleConfigReload)
 	mux.HandleFunc("GET /v1/sessions/search", s.handleSessionSearch)
 	mux.HandleFunc("GET /v1/audit", s.handleAuditQuery)
+	mux.HandleFunc("GET /v1/webhooks", s.handleListWebhooks)
+	mux.HandleFunc("POST /v1/webhooks", s.handleAddWebhook)
+	mux.HandleFunc("DELETE /v1/webhooks", s.handleRemoveWebhook)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -888,6 +895,71 @@ func (s *HTTPServer) handleAuditQuery(w http.ResponseWriter, r *http.Request) {
 		"count":   len(events),
 		"events":  events,
 	})
+}
+
+// handleListWebhooks GET /v1/webhooks — 列出所有 webhook 及发送统计
+func (s *HTTPServer) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
+	if s.webhookMgr == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"enabled": false,
+			"hooks":   []interface{}{},
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled": true,
+		"hooks":   s.webhookMgr.ListHooks(),
+		"stats":   s.webhookMgr.Stats(),
+	})
+}
+
+// handleAddWebhook POST /v1/webhooks — 动态添加 webhook
+func (s *HTTPServer) handleAddWebhook(w http.ResponseWriter, r *http.Request) {
+	if s.webhookMgr == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "webhooks not enabled"})
+		return
+	}
+
+	var hook webhook.Hook
+	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json: " + err.Error()})
+		return
+	}
+	if hook.URL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url is required"})
+		return
+	}
+
+	s.webhookMgr.AddHook(hook)
+
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, "", "webhook added: "+hook.URL, clientIP(r), nil)
+	}
+
+	writeJSON(w, http.StatusCreated, map[string]string{"message": "webhook added", "url": hook.URL})
+}
+
+// handleRemoveWebhook DELETE /v1/webhooks — 按 URL 移除 webhook
+func (s *HTTPServer) handleRemoveWebhook(w http.ResponseWriter, r *http.Request) {
+	if s.webhookMgr == nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "webhooks not enabled"})
+		return
+	}
+
+	var req struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url is required"})
+		return
+	}
+
+	if s.webhookMgr.RemoveHook(req.URL) {
+		writeJSON(w, http.StatusOK, map[string]string{"message": "webhook removed", "url": req.URL})
+	} else {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "webhook not found"})
+	}
 }
 
 func (s *HTTPServer) handleExportSession(w http.ResponseWriter, r *http.Request) {
