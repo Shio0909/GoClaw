@@ -7,14 +7,16 @@
 灵感来自 [Claude Code](https://github.com/anthropics/claude-code) 和 [Hermes Agent](https://github.com/nousresearch/hermes-agent)，基于 [Eino](https://github.com/cloudwego/eino)（字节跳动 AI 框架）的 ReAct Agent 实现。
 
 ```
-               ┌─────────────────────────────────┐
-               │         GoClaw Runtime           │
-               │                                  │
-  HTTP API ──→ │  ┌──────┐  ┌──────┐  ┌────────┐ │
-  CLI      ──→ │  │Agent │──│Tools │──│Memory  │ │
-  QQ Bot   ──→ │  │Loop  │  │17+MCP│  │3-Layer │ │
-  (扩展)   ──→ │  └──────┘  └──────┘  └────────┘ │
-               └─────────────────────────────────┘
+               ┌──────────────────────────────────────┐
+               │          GoClaw Runtime               │
+               │                                       │
+  HTTP API ──→ │  ┌───────┐  ┌───────┐  ┌──────────┐  │
+  WebSocket──→ │  │ Agent │──│ Tools │──│ Memory   │  │
+  CLI      ──→ │  │ Loop  │  │17+MCP │  │ 3-Layer  │  │
+  QQ Bot   ──→ │  │+Retry │  │+Stats │  │+RAG      │  │
+  (扩展)   ──→ │  │+Route │  │+Retry │  │+Persist  │  │
+               │  └───────┘  └───────┘  └──────────┘  │
+               └──────────────────────────────────────┘
 ```
 
 ## 为什么选择 GoClaw
@@ -25,7 +27,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~8000 行 Go（含测试） | — |
+| **代码量** | ~12,000 行 Go（含 148 个测试） | — |
 
 ## 核心特性
 
@@ -48,16 +50,24 @@
 
 **生产可靠性**
 - 错误分类（7 类）+ 智能重试 + 凭证池 Key 轮换
+- 模型回退：主模型 503/429/超时/额度不足 → 自动切换备用模型
 - 工具级自动重试（网络工具瞬时错误 3 次指数退避）
+- 令牌桶速率限制（per-IP，X-Forwarded-For 支持，429 + Retry-After）
 - 危险工具确认（CLI 模式下 shell/file_write 等需用户确认）
 - 上下文压缩（裁剪→边界保护→LLM 摘要）
+- 会话持久化（JSON 快照，启动恢复，优雅关闭保存）
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 原生 REST API + SSE 流式
+- 原生 REST API + SSE 流式 + WebSocket 实时通信
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
 - Bearer Token 认证 + 请求日志 + 可配置超时
+- 令牌桶速率限制（每 IP 独立计数）
+- 运行指标端点 + 工具调用统计
+- 会话持久化（磁盘 JSON 快照，优雅关闭自动保存）
+- 会话导出（JSON / Markdown 格式）
+- 模型回退（主模型失败自动切换备用模型）
 
 ## 项目结构
 
@@ -70,6 +80,7 @@ GoClaw/
 │   ├── compressor.go       # 三阶段上下文压缩
 │   ├── errors.go           # API 错误分类（7 类 + 重试决策）
 │   ├── retry.go            # 智能重试 + Key 轮换
+│   ├── fallback.go         # 模型回退（主模型失败→备用模型）
 │   ├── credential_pool.go  # 多 Key 凭证池（3 种策略）
 │   ├── router.go           # 智能模型路由
 │   └── think_filter.go     # 思考过程过滤器
@@ -77,7 +88,9 @@ GoClaw/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（REST + SSE + OpenAI 兼容 + CORS）
+│   ├── http.go             # HTTP API（REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
+│   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
 │   ├── qq.go               # QQ 机器人 (OneBot v11 WebSocket)
 │   ├── qq_image.go         # 图片消息处理
 │   ├── qq_voice.go         # 语音消息处理 (STT)
@@ -86,6 +99,7 @@ GoClaw/
 ├── tools/
 │   ├── registry.go         # 工具注册表
 │   ├── builtins.go         # 内置工具注册（20+ 个工具）
+│   ├── stats.go            # 工具调用统计（原子计数器 + 快照）
 │   ├── confirm.go          # 危险工具确认系统
 │   ├── eino_adapter.go     # Eino 适配器 + 工具级重试 + 输出截断
 │   ├── mcp_bridge.go       # MCP Server 连接桥
@@ -165,11 +179,16 @@ docker compose up -d
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/v1/chat` | POST | 发送消息（`stream: true` 启用 SSE） |
-| `/v1/chat/:session` | GET | 查看会话状态 |
+| `/v1/chat/:session` | GET | 查看会话历史 |
 | `/v1/chat/:session` | DELETE | 清空会话 |
+| `/v1/chat/:session/export` | GET | 导出会话（`?format=json\|markdown`） |
+| `/v1/sessions` | GET | 列出所有活跃会话 |
 | `/v1/tools` | GET | 列出可用工具 |
+| `/v1/tools/stats` | GET | 工具调用统计（次数、错误、平均耗时） |
 | `/v1/memory/:session` | GET | 查看记忆状态 |
-| `/v1/health` | GET | 健康检查 |
+| `/v1/metrics` | GET | 运行指标（uptime、请求数、活跃会话等） |
+| `/v1/health` | GET | 健康检查（免认证） |
+| `/v1/ws` | GET | WebSocket 实时聊天 |
 
 ### OpenAI 兼容 API
 
@@ -220,7 +239,26 @@ gateways:
     cors_origins: ["*"]              # CORS 允许域名
     session_timeout: 30              # 会话超时（分钟）
     request_timeout: 300             # 请求超时（秒）
+    session_dir: "./sessions"        # 会话持久化目录（留空则不持久化）
+    rate_limit: 60                   # 每分钟请求限制（0 = 不限制）
 ```
+
+### WebSocket
+
+连接 `ws://localhost:8080/v1/ws`，消息格式：
+
+```json
+// 发送消息
+{"type": "chat", "session": "my-session", "message": "你好"}
+
+// 清空会话
+{"type": "clear", "session": "my-session"}
+
+// 心跳检测
+{"type": "ping"}
+```
+
+响应类型：`chunk`（流式分块）、`done`（完成）、`error`（错误）、`pong`（心跳回复）
 
 ## 内置工具
 
@@ -472,22 +510,51 @@ GoClaw 基于 Eino 框架的 ReAct Agent 模式：
 9. 上下文过长时自动三阶段压缩
 
 ```
-用户输入 (HTTP / CLI / QQ)
+用户输入 (HTTP / WebSocket / CLI / QQ)
   ↓
-Gateway 接口路由 (CORS + 认证 + 请求日志)
+Gateway 接口路由 (CORS + 速率限制 + 认证 + 请求日志)
   ↓
-BuildSystemPrompt (memory + tools + skills + custom prompt)
+BuildSystemPrompt (memory + tools + skills + RAG + custom prompt)
   ↓
 ModelRouter (复杂度分类 → 选择模型)
   ↓
 Eino ReAct Agent
-  ↓ ←→ Tool Calls (20+ 内置 + MCP)
+  ↓ ←→ Tool Calls (20+ 内置 + MCP)  → ToolStats 统计
   ↓ ←→ Confirmation (CLI 模式危险工具确认)
   ↓ ←→ Tool Retry (网络工具自动重试)
   ↓ ←→ Error Recovery (retry + key rotation + compress)
+  ↓ ←→ Model Fallback (主模型失败 → 备用模型)
   ↓
 流式输出 (Think 过滤) → Gateway 回复
+  ↓
+会话持久化 (JSON 快照) + 记忆提炼
 ```
+
+## 环境变量
+
+所有配置均支持 YAML + 环境变量双模式。YAML 优先，环境变量作为回退。
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `GOCLAW_PROVIDER` | 模型提供方 | openai |
+| `GOCLAW_MODEL` | 模型名称 | 按 provider 决定 |
+| `GOCLAW_LISTEN` | HTTP 监听地址 | — |
+| `GOCLAW_MAX_STEP` | Agent 最大步数 | 25 |
+| `GOCLAW_MAX_TOKENS` | 最大输出 token | 模型默认 |
+| `GOCLAW_CONTEXT_LENGTH` | 上下文长度 | 128000 |
+| `GOCLAW_SYSTEM_PROMPT` | 自定义系统指令 | — |
+| `GOCLAW_REASONING_EFFORT` | 推理力度 | — |
+| `GOCLAW_API_TOKEN` | HTTP Bearer 认证 | — |
+| `GOCLAW_SESSION_DIR` | 会话持久化目录 | — |
+| `GOCLAW_RATE_LIMIT` | 每分钟请求限制 | 0 (不限) |
+| `GOCLAW_FALLBACK_MODEL` | 备用模型 | — |
+| `GOCLAW_FALLBACK_PROVIDER` | 备用模型 provider | — |
+| `GOCLAW_FALLBACK_BASE_URL` | 备用模型 API 地址 | — |
+| `GOCLAW_FALLBACK_API_KEY` | 备用模型 Key | 复用主 Key |
+| `OPENAI_API_KEY` | OpenAI 兼容 Key | — |
+| `ANTHROPIC_API_KEY` | Claude Key | — |
+| `MINIMAX_API_KEY` | MiniMax Key | — |
+| `TAVILY_API_KEY` | Tavily 搜索 Key | — |
 
 ## 部署
 
