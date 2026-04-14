@@ -238,7 +238,13 @@ type onebotAction struct {
 	Params any    `json:"params"`
 }
 
+// 编译期检查 QQBot 实现 Gateway 接口
+var _ Gateway = (*QQBot)(nil)
+
 // -------- 构造与启动 --------
+
+// Name 返回网关名称
+func (b *QQBot) Name() string { return "qq" }
 
 func NewQQBot(cfg QQBotConfig) *QQBot {
 	var stickers *StickerStore

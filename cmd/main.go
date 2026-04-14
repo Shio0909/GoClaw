@@ -11,13 +11,17 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 
 	"github.com/goclaw/goclaw/agent"
+	"github.com/goclaw/goclaw/config"
 	"github.com/goclaw/goclaw/gateway"
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/tools"
 )
+
+const version = "0.2.0"
 
 // ANSI 颜色
 const (
@@ -32,80 +36,88 @@ const (
 )
 
 func main() {
-	// 自动加载 .env 文件
+	// 自动加载 .env 文件（用于向后兼容）
 	loadEnvFile(".env")
 
-	// 读取配置 - 支持多种 LLM 提供方
-	provider := os.Getenv("GOCLAW_PROVIDER") // "claude", "openai", "mimo", ...
-	model := os.Getenv("GOCLAW_MODEL")
-	tavilyKey := os.Getenv("TAVILY_API_KEY")
-	smitheryKey := os.Getenv("SMITHERY_API_KEY")
+	// 解析子命令
+	cmd := ""
+	configPath := "goclaw.yaml"
+	args := os.Args[1:]
 
-	var apiKey, baseURL string
-
-	// 根据 provider 选择对应的 API Key 和 Base URL
-	switch provider {
-	case "claude", "":
-		if claudeKey := os.Getenv("ANTHROPIC_API_KEY"); claudeKey != "" {
-			provider = "claude"
-			apiKey = claudeKey
-			baseURL = os.Getenv("ANTHROPIC_BASE_URL")
-			if model == "" {
-				model = "claude-sonnet-4-20250514"
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "serve", "cli", "version":
+			cmd = args[i]
+		case "-c", "--config":
+			if i+1 < len(args) {
+				i++
+				configPath = args[i]
 			}
 		}
-	case "mimo":
-		apiKey = os.Getenv("MIMO_API_KEY")
-		baseURL = "https://api.xiaomimimo.com/v1"
-		if model == "" {
-			model = "mimo-v2-pro"
-		}
-	case "minimax":
-		apiKey = os.Getenv("MINIMAX_API_KEY")
-		baseURL = os.Getenv("MINIMAX_BASE_URL")
-		if baseURL == "" {
-			baseURL = "https://api.minimax.chat/v1"
-		}
-		if model == "" {
-			model = "MiniMax-M2.7"
-		}
-	case "siliconflow":
-		apiKey = os.Getenv("SILICONFLOW_API_KEY")
-		baseURL = "https://api.siliconflow.cn/v1"
-		if model == "" {
-			model = "Pro/MiniMaxAI/MiniMax-M2.5"
-		}
-	default: // openai 兼容 (deepseek, doubao, ollama, ...)
-		apiKey = os.Getenv("OPENAI_API_KEY")
-		baseURL = os.Getenv("OPENAI_BASE_URL")
 	}
 
-	if apiKey == "" {
-		fmt.Printf("%s请设置 API Key 环境变量:%s\n", colorRed, colorReset)
+	if cmd == "version" {
+		fmt.Printf("GoClaw v%s\n", version)
+		return
+	}
+
+	// 加载配置（YAML + 环境变量回退）
+	cfg, err := config.Load(configPath)
+	if err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+
+	if cfg.Agent.APIKey == "" {
+		fmt.Printf("%s请设置 API Key（通过 goclaw.yaml 或环境变量）:%s\n", colorRed, colorReset)
 		fmt.Println("  Claude:      GOCLAW_PROVIDER=claude      + ANTHROPIC_API_KEY")
-		fmt.Println("  MiMo:        GOCLAW_PROVIDER=mimo        + MIMO_API_KEY")
 		fmt.Println("  MiniMax:     GOCLAW_PROVIDER=minimax     + MINIMAX_API_KEY")
 		fmt.Println("  SiliconFlow: GOCLAW_PROVIDER=siliconflow + SILICONFLOW_API_KEY")
 		fmt.Println("  OpenAI 兼容: GOCLAW_PROVIDER=openai      + OPENAI_API_KEY + OPENAI_BASE_URL")
 		fmt.Println()
-		fmt.Println("可选: TAVILY_API_KEY (网络搜索), GOCLAW_MODEL (模型名)")
+		fmt.Println("或创建 goclaw.yaml 配置文件（参考 goclaw.example.yaml）")
 		os.Exit(1)
 	}
 
-	if provider == "" {
-		provider = "openai"
-	}
-	if baseURL == "" && provider == "openai" {
-		baseURL = "https://api.openai.com/v1"
-	}
-	if model == "" {
-		model = "gpt-4o-mini"
-	}
+	// 共享基础设施
+	infra := setupInfra(cfg)
+	defer infra.cleanup()
 
+	switch cmd {
+	case "serve":
+		runServe(cfg, infra)
+	default:
+		// 默认 CLI 模式（向后兼容：无子命令 = CLI）
+		// 但如果配置了 QQ Gateway 且没有 HTTP listen，走 QQ 模式
+		if cfg.Gateway.QQ != nil && cfg.Gateway.QQ.Enabled && cfg.Server.Listen == "" {
+			runServe(cfg, infra)
+		} else if cfg.Server.Listen != "" {
+			runServe(cfg, infra)
+		} else {
+			runCLI(cfg, infra)
+		}
+	}
+}
+
+// infra 共享基础设施
+type infra struct {
+	agentCfg  agent.Config
+	registry  *tools.Registry
+	memStore  *memory.Store
+	memDir    string
+	retryCfg  *agent.RetryConfig
+	mcpBridge *tools.MCPBridge
+}
+
+func (inf *infra) cleanup() {
+	if inf.mcpBridge != nil {
+		inf.mcpBridge.Close()
+	}
+}
+
+func setupInfra(cfg *config.Config) *infra {
 	// 初始化记忆
 	memDir := findMemoryDir()
 	store := memory.NewStore(memDir)
-	memMgr := memory.NewManager(store, 10)
 
 	// 初始化工具
 	tools.InitSandbox()
@@ -113,45 +125,42 @@ func main() {
 	tools.RegisterBuiltins(registry)
 
 	// 设置技能目录
-	agent.SkillsDir = "skills"
+	agent.SkillsDir = cfg.Tools.SkillsDir
 
-	// 注册 Tavily 搜索工具
-	if tavilyKey != "" {
-		registry.Register(tools.NewWebSearchTool(tavilyKey))
+	// 注册搜索工具
+	if cfg.Tools.TavilyKey != "" {
+		registry.Register(tools.NewWebSearchTool(cfg.Tools.TavilyKey))
 	}
-
-	// 注册 Smithery 市场搜索工具
-	if smitheryKey != "" {
-		registry.Register(tools.NewMCPMarketplaceSearchTool(smitheryKey))
+	if cfg.Tools.SmitheryKey != "" {
+		registry.Register(tools.NewMCPMarketplaceSearchTool(cfg.Tools.SmitheryKey))
 	}
 
 	// 连接 MCP Servers
-	mcpBridge := connectMCPServers(registry)
-	if mcpBridge != nil {
-		defer mcpBridge.Close()
-	} else {
+	mcpBridge := connectMCPServersFromConfig(cfg, registry)
+	if mcpBridge == nil {
+		// 回退：尝试旧的 mcp_servers.json
+		mcpBridge = connectMCPServers(registry)
+	}
+	if mcpBridge == nil {
 		mcpBridge = tools.NewMCPBridge()
 	}
 	registry.SetMCPBridge(mcpBridge)
 
 	agentCfg := agent.Config{
-		Provider: provider,
-		APIKey:   apiKey,
-		BaseURL:  baseURL,
-		Model:    model,
+		Provider: cfg.Agent.Provider,
+		APIKey:   cfg.Agent.APIKey,
+		BaseURL:  cfg.Agent.BaseURL,
+		Model:    cfg.Agent.Model,
 	}
 
 	// 构建重试 + 凭证池配置
 	retryCfg := &agent.RetryConfig{MaxAttempts: 3}
-
-	// 加载额外 API Key（逗号分隔，如 GOCLAW_API_KEYS=key1,key2,key3）
-	if extraKeys := os.Getenv("GOCLAW_API_KEYS"); extraKeys != "" {
+	if len(cfg.Agent.APIKeys) > 0 {
 		pool := agent.NewCredentialPool(agent.StrategyRoundRobin)
-		pool.AddKey(apiKey, provider, baseURL) // 主 key
-		for _, k := range strings.Split(extraKeys, ",") {
-			k = strings.TrimSpace(k)
-			if k != "" && k != apiKey {
-				pool.AddKey(k, provider, baseURL)
+		pool.AddKey(agentCfg.APIKey, agentCfg.Provider, agentCfg.BaseURL)
+		for _, k := range cfg.Agent.APIKeys {
+			if k != agentCfg.APIKey {
+				pool.AddKey(k, agentCfg.Provider, agentCfg.BaseURL)
 			}
 		}
 		if pool.Size() > 1 {
@@ -160,140 +169,143 @@ func main() {
 		retryCfg.Pool = pool
 	}
 
-	// QQ 机器人模式
-	qqWS := os.Getenv("GOCLAW_QQ_WS")
-	qqSelfID := os.Getenv("GOCLAW_QQ_SELF_ID")
-	if qqWS != "" {
-		log.Printf("🐾 GoClaw QQ 机器人启动中...")
-		log.Printf("   WebSocket: %s | 模型: %s", qqWS, model)
+	return &infra{
+		agentCfg:  agentCfg,
+		registry:  registry,
+		memStore:  store,
+		memDir:    memDir,
+		retryCfg:  retryCfg,
+		mcpBridge: mcpBridge,
+	}
+}
 
-		var adminIDs []string
-		if ids := os.Getenv("GOCLAW_QQ_ADMINS"); ids != "" {
-			adminIDs = strings.Split(ids, ",")
-		}
+// runServe 启动 HTTP API + Gateway 服务模式
+func runServe(cfg *config.Config, inf *infra) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("收到信号 %v，正在关闭...", sig)
+		cancel()
+	}()
 
-		// 上下文窗口大小
-		contextLength := 128000
-		if cl := os.Getenv("GOCLAW_CONTEXT_LENGTH"); cl != "" {
-			if v, err := fmt.Sscanf(cl, "%d", &contextLength); err != nil || v != 1 {
-				contextLength = 128000
-			}
-		}
+	var gateways []gateway.Gateway
 
-		// 语音转文字配置
+	// HTTP API Server
+	if cfg.Server.Listen != "" {
+		httpSrv := gateway.NewHTTPServer(gateway.HTTPServerConfig{
+			Addr:          cfg.Server.Listen,
+			AgentCfg:      inf.agentCfg,
+			Registry:      inf.registry,
+			MemStore:      inf.memStore,
+			RetryConfig:   inf.retryCfg,
+			ContextLength: cfg.Agent.ContextLength,
+		})
+		gateways = append(gateways, httpSrv)
+	}
+
+	// QQ Gateway
+	if cfg.Gateway.QQ != nil && cfg.Gateway.QQ.Enabled {
 		sttCfg := gateway.STTConfig{
-			BaseURL: os.Getenv("GOCLAW_STT_BASE_URL"),
-			APIKey:  os.Getenv("GOCLAW_STT_API_KEY"),
-			Model:   os.Getenv("GOCLAW_STT_MODEL"),
+			BaseURL: cfg.Gateway.QQ.STT.BaseURL,
+			APIKey:  cfg.Gateway.QQ.STT.APIKey,
+			Model:   cfg.Gateway.QQ.STT.Model,
 		}
 		if sttCfg.APIKey == "" {
-			sttCfg.APIKey = apiKey // 默认复用主 API Key
-		}
-		if sttCfg.Enabled() {
-			log.Printf("   STT: %s (模型: %s)", sttCfg.BaseURL, sttCfg.Model)
+			sttCfg.APIKey = inf.agentCfg.APIKey
 		}
 
-		// 技能自学习配置
-		nudgeInterval := 8
-		if ni := os.Getenv("GOCLAW_SKILL_NUDGE_INTERVAL"); ni != "" {
-			if v, err := fmt.Sscanf(ni, "%d", &nudgeInterval); err != nil || v != 1 {
-				nudgeInterval = 8
-			}
-		}
-		var qqSkillLearnerCfg *agent.SkillLearnerConfig
-		if nudgeInterval > 0 {
-			qqSkillLearnerCfg = &agent.SkillLearnerConfig{
-				NudgeInterval: nudgeInterval,
-				SkillsDir:     "skills",
+		var skillCfg *agent.SkillLearnerConfig
+		if cfg.Tools.SkillNudge > 0 {
+			skillCfg = &agent.SkillLearnerConfig{
+				NudgeInterval: cfg.Tools.SkillNudge,
+				SkillsDir:     cfg.Tools.SkillsDir,
 			}
 		}
 
 		bot := gateway.NewQQBot(gateway.QQBotConfig{
-			WebSocketURL:    qqWS,
-			SelfID:          qqSelfID,
-			AdminIDs:        adminIDs,
-			AgentCfg:        agentCfg,
-			Registry:        registry,
-			MemStore:        store,
-			StickersDir:     os.Getenv("GOCLAW_STICKERS_DIR"),
-			ContextLength:   contextLength,
-			RetryConfig:     retryCfg,
-			SkillLearnerCfg: qqSkillLearnerCfg,
+			WebSocketURL:    cfg.Gateway.QQ.WebSocket,
+			SelfID:          cfg.Gateway.QQ.SelfID,
+			AdminIDs:        cfg.Gateway.QQ.Admins,
+			AgentCfg:        inf.agentCfg,
+			Registry:        inf.registry,
+			MemStore:        inf.memStore,
+			StickersDir:     cfg.Gateway.QQ.StickersDir,
+			ContextLength:   cfg.Agent.ContextLength,
+			RetryConfig:     inf.retryCfg,
+			SkillLearnerCfg: skillCfg,
 			STTConfig:       sttCfg,
 		})
-
-		// 优雅关闭：监听 SIGINT/SIGTERM
-		ctx, cancel := context.WithCancel(context.Background())
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		go func() {
-			sig := <-sigCh
-			log.Printf("[QQ] 收到信号 %v，正在关闭...", sig)
-			cancel()
-		}()
-
-		if err := bot.Run(ctx); err != nil && err != context.Canceled {
-			log.Fatalf("QQ 机器人退出: %v", err)
-		}
-		return
+		gateways = append(gateways, bot)
 	}
 
-	// CLI 模式
-	ag := agent.NewAgent(agentCfg, registry, memMgr)
-	ag.SetRetryConfig(retryCfg)
+	if len(gateways) == 0 {
+		log.Fatal("serve 模式需要至少一个 gateway 或 HTTP API 监听地址")
+	}
 
-	// 配置智能模型路由（可选）
-	if simpleModel := os.Getenv("GOCLAW_SIMPLE_MODEL"); simpleModel != "" {
+	// 启动所有 gateway
+	log.Printf("🐾 GoClaw v%s 服务模式启动", version)
+	log.Printf("   模型: %s | 后端: %s", inf.agentCfg.Model, inf.agentCfg.Provider)
+	for _, gw := range gateways {
+		log.Printf("   网关: %s", gw.Name())
+	}
+
+	var wg sync.WaitGroup
+	for _, gw := range gateways {
+		wg.Add(1)
+		go func(g gateway.Gateway) {
+			defer wg.Done()
+			if err := g.Run(ctx); err != nil && err != context.Canceled {
+				log.Printf("[%s] 退出: %v", g.Name(), err)
+			}
+		}(gw)
+	}
+	wg.Wait()
+}
+
+// runCLI 交互式 CLI 模式
+func runCLI(cfg *config.Config, inf *infra) {
+	memMgr := memory.NewManager(inf.memStore, 10)
+	ag := agent.NewAgent(inf.agentCfg, inf.registry, memMgr)
+	ag.SetRetryConfig(inf.retryCfg)
+
+	// 智能模型路由
+	if cfg.Agent.SimpleModel != "" {
 		routerCfg := agent.RouterConfig{
-			SimpleModel:  simpleModel,
-			ComplexModel: model, // 复杂问题用主模型
-		}
-		if sp := os.Getenv("GOCLAW_SIMPLE_PROVIDER"); sp != "" {
-			routerCfg.SimpleProvider = sp
-		}
-		if sb := os.Getenv("GOCLAW_SIMPLE_BASE_URL"); sb != "" {
-			routerCfg.SimpleBaseURL = sb
+			SimpleModel:    cfg.Agent.SimpleModel,
+			ComplexModel:   cfg.Agent.Model,
+			SimpleProvider: cfg.Agent.SimpleProvider,
+			SimpleBaseURL:  cfg.Agent.SimpleBaseURL,
 		}
 		ag.SetRouter(agent.NewModelRouter(routerCfg))
-		log.Printf("🧠 智能路由已启用: 简单→%s, 复杂→%s", simpleModel, model)
+		log.Printf("🧠 智能路由已启用: 简单→%s, 复杂→%s", cfg.Agent.SimpleModel, cfg.Agent.Model)
 	}
 
 	// LLM caller（记忆精炼 + 上下文压缩共用）
 	llmCaller := func(ctx context.Context, sys, user string) (string, error) {
-		tempAgent := agent.NewAgent(agentCfg, tools.NewRegistry(), memory.NewManager(memory.NewStore(memDir), 999))
+		tempAgent := agent.NewAgent(inf.agentCfg, tools.NewRegistry(), memory.NewManager(memory.NewStore(inf.memDir), 999))
 		return tempAgent.Run(ctx, user)
 	}
 	memMgr.SetLLMCaller(llmCaller)
 
-	// 设置上下文压缩器
-	contextLength := 128000 // 默认上下文窗口
-	if cl := os.Getenv("GOCLAW_CONTEXT_LENGTH"); cl != "" {
-		if v, err := fmt.Sscanf(cl, "%d", &contextLength); err != nil || v != 1 {
-			contextLength = 128000
-		}
-	}
+	// 上下文压缩器
 	compressor := agent.NewCompressor(agent.CompressorConfig{
-		ContextLength: contextLength,
+		ContextLength: cfg.Agent.ContextLength,
 	}, llmCaller)
 	ag.SetCompressor(compressor)
 
-	// 技能自学习（可选，默认开启）
-	nudgeInterval := 8
-	if ni := os.Getenv("GOCLAW_SKILL_NUDGE_INTERVAL"); ni != "" {
-		if v, err := fmt.Sscanf(ni, "%d", &nudgeInterval); err != nil || v != 1 {
-			nudgeInterval = 8
-		}
-	}
-	if nudgeInterval > 0 {
+	// 技能自学习
+	if cfg.Tools.SkillNudge > 0 {
 		learner := agent.NewSkillLearner(agent.SkillLearnerConfig{
-			NudgeInterval: nudgeInterval,
-			SkillsDir:     "skills",
-		}, agentCfg, registry, store)
+			NudgeInterval: cfg.Tools.SkillNudge,
+			SkillsDir:     cfg.Tools.SkillsDir,
+		}, inf.agentCfg, inf.registry, inf.memStore)
 		ag.SetSkillLearner(learner)
 	}
 
 	// 打印欢迎信息
-	printBanner(provider, model, baseURL, tavilyKey != "")
+	printBanner(cfg.Agent.Provider, cfg.Agent.Model, cfg.Agent.BaseURL, cfg.Tools.TavilyKey != "")
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
@@ -309,13 +321,12 @@ func main() {
 			continue
 		}
 
-		// 内置命令
 		switch {
 		case input == "/quit" || input == "/exit":
 			fmt.Printf("%s再见！%s\n", colorCyan, colorReset)
 			return
 		case input == "/memory":
-			showMemoryStatus(store)
+			showMemoryStatus(inf.memStore)
 			continue
 		case input == "/help":
 			showHelp()
@@ -334,7 +345,6 @@ func main() {
 			continue
 		}
 
-		// 逐 chunk 读取并打印（过滤 <think> 推理内容）
 		filter := &agent.ThinkFilter{}
 		var fullContent strings.Builder
 		for {
@@ -360,7 +370,6 @@ func main() {
 		}
 		fmt.Print("\n\n")
 
-		// 将完整回复加入历史
 		if fullContent.Len() > 0 {
 			ag.AppendAssistantMessage(ctx, fullContent.String())
 		}
@@ -369,13 +378,12 @@ func main() {
 
 func printBanner(provider, model, baseURL string, hasSearch bool) {
 	fmt.Println()
-	fmt.Printf("  %s%s🐾 GoClaw%s - Go 语言 AI 助手\n", colorBold, colorCyan, colorReset)
+	fmt.Printf("  %s%s🐾 GoClaw v%s%s - Go AI Agent Runtime\n", colorBold, colorCyan, version, colorReset)
 	fmt.Printf("  %s模型: %s | 后端: %s%s\n", colorDim, model, provider, colorReset)
 	if baseURL != "" {
 		fmt.Printf("  %sAPI:  %s%s\n", colorDim, baseURL, colorReset)
 	}
 
-	// 显示能力
 	capabilities := []string{"文件操作", "Shell/进程", "网页抓取", "HTTP请求", "JSON解析", "定时提醒", "MCP管理"}
 	if hasSearch {
 		capabilities = append(capabilities, "网络搜索")
@@ -386,33 +394,27 @@ func printBanner(provider, model, baseURL string, hasSearch bool) {
 }
 
 func showHelp() {
-	fmt.Printf("\n%s可用命令:%s\n", colorYellow, colorReset)
+	fmt.Printf("\n%s子命令:%s\n", colorYellow, colorReset)
+	fmt.Println("  goclaw cli     - 交互式 CLI 模式（默认）")
+	fmt.Println("  goclaw serve   - 启动 HTTP API + Gateway 服务")
+	fmt.Println("  goclaw version - 显示版本号")
+	fmt.Println("  -c <file>      - 指定配置文件（默认 goclaw.yaml）")
+	fmt.Printf("\n%sCLI 命令:%s\n", colorYellow, colorReset)
 	fmt.Println("  /help    - 显示帮助")
 	fmt.Println("  /memory  - 查看记忆状态")
 	fmt.Println("  /clear   - 清空对话历史")
 	fmt.Println("  /quit    - 退出")
-	fmt.Printf("\n%s环境变量:%s\n", colorYellow, colorReset)
+	fmt.Printf("\n%s配置:%s\n", colorYellow, colorReset)
+	fmt.Println("  goclaw.yaml — 主配置文件（参考 goclaw.example.yaml）")
+	fmt.Println("  .env        — 环境变量（向后兼容，YAML 优先）")
+	fmt.Printf("\n%s环境变量（YAML 为空时回退）:%s\n", colorYellow, colorReset)
 	fmt.Println("  GOCLAW_PROVIDER      - 提供方 (claude/mimo/minimax/siliconflow/openai)")
 	fmt.Println("  ANTHROPIC_API_KEY    - Claude API Key")
-	fmt.Println("  ANTHROPIC_BASE_URL   - Claude API 代理地址")
-	fmt.Println("  MIMO_API_KEY         - 小米 MiMo API Key")
 	fmt.Println("  MINIMAX_API_KEY      - MiniMax API Key")
-	fmt.Println("  MINIMAX_BASE_URL     - MiniMax API 地址 (默认 api.minimax.chat)")
-	fmt.Println("  SILICONFLOW_API_KEY  - 硅基流动 API Key")
 	fmt.Println("  OPENAI_API_KEY       - OpenAI 兼容 API Key")
 	fmt.Println("  OPENAI_BASE_URL      - API 地址 (DeepSeek/豆包/Ollama)")
 	fmt.Println("  GOCLAW_MODEL         - 模型名称")
 	fmt.Println("  TAVILY_API_KEY       - Tavily 搜索 API Key")
-	fmt.Println("  SMITHERY_API_KEY     - Smithery MCP 市场 API Key (可选)")
-	fmt.Printf("\n%sQQ 机器人:%s\n", colorYellow, colorReset)
-	fmt.Println("  GOCLAW_QQ_WS       - NapCatQQ WebSocket 地址 (如 ws://127.0.0.1:3001)")
-	fmt.Println("  GOCLAW_QQ_SELF_ID  - 机器人 QQ 号")
-	fmt.Println("  GOCLAW_QQ_ADMINS   - 允许使用的 QQ 号 (逗号分隔，空则不限)")
-	fmt.Println()
-	fmt.Println("  语音转文字 (可选):")
-	fmt.Println("  GOCLAW_STT_BASE_URL - STT API 地址 (如 https://api.openai.com/v1)")
-	fmt.Println("  GOCLAW_STT_API_KEY  - STT API Key (默认复用 GOCLAW_API_KEY)")
-	fmt.Println("  GOCLAW_STT_MODEL    - STT 模型名 (默认 whisper-1)")
 	fmt.Println()
 }
 
@@ -496,6 +498,34 @@ func connectMCPServers(registry *tools.Registry) *tools.MCPBridge {
 	ctx := context.Background()
 
 	for name, srv := range config.MCPServers {
+		err := bridge.Connect(ctx, tools.MCPServerConfig{
+			Name:      name,
+			Command:   srv.Command,
+			Args:      srv.Args,
+			Env:       srv.Env,
+			Endpoint:  srv.Endpoint,
+			Transport: srv.Transport,
+			APIKey:    srv.APIKey,
+			ToolNames: srv.ToolNames,
+		}, registry)
+		if err != nil {
+			fmt.Printf("  %sMCP %s 连接失败: %v%s\n", colorRed, name, err, colorReset)
+		}
+	}
+
+	return bridge
+}
+
+// connectMCPServersFromConfig 从 YAML 配置加载 MCP Servers
+func connectMCPServersFromConfig(cfg *config.Config, registry *tools.Registry) *tools.MCPBridge {
+	if len(cfg.MCP) == 0 {
+		return nil
+	}
+
+	bridge := tools.NewMCPBridge()
+	ctx := context.Background()
+
+	for name, srv := range cfg.MCP {
 		err := bridge.Connect(ctx, tools.MCPServerConfig{
 			Name:      name,
 			Command:   srv.Command,

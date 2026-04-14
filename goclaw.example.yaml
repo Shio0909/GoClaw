@@ -1,0 +1,52 @@
+# GoClaw 配置文件示例
+# 环境变量可用 ${VAR_NAME} 语法引用
+
+server:
+  listen: ":8080"  # HTTP API 监听地址（留空则不启动 HTTP API）
+
+agent:
+  provider: minimax         # claude / openai / minimax / mimo / siliconflow
+  api_key: ${MINIMAX_API_KEY}
+  # base_url: https://api.minimax.chat/v1  # 自动根据 provider 设置
+  model: MiniMax-M2.7
+  context_length: 128000
+
+  # 多 Key 轮换（可选）
+  # api_keys:
+  #   - key1
+  #   - key2
+
+  # 智能模型路由（可选，简单问题用便宜模型）
+  # simple_model: deepseek-chat
+  # simple_provider: openai
+  # simple_base_url: https://api.deepseek.com/v1
+
+gateways:
+  qq:
+    enabled: false
+    websocket: ws://127.0.0.1:3001
+    self_id: "123456"
+    admins: ["789"]
+    stickers_dir: ./stickers
+    stt:
+      base_url: https://api.openai.com/v1
+      api_key: ${GOCLAW_STT_API_KEY}
+      model: whisper-1
+
+tools:
+  # sandbox: /path/to/sandbox    # 文件写入沙箱（可选）
+  tavily_key: ${TAVILY_API_KEY}
+  # smithery_key: ${SMITHERY_API_KEY}
+  skills_dir: skills
+  skill_nudge_interval: 8        # 每 N 轮检查是否需要学习新技能
+
+# MCP Server 配置
+# mcp_servers:
+#   filesystem:
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-filesystem", "/data"]
+#   github:
+#     command: npx
+#     args: ["-y", "@modelcontextprotocol/server-github"]
+#     env:
+#       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
