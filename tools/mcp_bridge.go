@@ -4,10 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"math/rand"
 	"net/http"
 	"os/exec"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
@@ -39,16 +42,23 @@ type MCPServerConfig struct {
 type MCPBridge struct {
 	mu       sync.Mutex
 	sessions map[string]*mcp.ClientSession
-	toolMap  map[string]*mcp.ClientSession // toolName -> session
+	configs  map[string]MCPServerConfig    // 保存配置用于重连
+	toolMap  map[string]string             // toolName -> serverName（动态查 session）
 	// serverTools 记录每个 server 注册了哪些工具名，用于卸载
 	serverTools map[string][]string // serverName -> []toolName
 }
+
+const (
+	mcpMaxRetries    = 3             // MCP 工具调用最大重试次数
+	mcpRetryBaseWait = 2 * time.Second // 重试基础等待时间
+)
 
 // NewMCPBridge 创建 MCP 桥接器
 func NewMCPBridge() *MCPBridge {
 	return &MCPBridge{
 		sessions:    make(map[string]*mcp.ClientSession),
-		toolMap:     make(map[string]*mcp.ClientSession),
+		configs:     make(map[string]MCPServerConfig),
+		toolMap:     make(map[string]string),
 		serverTools: make(map[string][]string),
 	}
 }
@@ -69,44 +79,13 @@ func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	client := mcp.NewClient(&mcp.Implementation{
-		Name:    "goclaw",
-		Version: "1.0.0",
-	}, nil)
-
-	// 根据传输类型创建不同的 transport
-	var transport mcp.Transport
-	transportType := strings.ToLower(cfg.Transport)
-
-	switch transportType {
-	case "sse":
-		transport = &mcp.SSEClientTransport{
-			Endpoint:   cfg.Endpoint,
-			HTTPClient: newHTTPClient(cfg.APIKey),
-		}
-
-	case "streamable_http":
-		transport = &mcp.StreamableClientTransport{
-			Endpoint:   cfg.Endpoint,
-			HTTPClient: newHTTPClient(cfg.APIKey),
-		}
-
-	default: // "stdio" 或空
-		cmd := exec.Command(cfg.Command, cfg.Args...)
-		if len(cfg.Env) > 0 {
-			for k, v := range cfg.Env {
-				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
-			}
-		}
-		transport = &mcp.CommandTransport{Command: cmd}
-	}
-
-	session, err := client.Connect(ctx, transport, nil)
+	session, err := b.dial(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("connect to MCP server %s: %w", cfg.Name, err)
 	}
 
 	b.sessions[cfg.Name] = session
+	b.configs[cfg.Name] = cfg
 
 	// 列出远程工具并注册到本地
 	toolsResult, err := session.ListTools(ctx, nil)
@@ -125,13 +104,13 @@ func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *
 		if len(allowedTools) > 0 && !allowedTools[tool.Name] {
 			continue
 		}
-		b.toolMap[tool.Name] = session
-		registry.Register(b.wrapMCPTool(cfg.Name, *tool, session))
+		b.toolMap[tool.Name] = cfg.Name
+		registry.Register(b.wrapMCPTool(cfg.Name, *tool))
 		toolNames = append(toolNames, tool.Name)
 	}
 	b.serverTools[cfg.Name] = toolNames
 
-	label := transportType
+	label := strings.ToLower(cfg.Transport)
 	if label == "" {
 		label = "stdio"
 	}
@@ -139,8 +118,43 @@ func (b *MCPBridge) Connect(ctx context.Context, cfg MCPServerConfig, registry *
 	return nil
 }
 
+// dial 根据配置创建 MCP 连接（不持锁，由调用者持锁）
+func (b *MCPBridge) dial(ctx context.Context, cfg MCPServerConfig) (*mcp.ClientSession, error) {
+	client := mcp.NewClient(&mcp.Implementation{
+		Name:    "goclaw",
+		Version: "1.0.0",
+	}, nil)
+
+	var transport mcp.Transport
+	transportType := strings.ToLower(cfg.Transport)
+
+	switch transportType {
+	case "sse":
+		transport = &mcp.SSEClientTransport{
+			Endpoint:   cfg.Endpoint,
+			HTTPClient: newHTTPClient(cfg.APIKey),
+		}
+	case "streamable_http":
+		transport = &mcp.StreamableClientTransport{
+			Endpoint:   cfg.Endpoint,
+			HTTPClient: newHTTPClient(cfg.APIKey),
+		}
+	default: // "stdio" 或空
+		cmd := exec.Command(cfg.Command, cfg.Args...)
+		if len(cfg.Env) > 0 {
+			for k, v := range cfg.Env {
+				cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", k, v))
+			}
+		}
+		transport = &mcp.CommandTransport{Command: cmd}
+	}
+
+	return client.Connect(ctx, transport, nil)
+}
+
 // wrapMCPTool 将 MCP 远程工具包装为本地 ToolDef
-func (b *MCPBridge) wrapMCPTool(serverName string, tool mcp.Tool, session *mcp.ClientSession) *ToolDef {
+// 闭包不直接捕获 session，而是通过 bridge 动态查找，支持重连后自动生效
+func (b *MCPBridge) wrapMCPTool(serverName string, tool mcp.Tool) *ToolDef {
 	// 从 InputSchema (any → map[string]any) 提取参数定义
 	var params []ParamDef
 	if schemaMap, ok := tool.InputSchema.(map[string]any); ok {
@@ -185,27 +199,145 @@ func (b *MCPBridge) wrapMCPTool(serverName string, tool mcp.Tool, session *mcp.C
 		Description: desc,
 		Parameters:  params,
 		Fn: func(ctx context.Context, args map[string]any) (string, error) {
-			result, err := session.CallTool(ctx, &mcp.CallToolParams{
-				Name:      toolName,
-				Arguments: args,
-			})
-			if err != nil {
-				return "", fmt.Errorf("MCP call %s/%s: %w", serverName, toolName, err)
-			}
-
-			// 提取文本内容
-			var parts []string
-			for _, content := range result.Content {
-				if tc, ok := content.(*mcp.TextContent); ok {
-					parts = append(parts, tc.Text)
-				} else {
-					data, _ := json.Marshal(content)
-					parts = append(parts, string(data))
-				}
-			}
-			return strings.Join(parts, "\n"), nil
+			return b.callWithRetry(ctx, serverName, toolName, args)
 		},
 	}
+}
+
+// callWithRetry 带重试和自动重连的 MCP 工具调用
+func (b *MCPBridge) callWithRetry(ctx context.Context, serverName, toolName string, args map[string]any) (string, error) {
+	var lastErr error
+	for attempt := 1; attempt <= mcpMaxRetries; attempt++ {
+		session := b.getSession(serverName)
+		if session == nil {
+			log.Printf("[MCP] %s 无活跃连接，尝试重连 (attempt %d/%d)", serverName, attempt, mcpMaxRetries)
+			if err := b.reconnect(ctx, serverName); err != nil {
+				lastErr = fmt.Errorf("MCP %s 重连失败: %w", serverName, err)
+				b.retryWait(ctx, attempt)
+				continue
+			}
+			session = b.getSession(serverName)
+			if session == nil {
+				lastErr = fmt.Errorf("MCP %s 重连后仍无会话", serverName)
+				continue
+			}
+		}
+
+		result, err := session.CallTool(ctx, &mcp.CallToolParams{
+			Name:      toolName,
+			Arguments: args,
+		})
+		if err == nil {
+			return extractTextContent(result), nil
+		}
+
+		lastErr = err
+		if !isMCPConnectionError(err) {
+			return "", fmt.Errorf("MCP call %s/%s: %w", serverName, toolName, err)
+		}
+
+		log.Printf("[MCP] %s/%s 调用失败 (attempt %d/%d): %v", serverName, toolName, attempt, mcpMaxRetries, err)
+		if attempt < mcpMaxRetries {
+			_ = b.reconnect(ctx, serverName)
+			b.retryWait(ctx, attempt)
+		}
+	}
+	return "", fmt.Errorf("MCP call %s/%s 重试 %d 次后失败: %w", serverName, toolName, mcpMaxRetries, lastErr)
+}
+
+// getSession 获取指定 server 的当前 session（线程安全）
+func (b *MCPBridge) getSession(serverName string) *mcp.ClientSession {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sessions[serverName]
+}
+
+// reconnect 关闭旧连接并重新建立连接
+func (b *MCPBridge) reconnect(ctx context.Context, serverName string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+
+	cfg, ok := b.configs[serverName]
+	if !ok {
+		return fmt.Errorf("无 %s 的配置信息，无法重连", serverName)
+	}
+
+	// 关闭旧 session
+	if old, ok := b.sessions[serverName]; ok {
+		_ = old.Close()
+		delete(b.sessions, serverName)
+	}
+
+	session, err := b.dial(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	b.sessions[serverName] = session
+	log.Printf("[MCP] %s 重连成功", serverName)
+	return nil
+}
+
+// retryWait 带抖动的等待
+func (b *MCPBridge) retryWait(ctx context.Context, attempt int) {
+	base := mcpRetryBaseWait * time.Duration(1<<(attempt-1)) // 2s, 4s, 8s
+	if base > 30*time.Second {
+		base = 30 * time.Second
+	}
+	jitter := time.Duration(rand.Int63n(int64(base / 2)))
+	wait := base + jitter
+
+	select {
+	case <-time.After(wait):
+	case <-ctx.Done():
+	}
+}
+
+// isMCPConnectionError 判断是否为连接类错误（应触发重连）
+func isMCPConnectionError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	connectionPatterns := []string{
+		"connection refused",
+		"connection reset",
+		"broken pipe",
+		"eof",
+		"transport",
+		"dial tcp",
+		"no such host",
+		"timeout",
+		"deadline exceeded",
+		"use of closed",
+		"session closed",
+		"write: broken pipe",
+		"read: connection reset",
+		"i/o timeout",
+		"wsarecv",     // Windows 网络错误
+		"wsasend",     // Windows 网络错误
+		"connectex",   // Windows 连接错误
+	}
+	for _, p := range connectionPatterns {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// extractTextContent 从 MCP CallToolResult 提取文本内容
+func extractTextContent(result *mcp.CallToolResult) string {
+	var parts []string
+	for _, content := range result.Content {
+		if tc, ok := content.(*mcp.TextContent); ok {
+			parts = append(parts, tc.Text)
+		} else {
+			data, _ := json.Marshal(content)
+			parts = append(parts, string(data))
+		}
+	}
+	return strings.Join(parts, "\n")
 }
 
 // Disconnect 断开指定 MCP Server 并移除其工具
@@ -223,6 +355,7 @@ func (b *MCPBridge) Disconnect(name string, registry *Registry) error {
 		registry.Unregister(toolName)
 	}
 	delete(b.serverTools, name)
+	delete(b.configs, name)
 
 	_ = session.Close()
 	delete(b.sessions, name)
