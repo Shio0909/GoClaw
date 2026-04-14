@@ -37,6 +37,7 @@ gateways:
     cors_origins: ["*"]                 # CORS 允许域名，["*"] 为全部
     session_timeout: 30                 # 会话超时（分钟）
     request_timeout: 300                # 请求超时（秒）
+    session_dir: "./sessions"           # 会话持久化目录（留空则不持久化）
   qq:
     enabled: false
     websocket: ws://127.0.0.1:3001

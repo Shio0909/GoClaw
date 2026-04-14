@@ -55,6 +55,7 @@ type HTTPConfig struct {
 	CORS           []string `yaml:"cors_origins"`     // CORS 允许的域名，["*"] 为全部
 	SessionTimeout int      `yaml:"session_timeout"`  // 会话超时（分钟），默认 30
 	RequestTimeout int      `yaml:"request_timeout"`  // 请求超时（秒），默认 300
+	SessionDir     string   `yaml:"session_dir"`      // 会话持久化目录，空则不持久化
 }
 
 type QQConfig struct {

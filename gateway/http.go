@@ -35,6 +35,7 @@ type HTTPServer struct {
 	corsOrigins    []string // CORS 允许的域名
 	sessionTimeout time.Duration
 	requestTimeout time.Duration
+	sessionStore   *SessionStore // 会话持久化（可选）
 
 	server *http.Server
 }
@@ -58,6 +59,7 @@ type HTTPServerConfig struct {
 	CORSOrigins    []string // CORS 允许的域名，["*"] 为全部
 	SessionTimeout int      // 会话超时（分钟），默认 30
 	RequestTimeout int      // 请求超时（秒），默认 300
+	SessionDir     string   // 会话持久化目录，空则不持久化
 }
 
 // 编译期检查 HTTPServer 实现 Gateway 接口
@@ -77,7 +79,19 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 	if reqTimeout <= 0 {
 		reqTimeout = 5 * time.Minute
 	}
-	return &HTTPServer{
+
+	var store *SessionStore
+	if cfg.SessionDir != "" {
+		var err error
+		store, err = NewSessionStore(cfg.SessionDir)
+		if err != nil {
+			log.Printf("[HTTP] 会话持久化目录创建失败: %v (跳过持久化)", err)
+		} else {
+			log.Printf("[HTTP] 会话持久化: %s", cfg.SessionDir)
+		}
+	}
+
+	srv := &HTTPServer{
 		addr:           cfg.Addr,
 		agentCfg:       cfg.AgentCfg,
 		registry:       cfg.Registry,
@@ -89,7 +103,15 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		corsOrigins:    cfg.CORSOrigins,
 		sessionTimeout: sessTimeout,
 		requestTimeout: reqTimeout,
+		sessionStore:   store,
 	}
+
+	// 从磁盘恢复会话
+	if store != nil {
+		srv.restoreSessions()
+	}
+
+	return srv
 }
 
 func (s *HTTPServer) Name() string { return "http" }
@@ -126,6 +148,7 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	// 优雅关闭
 	go func() {
 		<-ctx.Done()
+		s.saveAllSessions() // 关闭前持久化所有会话
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		s.server.Shutdown(shutdownCtx)
@@ -343,6 +366,9 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	s.sessions.Delete(sessionID)
+	if s.sessionStore != nil {
+		_ = s.sessionStore.Delete(sessionID)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "session deleted"})
 }
 
@@ -643,14 +669,77 @@ func (s *HTTPServer) cleanSessions(ctx context.Context) {
 			s.sessions.Range(func(key, val any) bool {
 				sess := val.(*httpSession)
 				if time.Since(sess.lastUsed) > s.sessionTimeout {
+					s.saveSession(key.(string), sess) // 过期前持久化
 					s.sessions.Delete(key)
 					log.Printf("[HTTP] 清理过期会话: %s", key)
 				}
 				return true
 			})
+			s.saveAllSessions() // 定期全量保存
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// restoreSessions 从磁盘恢复所有会话
+func (s *HTTPServer) restoreSessions() {
+	if s.sessionStore == nil {
+		return
+	}
+	snapshots, err := s.sessionStore.LoadAll()
+	if err != nil {
+		log.Printf("[HTTP] 恢复会话失败: %v", err)
+		return
+	}
+	restored := 0
+	for _, snap := range snapshots {
+		if time.Since(snap.LastUsed) > s.sessionTimeout {
+			_ = s.sessionStore.Delete(snap.ID)
+			continue
+		}
+		if len(snap.History) == 0 {
+			_ = s.sessionStore.Delete(snap.ID)
+			continue
+		}
+		ag := s.getOrCreateSession(snap.ID)
+		ag.SetHistory(snap.History)
+		restored++
+	}
+	if restored > 0 {
+		log.Printf("[HTTP] 恢复了 %d 个会话", restored)
+	}
+}
+
+// saveAllSessions 保存所有活跃会话到磁盘
+func (s *HTTPServer) saveAllSessions() {
+	if s.sessionStore == nil {
+		return
+	}
+	s.sessions.Range(func(key, val any) bool {
+		sess := val.(*httpSession)
+		s.saveSession(key.(string), sess)
+		return true
+	})
+}
+
+// saveSession 保存单个会话到磁盘
+func (s *HTTPServer) saveSession(id string, sess *httpSession) {
+	if s.sessionStore == nil {
+		return
+	}
+	history := sess.agent.GetHistory()
+	if len(history) == 0 {
+		return
+	}
+	snap := &SessionSnapshot{
+		ID:       id,
+		History:  history,
+		SavedAt:  time.Now(),
+		LastUsed: sess.lastUsed,
+	}
+	if err := s.sessionStore.Save(snap); err != nil {
+		log.Printf("[HTTP] 保存会话失败 %s: %v", id, err)
 	}
 }
 

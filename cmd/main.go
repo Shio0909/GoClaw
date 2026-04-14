@@ -279,6 +279,7 @@ func runServe(cfg *config.Config, inf *infra) {
 			httpCfg.CORSOrigins = cfg.Gateway.HTTP.CORS
 			httpCfg.SessionTimeout = cfg.Gateway.HTTP.SessionTimeout
 			httpCfg.RequestTimeout = cfg.Gateway.HTTP.RequestTimeout
+			httpCfg.SessionDir = cfg.Gateway.HTTP.SessionDir
 		}
 		httpSrv := gateway.NewHTTPServer(httpCfg)
 		gateways = append(gateways, httpSrv)

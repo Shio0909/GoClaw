@@ -421,6 +421,16 @@ func (a *Agent) ClearHistory() {
 	a.history = nil
 }
 
+// GetHistory 导出对话历史（用于持久化）
+func (a *Agent) GetHistory() []*schema.Message {
+	return a.history
+}
+
+// SetHistory 导入对话历史（用于恢复会话）
+func (a *Agent) SetHistory(msgs []*schema.Message) {
+	a.history = msgs
+}
+
 // applyRoute 应用模型路由（如果配置了路由器）
 func (a *Agent) applyRoute(input string) {
 	if a.router == nil {
