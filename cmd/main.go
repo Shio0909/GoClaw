@@ -334,7 +334,8 @@ func main() {
 			continue
 		}
 
-		// 逐 chunk 读取并打印
+		// 逐 chunk 读取并打印（过滤 <think> 推理内容）
+		filter := &agent.ThinkFilter{}
 		var fullContent strings.Builder
 		for {
 			msg, err := stream.Recv()
@@ -346,9 +347,16 @@ func main() {
 				break
 			}
 			if msg != nil && msg.Content != "" {
-				fmt.Print(msg.Content)
-				fullContent.WriteString(msg.Content)
+				filtered := filter.Process(msg.Content)
+				if filtered != "" {
+					fmt.Print(filtered)
+					fullContent.WriteString(filtered)
+				}
 			}
+		}
+		if remaining := filter.Flush(); remaining != "" {
+			fmt.Print(remaining)
+			fullContent.WriteString(remaining)
 		}
 		fmt.Print("\n\n")
 

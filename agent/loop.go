@@ -227,10 +227,12 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 		return "", fmt.Errorf("agent generate: %w", err)
 	}
 
-	a.history = append(a.history, schema.UserMessage(userInput), resp)
-	a.memMgr.OnTurn(ctx, "assistant", resp.Content)
-	a.CheckSkillLearning(ctx, resp.Content)
-	return resp.Content, nil
+	content := StripThinkTags(resp.Content)
+	cleanResp := schema.AssistantMessage(content, nil)
+	a.history = append(a.history, schema.UserMessage(userInput), cleanResp)
+	a.memMgr.OnTurn(ctx, "assistant", content)
+	a.CheckSkillLearning(ctx, content)
+	return content, nil
 }
 
 // RunStream 执行一轮对话（流式输出）
@@ -323,10 +325,12 @@ func (a *Agent) RunWithImages(ctx context.Context, text string, images []ImageIn
 		return "", fmt.Errorf("agent generate: %w", err)
 	}
 
-	a.history = append(a.history, schema.UserMessage(text), resp)
-	a.memMgr.OnTurn(ctx, "assistant", resp.Content)
-	a.CheckSkillLearning(ctx, resp.Content)
-	return resp.Content, nil
+	content := StripThinkTags(resp.Content)
+	cleanResp := schema.AssistantMessage(content, nil)
+	a.history = append(a.history, schema.UserMessage(text), cleanResp)
+	a.memMgr.OnTurn(ctx, "assistant", content)
+	a.CheckSkillLearning(ctx, content)
+	return content, nil
 }
 
 // buildMultimodalMessages 构建包含图片的消息列表
