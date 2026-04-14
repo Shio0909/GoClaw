@@ -1,0 +1,48 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build all platforms
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/}
+          LDFLAGS="-s -w -X main.version=${VERSION}"
+
+          for pair in linux/amd64 linux/arm64 darwin/arm64 windows/amd64; do
+            GOOS=${pair%/*}
+            GOARCH=${pair#*/}
+            suffix=""
+            [ "$GOOS" = "windows" ] && suffix=".exe"
+            output="goclaw-${GOOS}-${GOARCH}${suffix}"
+            echo "Building $output..."
+            GOOS=$GOOS GOARCH=$GOARCH go build -ldflags="$LDFLAGS" -o "dist/$output" ./cmd/
+          done
+
+      - name: Create checksums
+        run: |
+          cd dist
+          sha256sum goclaw-* > checksums.txt
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            dist/goclaw-*
+            dist/checksums.txt

@@ -21,7 +21,8 @@ import (
 	"github.com/goclaw/goclaw/tools"
 )
 
-const version = "0.2.0"
+// version is set by -ldflags at build time; defaults to "dev"
+var version = "0.2.0"
 
 // ANSI 颜色
 const (

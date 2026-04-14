@@ -1,0 +1,11 @@
+services:
+  goclaw:
+    build: .
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./memory_data:/data/memory_data
+      - ./goclaw.yaml:/data/goclaw.yaml:ro
+    env_file:
+      - .env
+    restart: unless-stopped
