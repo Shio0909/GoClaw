@@ -27,7 +27,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~12,000 行 Go（含 148 个测试） | — |
+| **代码量** | ~13,300 行 Go（含 272 个测试） | — |
 
 ## 核心特性
 
@@ -59,15 +59,18 @@
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 原生 REST API + SSE 流式 + WebSocket 实时通信
+- 17 个端点（原生 14 + OpenAI 兼容 3），完整 OpenAPI 3.0 规范
+- X-Request-ID 请求追踪（自动生成或透传客户端 ID）
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
 - Bearer Token 认证 + 请求日志 + 可配置超时
 - 令牌桶速率限制（每 IP 独立计数）
-- 运行指标端点 + 工具调用统计
-- 会话持久化（磁盘 JSON 快照，优雅关闭自动保存）
+- Prometheus 指标拉取（`/v1/metrics?format=prometheus`）
+- 运行时配置审查（API Key 自动脱敏）
+- 会话分叉（克隆对话历史到新会话）
 - 会话导出（JSON / Markdown 格式）
-- 模型回退（主模型失败自动切换备用模型）
+- 优雅关闭（活跃连接排水 + 30s 超时）
+- 工具执行超时（per-tool 或全局默认，context.WithTimeout）
 
 ## 项目结构
 
@@ -89,6 +92,7 @@ GoClaw/
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
 │   ├── http.go             # HTTP API（REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
 │   ├── qq.go               # QQ 机器人 (OneBot v11 WebSocket)
@@ -109,6 +113,8 @@ GoClaw/
 │   ├── websearch.go        # Tavily 网络搜索（自动重试）
 │   ├── shell_security.go   # Shell 安全检查（危险命令拦截）
 │   └── sandbox.go          # 文件沙箱 + 路径验证
+├── logger/
+│   └── logger.go           # 结构化日志（slog + 遗留 log 桥接）
 ├── memory/
 │   ├── store.go            # 记忆文件读写
 │   ├── manager.go          # 记忆管理 + 自动提炼
@@ -183,11 +189,14 @@ docker compose up -d
 | `/v1/chat/:session` | DELETE | 清空会话 |
 | `/v1/chat/:session/export` | GET | 导出会话（`?format=json\|markdown`） |
 | `/v1/sessions` | GET | 列出所有活跃会话 |
+| `/v1/sessions/:session/fork` | POST | 分叉会话（克隆对话历史到新 ID） |
 | `/v1/tools` | GET | 列出可用工具 |
 | `/v1/tools/stats` | GET | 工具调用统计（次数、错误、平均耗时） |
 | `/v1/memory/:session` | GET | 查看记忆状态 |
-| `/v1/metrics` | GET | 运行指标（uptime、请求数、活跃会话等） |
-| `/v1/health` | GET | 健康检查（免认证） |
+| `/v1/metrics` | GET | 运行指标（`?format=prometheus` 支持 Prometheus 拉取） |
+| `/v1/health` | GET | 健康检查（免认证，含 uptime、连接数） |
+| `/v1/config` | GET | 运行时配置审查（API Key 脱敏） |
+| `/v1/openapi.json` | GET | OpenAPI 3.0 规范 |
 | `/v1/ws` | GET | WebSocket 实时聊天 |
 
 ### OpenAI 兼容 API
