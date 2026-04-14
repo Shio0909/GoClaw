@@ -193,6 +193,7 @@ func setupInfra(cfg *config.Config) *infra {
 		Temperature:     cfg.Agent.Temperature,
 		MaxTokens:       cfg.Agent.MaxTokens,
 		ReasoningEffort: cfg.Agent.ReasoningEffort,
+		SystemPrompt:    cfg.Agent.SystemPrompt,
 	}
 
 	// 应用工具结果截断大小

@@ -49,6 +49,7 @@ type Config struct {
 	Temperature     *float32 // 采样温度（nil = 使用默认值）
 	MaxTokens       int      // 最大输出 token（0 = 使用默认值）
 	ReasoningEffort string   // 推理力度: low, medium, high（仅推理模型）
+	SystemPrompt    string   // 用户自定义 system prompt（追加到默认 prompt 后）
 }
 
 // Agent 核心 Agent，基于 Eino react agent
@@ -193,22 +194,32 @@ func allChunksToolCallChecker(_ context.Context, sr *schema.StreamReader[*schema
 	}
 }
 
-// buildMessages 构建发送给 Eino agent 的消息列表
-func (a *Agent) buildMessages(ctx context.Context, userInput string) ([]*schema.Message, error) {
+// buildFullSystemPrompt 构建完整 system prompt（默认 + extra + 用户自定义 + RAG）
+func (a *Agent) buildFullSystemPrompt(ctx context.Context, userInput string) (string, error) {
 	systemPrompt, err := BuildSystemPrompt(a.memMgr, a.registry)
 	if err != nil {
-		return nil, fmt.Errorf("build system prompt: %w", err)
+		return "", fmt.Errorf("build system prompt: %w", err)
 	}
 	if a.extraSystemPrompt != "" {
 		systemPrompt += "\n\n" + a.extraSystemPrompt
 	}
-
-	// RAG context injection (query-time retrieval)
+	if a.cfg.SystemPrompt != "" {
+		systemPrompt += "\n\n=== 用户自定义指令 ===\n" + a.cfg.SystemPrompt
+	}
 	if a.ragMgr != nil && a.ragMgr.HasProviders() {
 		ragCtx := a.ragMgr.BuildContext(ctx, userInput)
 		if ragCtx != "" {
 			systemPrompt += "\n" + ragCtx
 		}
+	}
+	return systemPrompt, nil
+}
+
+// buildMessages 构建发送给 Eino agent 的消息列表
+func (a *Agent) buildMessages(ctx context.Context, userInput string) ([]*schema.Message, error) {
+	systemPrompt, err := a.buildFullSystemPrompt(ctx, userInput)
+	if err != nil {
+		return nil, err
 	}
 
 	msgs := []*schema.Message{schema.SystemMessage(systemPrompt)}
@@ -372,12 +383,9 @@ func (a *Agent) RunWithImages(ctx context.Context, text string, images []ImageIn
 
 // buildMultimodalMessages 构建包含图片的消息列表
 func (a *Agent) buildMultimodalMessages(ctx context.Context, text string, images []ImageInput) ([]*schema.Message, error) {
-	systemPrompt, err := BuildSystemPrompt(a.memMgr, a.registry)
+	systemPrompt, err := a.buildFullSystemPrompt(ctx, text)
 	if err != nil {
-		return nil, fmt.Errorf("build system prompt: %w", err)
-	}
-	if a.extraSystemPrompt != "" {
-		systemPrompt += "\n\n" + a.extraSystemPrompt
+		return nil, err
 	}
 
 	// 构建多模态 content parts

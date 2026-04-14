@@ -97,12 +97,16 @@ func (s *HTTPServer) Name() string { return "http" }
 // Run 启动 HTTP 服务器，阻塞直到 ctx 取消
 func (s *HTTPServer) Run(ctx context.Context) error {
 	mux := http.NewServeMux()
+	// GoClaw native API
 	mux.HandleFunc("POST /v1/chat", s.handleChat)
 	mux.HandleFunc("GET /v1/chat/{session}", s.handleGetHistory)
 	mux.HandleFunc("DELETE /v1/chat/{session}", s.handleDeleteSession)
 	mux.HandleFunc("GET /v1/tools", s.handleListTools)
 	mux.HandleFunc("GET /v1/memory/{session}", s.handleGetMemory)
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
+	// OpenAI-compatible endpoints
+	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
+	mux.HandleFunc("GET /v1/models", s.handleModels)
 
 	// 中间件链：CORS → 请求日志 → 认证
 	handler := s.withAuth(s.withRequestLog(mux))
@@ -383,6 +387,214 @@ func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 		"model":    s.agentCfg.Model,
 		"tools":    len(s.registry.Names()),
 	})
+}
+
+// -------- OpenAI-Compatible Endpoints --------
+
+// openaiMessage OpenAI 格式的消息
+type openaiMessage struct {
+	Role    string `json:"role"`
+	Content string `json:"content"`
+}
+
+// openaiRequest OpenAI /v1/chat/completions 请求格式
+type openaiRequest struct {
+	Model    string          `json:"model"`
+	Messages []openaiMessage `json:"messages"`
+	Stream   bool            `json:"stream"`
+}
+
+// openaiChoice OpenAI 响应中的选项
+type openaiChoice struct {
+	Index        int            `json:"index"`
+	Message      *openaiMessage `json:"message,omitempty"`
+	Delta        *openaiMessage `json:"delta,omitempty"`
+	FinishReason *string        `json:"finish_reason"`
+}
+
+// openaiUsage Token 用量
+type openaiUsage struct {
+	PromptTokens     int `json:"prompt_tokens"`
+	CompletionTokens int `json:"completion_tokens"`
+	TotalTokens      int `json:"total_tokens"`
+}
+
+// openaiResponse OpenAI /v1/chat/completions 响应格式
+type openaiResponse struct {
+	ID      string         `json:"id"`
+	Object  string         `json:"object"`
+	Created int64          `json:"created"`
+	Model   string         `json:"model"`
+	Choices []openaiChoice `json:"choices"`
+	Usage   *openaiUsage   `json:"usage,omitempty"`
+}
+
+func (s *HTTPServer) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
+	var req openaiRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error": map[string]string{"message": "invalid json: " + err.Error(), "type": "invalid_request_error"},
+		})
+		return
+	}
+	if len(req.Messages) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error": map[string]string{"message": "messages is required", "type": "invalid_request_error"},
+		})
+		return
+	}
+
+	// 提取最后一条用户消息
+	var userMsg string
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if req.Messages[i].Role == "user" {
+			userMsg = req.Messages[i].Content
+			break
+		}
+	}
+	if userMsg == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error": map[string]string{"message": "no user message found", "type": "invalid_request_error"},
+		})
+		return
+	}
+
+	// 使用 model 字段作为 session ID（简单映射，保证同一 "model" 复用会话）
+	sessionID := fmt.Sprintf("openai-%s", hashStr(fmt.Sprintf("%v", req.Messages[:len(req.Messages)-1])))
+	ag := s.getOrCreateSession(sessionID)
+
+	respID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
+
+	if req.Stream {
+		s.handleOpenAIStream(w, r, ag, userMsg, respID)
+		return
+	}
+
+	// 非流式
+	result, err := ag.Run(r.Context(), userMsg)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"error": map[string]string{"message": err.Error(), "type": "server_error"},
+		})
+		return
+	}
+
+	stop := "stop"
+	writeJSON(w, http.StatusOK, openaiResponse{
+		ID:      respID,
+		Object:  "chat.completion",
+		Created: time.Now().Unix(),
+		Model:   s.agentCfg.Model,
+		Choices: []openaiChoice{{
+			Index:        0,
+			Message:      &openaiMessage{Role: "assistant", Content: result},
+			FinishReason: &stop,
+		}},
+		Usage: &openaiUsage{
+			PromptTokens:     len(userMsg) / 4, // 粗略估算
+			CompletionTokens: len(result) / 4,
+			TotalTokens:      (len(userMsg) + len(result)) / 4,
+		},
+	})
+}
+
+func (s *HTTPServer) handleOpenAIStream(w http.ResponseWriter, r *http.Request, ag *agent.Agent, userMsg, respID string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"error": map[string]string{"message": "streaming not supported", "type": "server_error"},
+		})
+		return
+	}
+
+	stream, err := ag.RunStream(r.Context(), userMsg)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]interface{}{
+			"error": map[string]string{"message": err.Error(), "type": "server_error"},
+		})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	filter := &agent.ThinkFilter{}
+	var fullContent strings.Builder
+
+	sendChunk := func(content string, finish *string) {
+		chunk := openaiResponse{
+			ID:      respID,
+			Object:  "chat.completion.chunk",
+			Created: time.Now().Unix(),
+			Model:   s.agentCfg.Model,
+			Choices: []openaiChoice{{
+				Index:        0,
+				Delta:        &openaiMessage{Role: "assistant", Content: content},
+				FinishReason: finish,
+			}},
+		}
+		data, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", data)
+		flusher.Flush()
+	}
+
+	for {
+		msg, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			stop := "error"
+			sendChunk("", &stop)
+			break
+		}
+		if msg != nil && msg.Content != "" {
+			filtered := filter.Process(msg.Content)
+			if filtered != "" {
+				sendChunk(filtered, nil)
+				fullContent.WriteString(filtered)
+			}
+		}
+	}
+
+	if remaining := filter.Flush(); remaining != "" {
+		sendChunk(remaining, nil)
+		fullContent.WriteString(remaining)
+	}
+
+	stop := "stop"
+	sendChunk("", &stop)
+	fmt.Fprintf(w, "data: [DONE]\n\n")
+	flusher.Flush()
+
+	if fullContent.Len() > 0 {
+		ag.AppendAssistantMessage(r.Context(), fullContent.String())
+	}
+}
+
+// handleModels 返回 OpenAI /v1/models 兼容的模型列表
+func (s *HTTPServer) handleModels(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"object": "list",
+		"data": []map[string]interface{}{
+			{
+				"id":       s.agentCfg.Model,
+				"object":   "model",
+				"created":  time.Now().Unix(),
+				"owned_by": "goclaw",
+			},
+		},
+	})
+}
+
+// hashStr 简单哈希，用于生成 session ID
+func hashStr(s string) string {
+	h := uint64(0)
+	for _, c := range s {
+		h = h*31 + uint64(c)
+	}
+	return fmt.Sprintf("%x", h)
 }
 
 // -------- 会话管理 --------

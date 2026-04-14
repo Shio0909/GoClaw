@@ -281,3 +281,66 @@ func TestRequestLogMiddleware(t *testing.T) {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
 }
+
+func TestChatCompletionsValidation(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/chat/completions", srv.handleChatCompletions)
+
+	tests := []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{"empty messages", `{"messages":[]}`, 400},
+		{"no user msg", `{"messages":[{"role":"system","content":"hi"}]}`, 400},
+		{"invalid json", "bad json", 400},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			req := httptest.NewRequest("POST", "/v1/chat/completions", strings.NewReader(tt.body))
+			w := httptest.NewRecorder()
+			mux.ServeHTTP(w, req)
+			if w.Code != tt.status {
+				t.Errorf("expected %d, got %d: %s", tt.status, w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+func TestModelsEndpoint(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/models", srv.handleModels)
+
+	req := httptest.NewRequest("GET", "/v1/models", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["object"] != "list" {
+		t.Errorf("expected object=list, got %v", resp["object"])
+	}
+	data := resp["data"].([]interface{})
+	if len(data) != 1 {
+		t.Errorf("expected 1 model, got %d", len(data))
+	}
+}
+
+func TestHashStr(t *testing.T) {
+	h1 := hashStr("hello")
+	h2 := hashStr("hello")
+	h3 := hashStr("world")
+	if h1 != h2 {
+		t.Error("same input should produce same hash")
+	}
+	if h1 == h3 {
+		t.Error("different input should produce different hash")
+	}
+}

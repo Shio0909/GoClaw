@@ -14,6 +14,9 @@ agent:
   context_length: 128000
   max_step: 25               # Agent 最大工具调用步数（默认 25）
   tool_max_bytes: 30720      # 工具结果最大字节数（默认 30KB）
+  # system_prompt: |          # 自定义 system prompt（追加到默认 prompt 后）
+  #   你是一个专业的 Python 开发助手。
+  #   请用中文回答所有问题。
   # temperature: 0.7          # 采样温度（留空使用模型默认值）
   # max_tokens: 8192          # 最大输出 token 数（留空使用模型默认值）
   # reasoning_effort: high    # 推理力度: low/medium/high（仅 o1/o3 等推理模型）

@@ -38,6 +38,7 @@ type AgentConfig struct {
 	SimpleBaseURL string   `yaml:"simple_base_url"`
 	MaxStep       int      `yaml:"max_step"`        // Agent 最大工具调用步数（默认 25）
 	ToolMaxBytes  int      `yaml:"tool_max_bytes"`  // 工具结果最大字节数（默认 30KB）
+	SystemPrompt  string   `yaml:"system_prompt"`   // 自定义 system prompt（追加到默认 prompt）
 	Temperature   *float32 `yaml:"temperature"`     // 采样温度（nil = 使用模型默认值）
 	MaxTokens     int      `yaml:"max_tokens"`      // 最大输出 token 数（0 = 使用模型默认值）
 	ReasoningEffort string `yaml:"reasoning_effort"` // 推理力度: low, medium, high（仅 o1/o3 等推理模型）
