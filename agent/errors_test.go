@@ -33,7 +33,7 @@ func TestClassifyAPIError_StatusCodes(t *testing.T) {
 			errMsg:     "HTTP 429: Too Many Requests, retry after 30",
 			wantReason: ReasonRateLimit,
 			wantRetry:  true,
-			wantRotate: false,
+			wantRotate: true,
 		},
 		{
 			name:       "500 server error",

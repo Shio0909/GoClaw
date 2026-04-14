@@ -55,7 +55,7 @@ func gitLogTool() *ToolDef {
 				oneline = ol
 			}
 
-			gitArgs := []string{"log", fmt.Sprintf("-n%d", count), "--no-pager"}
+			gitArgs := []string{"log", fmt.Sprintf("-n%d", count)}
 
 			if oneline {
 				gitArgs = append(gitArgs, "--oneline", "--decorate")
@@ -98,7 +98,7 @@ func gitDiffTool() *ToolDef {
 				dir = "."
 			}
 
-			gitArgs := []string{"diff", "--no-pager"}
+			gitArgs := []string{"diff"}
 
 			if staged, ok := args["staged"].(bool); ok && staged {
 				gitArgs = append(gitArgs, "--staged")
@@ -130,16 +130,12 @@ func gitDiffTool() *ToolDef {
 
 // runGit executes a git command and returns its output
 func runGit(ctx context.Context, dir string, args ...string) (string, error) {
-	// flatten args (some may be slices passed as varargs)
-	var flatArgs []string
-	for _, a := range args {
-		flatArgs = append(flatArgs, a)
-	}
+	// prepend --no-pager as a top-level git flag (before subcommand)
+	fullArgs := append([]string{"--no-pager"}, args...)
 
-	cmd := exec.CommandContext(ctx, "git", flatArgs...)
+	cmd := exec.CommandContext(ctx, "git", fullArgs...)
 	cmd.Dir = dir
 
-	// Disable pager
 	cmd.Env = append(cmd.Environ(), "GIT_PAGER=cat", "GIT_TERMINAL_PROMPT=0")
 	if runtime.GOOS == "windows" {
 		cmd.Env = append(cmd.Env, "GIT_OPTIONAL_LOCKS=0")

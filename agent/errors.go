@@ -49,6 +49,13 @@ func ClassifyAPIError(err error) ClassifiedError {
 
 	// 按 HTTP 状态码分类
 	switch status {
+	case 400, 404, 405, 422:
+		return ClassifiedError{
+			Reason:     ReasonUnknown,
+			StatusCode: status,
+			Message:    msg,
+			ShouldRetry: false,
+		}
 	case 401, 403:
 		return ClassifiedError{
 			Reason:          ReasonAuth,
@@ -72,6 +79,7 @@ func ClassifyAPIError(err error) ClassifiedError {
 			StatusCode:        status,
 			Message:           msg,
 			ShouldRetry:       true,
+			ShouldRotateKey:   true,
 			RetryAfterSeconds: retryAfter,
 		}
 	case 500, 502, 503, 504:

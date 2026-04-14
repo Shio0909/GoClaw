@@ -40,6 +40,13 @@ func (a *Agent) runWithRetry(ctx context.Context, fn func(cfg Config) error) err
 			return err
 		}
 
+		// 需要轮换 Key 但没有凭证池 → 无法处理，直接返回
+		if classified.ShouldRotateKey && !classified.ShouldRetry {
+			if a.retryConfig == nil || a.retryConfig.Pool == nil {
+				return err
+			}
+		}
+
 		// 最后一次尝试，不再重试
 		if attempt >= maxAttempts {
 			return fmt.Errorf("重试 %d 次后仍然失败: %w", maxAttempts, err)
