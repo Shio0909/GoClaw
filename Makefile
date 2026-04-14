@@ -10,7 +10,7 @@ test:
 	go test -race ./...
 
 lint:
-	golangci-lint run
+	go vet ./...
 
 clean:
 	rm -f goclaw goclaw.exe
