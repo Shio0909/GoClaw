@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"time"
 )
 
 // RegisterBuiltins 注册所有内置工具
@@ -128,25 +129,62 @@ func listDirTool() *ToolDef {
 func shellTool() *ToolDef {
 	return &ToolDef{
 		Name:        "shell",
-		Description: "执行 shell 命令并返回输出",
+		Description: "执行 shell 命令并返回输出。支持超时控制和工作目录设置。Windows 用 cmd /C，Linux/Mac 用 sh -c",
 		Parameters: []ParamDef{
 			{Name: "command", Type: "string", Description: "要执行的命令", Required: true},
+			{Name: "working_dir", Type: "string", Description: "工作目录（可选，默认当前目录）", Required: false},
+			{Name: "timeout_seconds", Type: "number", Description: "超时秒数（可选，默认120秒，最大600秒）", Required: false},
 		},
 		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			command, _ := args["command"].(string)
 			if command == "" {
 				return "", fmt.Errorf("command is required")
 			}
+
+			// 超时控制
+			timeout := 120.0
+			if t, ok := args["timeout_seconds"].(float64); ok && t > 0 {
+				timeout = t
+			}
+			if timeout > 600 {
+				timeout = 600
+			}
+			execCtx, cancel := context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
+			defer cancel()
+
 			var cmd *exec.Cmd
 			if runtime.GOOS == "windows" {
-				cmd = exec.CommandContext(ctx, "cmd", "/C", command)
+				cmd = exec.CommandContext(execCtx, "cmd", "/C", command)
 			} else {
-				cmd = exec.CommandContext(ctx, "sh", "-c", command)
+				cmd = exec.CommandContext(execCtx, "sh", "-c", command)
 			}
+
+			// 工作目录
+			if dir, ok := args["working_dir"].(string); ok && dir != "" {
+				cmd.Dir = dir
+			}
+
 			output, err := cmd.CombinedOutput()
-			result := strings.TrimSpace(string(output))
+			result := string(output)
+
+			// 输出截断（防止大输出撑爆上下文）
+			const maxOutput = 50 * 1024 // 50KB
+			if len(result) > maxOutput {
+				truncated := len(result) - maxOutput
+				result = result[:maxOutput/2] + fmt.Sprintf("\n\n... [截断 %d 字节] ...\n\n", truncated) + result[len(result)-maxOutput/2:]
+			}
+
+			result = strings.TrimSpace(result)
+
 			if err != nil {
-				return result, fmt.Errorf("command failed: %w\noutput: %s", err, result)
+				if execCtx.Err() == context.DeadlineExceeded {
+					return result, fmt.Errorf("命令超时（%d秒）: %s", int(timeout), command)
+				}
+				exitCode := -1
+				if exitErr, ok := err.(*exec.ExitError); ok {
+					exitCode = exitErr.ExitCode()
+				}
+				return result, fmt.Errorf("exit code %d: %s", exitCode, result)
 			}
 			return result, nil
 		},
