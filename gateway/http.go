@@ -190,6 +190,7 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/webhooks", s.handleListWebhooks)
 	mux.HandleFunc("POST /v1/webhooks", s.handleAddWebhook)
 	mux.HandleFunc("DELETE /v1/webhooks", s.handleRemoveWebhook)
+	mux.HandleFunc("GET /v1/rate-limit", s.handleRateLimitStatus)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -699,6 +700,8 @@ func (s *HTTPServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		"rate_limit":  s.rateLimiter != nil,
 		"rag":         s.ragMgr != nil,
 		"persistence": s.sessionStore != nil,
+		"audit_log":   s.auditLog != nil,
+		"webhooks":    s.webhookMgr != nil,
 	}
 	if s.fallbackCfg != nil && s.fallbackCfg.Model != "" {
 		features["fallback"] = true
@@ -960,6 +963,20 @@ func (s *HTTPServer) handleRemoveWebhook(w http.ResponseWriter, r *http.Request)
 	} else {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "webhook not found"})
 	}
+}
+
+// handleRateLimitStatus GET /v1/rate-limit — 速率限制状态
+func (s *HTTPServer) handleRateLimitStatus(w http.ResponseWriter, r *http.Request) {
+	if s.rateLimiter == nil {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"enabled": false,
+		})
+		return
+	}
+
+	status := s.rateLimiter.Status()
+	status["enabled"] = true
+	writeJSON(w, http.StatusOK, status)
 }
 
 func (s *HTTPServer) handleExportSession(w http.ResponseWriter, r *http.Request) {

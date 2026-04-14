@@ -105,3 +105,15 @@ func (rl *RateLimiter) cleanup() {
 		rl.mu.Unlock()
 	}
 }
+
+// Status 返回速率限制器状态（活跃桶数、全局配置）
+func (rl *RateLimiter) Status() map[string]interface{} {
+	rl.mu.Lock()
+	defer rl.mu.Unlock()
+
+	return map[string]interface{}{
+		"rate_per_window":  rl.rate,
+		"window_seconds":   int(rl.window.Seconds()),
+		"active_buckets":   len(rl.buckets),
+	}
+}

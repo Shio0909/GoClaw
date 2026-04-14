@@ -7,6 +7,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/eino/schema"
 	"github.com/gorilla/websocket"
@@ -1195,5 +1196,47 @@ func TestRemoveWebhookNotFound(t *testing.T) {
 
 	if w.Code != http.StatusNotFound {
 		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ====== Rate Limit Status Tests ======
+
+func TestRateLimitStatusDisabled(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/rate-limit", srv.handleRateLimitStatus)
+
+	req := httptest.NewRequest("GET", "/v1/rate-limit", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["enabled"] != false {
+		t.Fatal("expected enabled=false")
+	}
+}
+
+func TestRateLimitStatusEnabled(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.rateLimiter = NewRateLimiter(100, time.Minute)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/rate-limit", srv.handleRateLimitStatus)
+
+	req := httptest.NewRequest("GET", "/v1/rate-limit", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["enabled"] != true {
+		t.Fatal("expected enabled=true")
+	}
+	if int(resp["rate_per_window"].(float64)) != 100 {
+		t.Fatalf("expected rate=100, got %v", resp["rate_per_window"])
+	}
+	if int(resp["window_seconds"].(float64)) != 60 {
+		t.Fatalf("expected window=60, got %v", resp["window_seconds"])
 	}
 }
