@@ -7,16 +7,17 @@
 灵感来自 [Claude Code](https://github.com/anthropics/claude-code) 和 [Hermes Agent](https://github.com/nousresearch/hermes-agent)，基于 [Eino](https://github.com/cloudwego/eino)（字节跳动 AI 框架）的 ReAct Agent 实现。
 
 ```
-               ┌──────────────────────────────────────┐
-               │          GoClaw Runtime               │
-               │                                       │
-  HTTP API ──→ │  ┌───────┐  ┌───────┐  ┌──────────┐  │
-  WebSocket──→ │  │ Agent │──│ Tools │──│ Memory   │  │
-  CLI      ──→ │  │ Loop  │  │17+MCP │  │ 3-Layer  │  │
-  QQ Bot   ──→ │  │+Retry │  │+Stats │  │+RAG      │  │
-  (扩展)   ──→ │  │+Route │  │+Retry │  │+Persist  │  │
-               │  └───────┘  └───────┘  └──────────┘  │
-               └──────────────────────────────────────┘
+               ┌──────────────────────────────────────────┐
+               │            GoClaw Runtime                 │
+               │                                           │
+  HTTP API ──→ │  ┌───────┐  ┌─────────┐  ┌──────────┐   │
+  WebSocket──→ │  │ Agent │──│  Tools  │──│ Memory   │   │
+  CLI      ──→ │  │ Loop  │  │20+MCP   │  │ 3-Layer  │   │
+  QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
+  (扩展)   ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
+               │  └───────┘  └─────────┘  └──────────┘   │
+               │  37 API Endpoints · Audit · Webhooks     │
+               └──────────────────────────────────────────┘
 ```
 
 ## 为什么选择 GoClaw
@@ -27,7 +28,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~13,300 行 Go（含 272 个测试） | — |
+| **代码量** | ~16,000 行 Go（含 358 个测试） | — |
 
 ## 核心特性
 
@@ -59,7 +60,7 @@
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 17 个端点（原生 14 + OpenAI 兼容 3），完整 OpenAPI 3.0 规范
+- 37 个端点（原生 31 + OpenAI 兼容 3 + WebSocket 1 + 管理 2），完整 OpenAPI 3.0 规范
 - X-Request-ID 请求追踪（自动生成或透传客户端 ID）
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
@@ -67,10 +68,21 @@
 - 令牌桶速率限制（每 IP 独立计数）
 - Prometheus 指标拉取（`/v1/metrics?format=prometheus`）
 - 运行时配置审查（API Key 自动脱敏）
+- 配置热重载（POST 重新加载 YAML，返回变更差异）
+- 审计日志系统（环形缓冲区，11 种事件类型，ID 轮询）
+- Webhook 系统（异步投递 + HMAC-SHA256 签名 + 事件过滤）
+- 会话标签/备注系统（标签管理 + 按标签过滤 + 文本备注）
+- 批量聊天（POST 多会话并发发送，≤20 并发）
 - 会话分叉（克隆对话历史到新会话）
 - 会话导出（JSON / Markdown 格式）
+- 工具运行时管理（动态禁用/启用工具）
+- 端点延迟追踪（per-endpoint 调用次数 / 错误率 / 平均耗时）
+- Admin GC（手动清理空闲会话）
+- 深度健康检查（逐项检测存储 / 配置 / RAG 状态）
+- 运行时分析仪表盘（会话统计 + 标签分布 + 审计摘要）
 - 优雅关闭（活跃连接排水 + 30s 超时）
 - 工具执行超时（per-tool 或全局默认，context.WithTimeout）
+- 插件系统（YAML/JSON 定义，脚本/HTTP 两种执行方式）
 
 ## 项目结构
 
@@ -87,11 +99,13 @@ GoClaw/
 │   ├── credential_pool.go  # 多 Key 凭证池（3 种策略）
 │   ├── router.go           # 智能模型路由
 │   └── think_filter.go     # 思考过程过滤器
+├── audit/
+│   └── audit.go            # 审计日志（环形缓冲区，11+ 种事件类型）
 ├── config/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── http.go             # HTTP API（37 端点，REST + SSE + WebSocket + OpenAI 兼容）
 │   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
@@ -103,6 +117,7 @@ GoClaw/
 ├── tools/
 │   ├── registry.go         # 工具注册表
 │   ├── builtins.go         # 内置工具注册（20+ 个工具）
+│   ├── plugin.go           # 插件系统（YAML/JSON → 脚本/HTTP 工具）
 │   ├── stats.go            # 工具调用统计（原子计数器 + 快照）
 │   ├── confirm.go          # 危险工具确认系统
 │   ├── eino_adapter.go     # Eino 适配器 + 工具级重试 + 输出截断
@@ -113,6 +128,8 @@ GoClaw/
 │   ├── websearch.go        # Tavily 网络搜索（自动重试）
 │   ├── shell_security.go   # Shell 安全检查（危险命令拦截）
 │   └── sandbox.go          # 文件沙箱 + 路径验证
+├── webhook/
+│   └── webhook.go          # Webhook 系统（异步投递 + HMAC-SHA256 签名）
 ├── logger/
 │   └── logger.go           # 结构化日志（slog + 遗留 log 桥接）
 ├── memory/
@@ -188,15 +205,31 @@ docker compose up -d
 | `/v1/chat/:session` | GET | 查看会话历史 |
 | `/v1/chat/:session` | DELETE | 清空会话 |
 | `/v1/chat/:session/export` | GET | 导出会话（`?format=json\|markdown`） |
-| `/v1/sessions` | GET | 列出所有活跃会话 |
+| `/v1/sessions` | GET | 列出所有活跃会话（`?tag=xxx` 按标签过滤） |
+| `/v1/sessions/search` | GET | 搜索会话内容（`?q=keyword`） |
 | `/v1/sessions/:session/fork` | POST | 分叉会话（克隆对话历史到新 ID） |
-| `/v1/tools` | GET | 列出可用工具 |
+| `/v1/sessions/:session/tags` | PUT/GET/DELETE | 会话标签管理（添加/查询/删除） |
+| `/v1/sessions/:session/annotate` | POST | 添加会话备注 |
+| `/v1/sessions/:session/annotations` | GET | 查看会话备注列表 |
+| `/v1/batch/chat` | POST | 批量多会话并发聊天（≤20） |
+| `/v1/tools` | GET | 列出可用工具（含禁用状态） |
 | `/v1/tools/stats` | GET | 工具调用统计（次数、错误、平均耗时） |
+| `/v1/tools/disabled` | GET | 列出运行时禁用的工具 |
+| `/v1/tools/:name/disable` | POST | 运行时禁用工具 |
+| `/v1/tools/:name/enable` | POST | 运行时启用工具 |
 | `/v1/memory/:session` | GET | 查看记忆状态 |
 | `/v1/metrics` | GET | 运行指标（`?format=prometheus` 支持 Prometheus 拉取） |
 | `/v1/health` | GET | 健康检查（免认证，含 uptime、连接数） |
+| `/v1/health/deep` | GET | 深度健康检查（逐项检测存储/配置/RAG） |
 | `/v1/config` | GET | 运行时配置审查（API Key 脱敏） |
+| `/v1/config/reload` | POST | 热重载配置（返回变更差异） |
 | `/v1/openapi.json` | GET | OpenAPI 3.0 规范 |
+| `/v1/audit` | GET | 审计日志查询（`?type=xxx&limit=N&since_id=N`） |
+| `/v1/webhooks` | GET/POST/DELETE | Webhook 管理（HMAC-SHA256 签名） |
+| `/v1/rate-limit` | GET | 速率限制状态 |
+| `/v1/latency` | GET | 端点延迟统计（调用次数/错误率/平均耗时） |
+| `/v1/analytics` | GET | 运行时分析仪表盘（会话/工具/审计汇总） |
+| `/v1/admin/gc` | POST | 手动清理空闲会话 |
 | `/v1/ws` | GET | WebSocket 实时聊天 |
 
 ### OpenAI 兼容 API
