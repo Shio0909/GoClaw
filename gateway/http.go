@@ -43,6 +43,8 @@ type HTTPServer struct {
 	chatCount      atomic.Int64  // 已处理的 chat 请求数
 	rateLimiter    *RateLimiter  // 速率限制（可选）
 	fallbackCfg    *agent.FallbackConfig // 模型回退（可选）
+	activeConns    atomic.Int64  // 当前活跃请求数
+	shutdownCh     chan struct{} // 触发优雅关闭
 
 	server *http.Server
 }
@@ -113,6 +115,7 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		sessionTimeout: sessTimeout,
 		requestTimeout: reqTimeout,
 		sessionStore:   store,
+		shutdownCh:     make(chan struct{}),
 	}
 
 	// 从磁盘恢复会话
@@ -136,6 +139,19 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 }
 
 func (s *HTTPServer) Name() string { return "http" }
+
+// Shutdown 触发优雅关闭（可由 admin API 调用）
+func (s *HTTPServer) Shutdown() {
+	select {
+	case s.shutdownCh <- struct{}{}:
+	default:
+	}
+}
+
+// ActiveConnections 返回当前活跃的 HTTP 请求数
+func (s *HTTPServer) ActiveConnections() int64 {
+	return s.activeConns.Load()
+}
 
 // Run 启动 HTTP 服务器，阻塞直到 ctx 取消
 func (s *HTTPServer) Run(ctx context.Context) error {
@@ -180,9 +196,13 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 
 	// 优雅关闭
 	go func() {
-		<-ctx.Done()
-		s.saveAllSessions() // 关闭前持久化所有会话
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		select {
+		case <-ctx.Done():
+		case <-s.shutdownCh:
+		}
+		log.Printf("[HTTP] 开始优雅关闭 (活跃连接: %d)", s.activeConns.Load())
+		s.saveAllSessions()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		s.server.Shutdown(shutdownCtx)
 	}()
@@ -249,6 +269,9 @@ func (s *HTTPServer) withCORS(next http.Handler) http.Handler {
 // withRequestLog 记录每个请求的方法、路径和耗时，并注入 X-Request-ID
 func (s *HTTPServer) withRequestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		s.activeConns.Add(1)
+		defer s.activeConns.Add(-1)
+
 		reqID := requestCounter.Add(1)
 		xRequestID := r.Header.Get("X-Request-ID")
 		if xRequestID == "" {
@@ -456,14 +479,15 @@ func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	})
 
 	resp := map[string]interface{}{
-		"status":          "ok",
-		"gateway":         s.Name(),
-		"provider":        s.agentCfg.Provider,
-		"model":           s.agentCfg.Model,
-		"tools":           len(s.registry.Names()),
-		"uptime_seconds":  int(time.Since(s.startedAt).Seconds()),
-		"active_sessions": sessionCount,
-		"total_chats":     s.chatCount.Load(),
+		"status":            "ok",
+		"gateway":           s.Name(),
+		"provider":          s.agentCfg.Provider,
+		"model":             s.agentCfg.Model,
+		"tools":             len(s.registry.Names()),
+		"uptime_seconds":    int(time.Since(s.startedAt).Seconds()),
+		"active_sessions":   sessionCount,
+		"active_connections": s.activeConns.Load(),
+		"total_chats":       s.chatCount.Load(),
 	}
 	if s.fallbackCfg != nil && s.fallbackCfg.Model != "" {
 		resp["fallback_model"] = s.fallbackCfg.Model
@@ -488,6 +512,7 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	totalRequests := requestCounter.Load()
 	totalChats := s.chatCount.Load()
 	toolsLoaded := len(s.registry.Names())
+	activeConns := s.activeConns.Load()
 
 	// Prometheus text format
 	if r.URL.Query().Get("format") == "prometheus" {
@@ -504,6 +529,9 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "# HELP goclaw_active_sessions Number of active sessions.\n")
 		fmt.Fprintf(w, "# TYPE goclaw_active_sessions gauge\n")
 		fmt.Fprintf(w, "goclaw_active_sessions %d\n", sessionCount)
+		fmt.Fprintf(w, "# HELP goclaw_active_connections Number of in-flight HTTP requests.\n")
+		fmt.Fprintf(w, "# TYPE goclaw_active_connections gauge\n")
+		fmt.Fprintf(w, "goclaw_active_connections %d\n", activeConns)
 		fmt.Fprintf(w, "# HELP goclaw_tools_loaded Number of tools loaded.\n")
 		fmt.Fprintf(w, "# TYPE goclaw_tools_loaded gauge\n")
 		fmt.Fprintf(w, "goclaw_tools_loaded %d\n", toolsLoaded)
@@ -521,15 +549,16 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 
 	// JSON format (default)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"uptime_seconds":  int(uptime.Seconds()),
-		"uptime_human":    uptime.Round(time.Second).String(),
-		"total_requests":  totalRequests,
-		"total_chats":     totalChats,
-		"active_sessions": sessionCount,
-		"tools_loaded":    toolsLoaded,
-		"model":           s.agentCfg.Model,
-		"provider":        s.agentCfg.Provider,
-		"tool_stats":      tools.GetGlobalToolStats().Summary(),
+		"uptime_seconds":    int(uptime.Seconds()),
+		"uptime_human":      uptime.Round(time.Second).String(),
+		"total_requests":    totalRequests,
+		"total_chats":       totalChats,
+		"active_sessions":   sessionCount,
+		"active_connections": activeConns,
+		"tools_loaded":      toolsLoaded,
+		"model":             s.agentCfg.Model,
+		"provider":          s.agentCfg.Provider,
+		"tool_stats":        tools.GetGlobalToolStats().Summary(),
 	})
 }
 
