@@ -372,6 +372,34 @@ func TestMetricsEndpoint(t *testing.T) {
 	}
 }
 
+func TestMetricsPrometheusFormat(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/metrics", srv.handleMetrics)
+
+	req := httptest.NewRequest("GET", "/v1/metrics?format=prometheus", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	ct := w.Header().Get("Content-Type")
+	if !strings.Contains(ct, "text/plain") {
+		t.Errorf("expected text/plain content type, got %s", ct)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "goclaw_uptime_seconds") {
+		t.Error("expected goclaw_uptime_seconds in prometheus output")
+	}
+	if !strings.Contains(body, "goclaw_requests_total") {
+		t.Error("expected goclaw_requests_total in prometheus output")
+	}
+	if !strings.Contains(body, "# TYPE") {
+		t.Error("expected Prometheus TYPE annotations")
+	}
+}
+
 func TestListSessionsEmpty(t *testing.T) {
 	srv := newTestHTTPServer(t)
 	mux := http.NewServeMux()

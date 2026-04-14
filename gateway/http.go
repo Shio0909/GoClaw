@@ -458,13 +458,48 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	})
 
 	uptime := time.Since(s.startedAt)
+	totalRequests := requestCounter.Load()
+	totalChats := s.chatCount.Load()
+	toolsLoaded := len(s.registry.Names())
+
+	// Prometheus text format
+	if r.URL.Query().Get("format") == "prometheus" {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		fmt.Fprintf(w, "# HELP goclaw_uptime_seconds Time since server start in seconds.\n")
+		fmt.Fprintf(w, "# TYPE goclaw_uptime_seconds gauge\n")
+		fmt.Fprintf(w, "goclaw_uptime_seconds %d\n", int(uptime.Seconds()))
+		fmt.Fprintf(w, "# HELP goclaw_requests_total Total HTTP requests processed.\n")
+		fmt.Fprintf(w, "# TYPE goclaw_requests_total counter\n")
+		fmt.Fprintf(w, "goclaw_requests_total %d\n", totalRequests)
+		fmt.Fprintf(w, "# HELP goclaw_chats_total Total chat messages processed.\n")
+		fmt.Fprintf(w, "# TYPE goclaw_chats_total counter\n")
+		fmt.Fprintf(w, "goclaw_chats_total %d\n", totalChats)
+		fmt.Fprintf(w, "# HELP goclaw_active_sessions Number of active sessions.\n")
+		fmt.Fprintf(w, "# TYPE goclaw_active_sessions gauge\n")
+		fmt.Fprintf(w, "goclaw_active_sessions %d\n", sessionCount)
+		fmt.Fprintf(w, "# HELP goclaw_tools_loaded Number of tools loaded.\n")
+		fmt.Fprintf(w, "# TYPE goclaw_tools_loaded gauge\n")
+		fmt.Fprintf(w, "goclaw_tools_loaded %d\n", toolsLoaded)
+
+		// Per-tool metrics
+		for _, snap := range tools.GetGlobalToolStats().Snapshot() {
+			fmt.Fprintf(w, "goclaw_tool_calls_total{tool=%q} %d\n", snap.Name, snap.Calls)
+			fmt.Fprintf(w, "goclaw_tool_errors_total{tool=%q} %d\n", snap.Name, snap.Errors)
+			if snap.Calls > 0 {
+				fmt.Fprintf(w, "goclaw_tool_avg_duration_ms{tool=%q} %.1f\n", snap.Name, snap.AvgMs)
+			}
+		}
+		return
+	}
+
+	// JSON format (default)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"uptime_seconds":  int(uptime.Seconds()),
 		"uptime_human":    uptime.Round(time.Second).String(),
-		"total_requests":  requestCounter.Load(),
-		"total_chats":     s.chatCount.Load(),
+		"total_requests":  totalRequests,
+		"total_chats":     totalChats,
 		"active_sessions": sessionCount,
-		"tools_loaded":    len(s.registry.Names()),
+		"tools_loaded":    toolsLoaded,
 		"model":           s.agentCfg.Model,
 		"provider":        s.agentCfg.Provider,
 		"tool_stats":      tools.GetGlobalToolStats().Summary(),
