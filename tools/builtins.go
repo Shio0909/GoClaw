@@ -236,6 +236,11 @@ func shellTool() *ToolDef {
 				return "", fmt.Errorf("command is required")
 			}
 
+			// 安全检查
+			if err := ShellSecurity.CheckCommand(command); err != nil {
+				return "", err
+			}
+
 			// 超时控制
 			timeout := 120.0
 			if t, ok := args["timeout_seconds"].(float64); ok && t > 0 {
