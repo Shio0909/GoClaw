@@ -10,6 +10,8 @@ agent:
   # base_url: https://api.minimax.chat/v1  # 自动根据 provider 设置
   model: MiniMax-M2.7
   context_length: 128000
+  max_step: 25               # Agent 最大工具调用步数（默认 25）
+  tool_max_bytes: 30720      # 工具结果最大字节数（默认 30KB）
 
   # 多 Key 轮换（可选）
   # api_keys:

@@ -19,7 +19,6 @@ const (
 	defaultThresholdPct    = 0.50   // 超过 50% 触发压缩
 	defaultProtectFirstN   = 2      // 保护头部 N 条消息（system 不计入）
 	defaultTailTokenBudget = 20000  // 尾部保护 token 预算
-	charsPerToken          = 4      // 粗略估算：4 字符 ≈ 1 token
 	minSummaryTokens       = 2000
 	summaryTokensCeiling   = 12000
 	summaryRatio           = 0.20 // 摘要 token 占被压缩内容的 20%
@@ -71,17 +70,43 @@ func NewCompressor(cfg CompressorConfig, llmCall memory.LLMCaller) *Compressor {
 	}
 }
 
-// estimateTokens 粗略估算消息列表的 token 数
+// estimateTokens 粗略估算消息列表的 token 数（CJK 感知）
+// CJK 字符约 1-2 字符 = 1 token，ASCII 约 4 字符 = 1 token
 func estimateTokens(msgs []*schema.Message) int {
 	total := 0
 	for _, m := range msgs {
-		total += len(m.Content)/charsPerToken + 4 // 每条消息 +4 token 开销
+		total += estimateStringTokens(m.Content) + 4 // 每条消息 +4 token 开销
 		for _, tc := range m.ToolCalls {
-			total += len(tc.Function.Arguments) / charsPerToken
-			total += len(tc.Function.Name)/charsPerToken + 4
+			total += estimateStringTokens(tc.Function.Arguments)
+			total += estimateStringTokens(tc.Function.Name) + 4
 		}
 	}
 	return total
+}
+
+// estimateStringTokens 估算单个字符串的 token 数
+func estimateStringTokens(s string) int {
+	if len(s) == 0 {
+		return 0
+	}
+	tokens := 0
+	asciiRun := 0
+	for _, r := range s {
+		if r >= 0x3000 || (r >= 0x4E00 && r <= 0x9FFF) || (r >= 0xAC00 && r <= 0xD7AF) {
+			// CJK Unified Ideographs, CJK symbols, Korean — ~1.5 chars per token
+			if asciiRun > 0 {
+				tokens += (asciiRun + 3) / 4
+				asciiRun = 0
+			}
+			tokens++
+		} else {
+			asciiRun++
+		}
+	}
+	if asciiRun > 0 {
+		tokens += (asciiRun + 3) / 4
+	}
+	return tokens
 }
 
 // ShouldCompress 检查是否需要压缩

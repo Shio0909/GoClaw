@@ -38,6 +38,15 @@ func RegisterBuiltins(r *Registry) {
 	r.Register(NewMCPInstallTool(r))
 	r.Register(NewMCPUninstallTool(r))
 
+	// 代码搜索
+	r.Register(grepSearchTool())
+	r.Register(globSearchTool())
+
+	// Git 操作
+	r.Register(gitStatusTool())
+	r.Register(gitLogTool())
+	r.Register(gitDiffTool())
+
 	// 技能管理
 	r.Register(NewSkillInstallTool())
 	RegisterSkillTools(r)
@@ -97,33 +106,119 @@ func fileWriteTool() *ToolDef {
 func listDirTool() *ToolDef {
 	return &ToolDef{
 		Name:        "list_dir",
-		Description: "列出指定目录下的文件和子目录",
+		Description: "列出指定目录下的文件和子目录。支持递归遍历和深度控制。",
 		Parameters: []ParamDef{
 			{Name: "path", Type: "string", Description: "目录路径", Required: true},
+			{Name: "recursive", Type: "boolean", Description: "是否递归列出子目录（默认 false）", Required: false},
+			{Name: "max_depth", Type: "number", Description: "递归最大深度（默认 3，仅 recursive=true 时生效）", Required: false},
+			{Name: "show_hidden", Type: "boolean", Description: "是否显示隐藏文件（默认 false）", Required: false},
 		},
 		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
 			path, _ := args["path"].(string)
 			if path == "" {
 				path = "."
 			}
-			entries, err := os.ReadDir(path)
-			if err != nil {
-				return "", fmt.Errorf("read dir: %w", err)
+			recursive, _ := args["recursive"].(bool)
+			showHidden, _ := args["show_hidden"].(bool)
+			maxDepth := 3
+			if md, ok := args["max_depth"].(float64); ok && md > 0 {
+				maxDepth = int(md)
 			}
-			var sb strings.Builder
-			for _, e := range entries {
-				info, _ := e.Info()
-				if e.IsDir() {
-					sb.WriteString(fmt.Sprintf("[DIR]  %s/\n", e.Name()))
-				} else if info != nil {
-					sb.WriteString(fmt.Sprintf("[FILE] %s (%d bytes)\n", e.Name(), info.Size()))
-				} else {
-					sb.WriteString(fmt.Sprintf("[FILE] %s\n", e.Name()))
-				}
+
+			if !recursive {
+				return listDirFlat(path, showHidden)
 			}
-			return sb.String(), nil
+			return listDirRecursive(path, showHidden, maxDepth)
 		},
 	}
+}
+
+// listDirFlat lists a single directory level
+func listDirFlat(path string, showHidden bool) (string, error) {
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		return "", fmt.Errorf("read dir: %w", err)
+	}
+	var sb strings.Builder
+	for _, e := range entries {
+		if !showHidden && strings.HasPrefix(e.Name(), ".") {
+			continue
+		}
+		info, _ := e.Info()
+		if e.IsDir() {
+			sb.WriteString(fmt.Sprintf("[DIR]  %s/\n", e.Name()))
+		} else if info != nil {
+			sb.WriteString(fmt.Sprintf("[FILE] %s (%d bytes)\n", e.Name(), info.Size()))
+		} else {
+			sb.WriteString(fmt.Sprintf("[FILE] %s\n", e.Name()))
+		}
+	}
+	return sb.String(), nil
+}
+
+// listDirRecursive lists directory tree with depth control
+func listDirRecursive(root string, showHidden bool, maxDepth int) (string, error) {
+	var sb strings.Builder
+	count := 0
+	const maxEntries = 1000
+
+	err := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if count >= maxEntries {
+			return filepath.SkipAll
+		}
+
+		rel, _ := filepath.Rel(root, path)
+		if rel == "." {
+			return nil
+		}
+
+		// calculate depth
+		depth := strings.Count(filepath.ToSlash(rel), "/")
+		if depth >= maxDepth {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		name := d.Name()
+		if !showHidden && strings.HasPrefix(name, ".") {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// skip common noise dirs
+		if d.IsDir() && (name == "node_modules" || name == "vendor" || name == "__pycache__") {
+			return filepath.SkipDir
+		}
+
+		indent := strings.Repeat("  ", depth)
+		if d.IsDir() {
+			sb.WriteString(fmt.Sprintf("%s📁 %s/\n", indent, name))
+		} else {
+			info, _ := d.Info()
+			if info != nil {
+				sb.WriteString(fmt.Sprintf("%s📄 %s (%d bytes)\n", indent, name, info.Size()))
+			} else {
+				sb.WriteString(fmt.Sprintf("%s📄 %s\n", indent, name))
+			}
+		}
+		count++
+		return nil
+	})
+
+	if err != nil && err != filepath.SkipAll {
+		return "", fmt.Errorf("walk dir: %w", err)
+	}
+	if count >= maxEntries {
+		sb.WriteString(fmt.Sprintf("\n... 结果已截断（上限 %d 条）", maxEntries))
+	}
+	return sb.String(), nil
 }
 
 func shellTool() *ToolDef {

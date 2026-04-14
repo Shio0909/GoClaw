@@ -33,6 +33,8 @@ type AgentConfig struct {
 	SimpleModel   string   `yaml:"simple_model"`
 	SimpleProvider string  `yaml:"simple_provider"`
 	SimpleBaseURL string   `yaml:"simple_base_url"`
+	MaxStep       int      `yaml:"max_step"`        // Agent 最大工具调用步数（默认 25）
+	ToolMaxBytes  int      `yaml:"tool_max_bytes"`  // 工具结果最大字节数（默认 30KB）
 }
 
 type GatewayConfig struct {
@@ -119,6 +121,8 @@ func applyEnvFallback(cfg *Config) {
 	envStr(&cfg.Agent.SimpleModel, "GOCLAW_SIMPLE_MODEL")
 	envStr(&cfg.Agent.SimpleProvider, "GOCLAW_SIMPLE_PROVIDER")
 	envStr(&cfg.Agent.SimpleBaseURL, "GOCLAW_SIMPLE_BASE_URL")
+	envInt(&cfg.Agent.MaxStep, "GOCLAW_MAX_STEP")
+	envInt(&cfg.Agent.ToolMaxBytes, "GOCLAW_TOOL_MAX_BYTES")
 
 	// Provider-specific API keys
 	if cfg.Agent.APIKey == "" {
@@ -187,6 +191,12 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Agent.ContextLength <= 0 {
 		cfg.Agent.ContextLength = 128000
+	}
+	if cfg.Agent.MaxStep <= 0 {
+		cfg.Agent.MaxStep = 25
+	}
+	if cfg.Agent.ToolMaxBytes <= 0 {
+		cfg.Agent.ToolMaxBytes = 30 * 1024 // 30KB
 	}
 	if cfg.Tools.SkillsDir == "" {
 		cfg.Tools.SkillsDir = "skills"

@@ -11,7 +11,14 @@ import (
 )
 
 // maxToolResultBytes 工具结果最大字节数，超出则截断
-const maxToolResultBytes = 30 * 1024 // 30KB
+var maxToolResultBytes = 30 * 1024 // 30KB, can be overridden via config
+
+// SetMaxToolResultBytes 设置工具结果最大字节数（供 config 调用）
+func SetMaxToolResultBytes(n int) {
+	if n > 0 {
+		maxToolResultBytes = n
+	}
+}
 
 // EinoTool 将 ToolDef 适配为 Eino 的 InvokableTool 接口
 type EinoTool struct {
@@ -57,23 +64,43 @@ func (t *EinoTool) InvokableRun(ctx context.Context, argumentsInJSON string, opt
 	}
 	result, err := t.def.Fn(ctx, args)
 
-	// 截断过大的工具结果，防止后续请求体爆炸
+	// 头尾保留截断策略：保留开头和结尾，中间插入截断提示
 	if len(result) > maxToolResultBytes {
 		log.Printf("[Tool] %s 结果过大 (%d 字节)，截断到 %d 字节", t.def.Name, len(result), maxToolResultBytes)
 		runes := []rune(result)
-		if len(string(runes)) > maxToolResultBytes {
-			// 按 rune 截断避免切断 UTF-8
-			cut := 0
-			size := 0
+		totalRuneBytes := len(result)
+		if totalRuneBytes > maxToolResultBytes {
+			// 头部占 40%，尾部占 40%，留 20% 给截断提示
+			headBudget := maxToolResultBytes * 40 / 100
+			tailBudget := maxToolResultBytes * 40 / 100
+
+			// 按 rune 边界找头部截止点
+			headCut := 0
+			headSize := 0
 			for i, r := range runes {
-				size += len(string(r))
-				if size > maxToolResultBytes-200 { // 留 200 字节给截断提示
-					cut = i
+				headSize += len(string(r))
+				if headSize > headBudget {
+					headCut = i
 					break
 				}
 			}
-			if cut > 0 {
-				result = string(runes[:cut]) + fmt.Sprintf("\n\n... [结果过大，已截断。原始大小: %d 字节，显示前 %d 字节]", len(result), maxToolResultBytes)
+
+			// 按 rune 边界找尾部起始点
+			tailStart := len(runes)
+			tailSize := 0
+			for i := len(runes) - 1; i >= 0; i-- {
+				tailSize += len(string(runes[i]))
+				if tailSize > tailBudget {
+					tailStart = i + 1
+					break
+				}
+			}
+
+			if headCut > 0 && tailStart < len(runes) {
+				omitted := totalRuneBytes - headSize - tailSize
+				result = string(runes[:headCut]) +
+					fmt.Sprintf("\n\n... [省略 %d 字节 / 原始大小: %d 字节] ...\n\n", omitted, totalRuneBytes) +
+					string(runes[tailStart:])
 			}
 		}
 	}

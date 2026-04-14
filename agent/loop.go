@@ -44,6 +44,7 @@ type Config struct {
 	APIKey   string
 	BaseURL  string
 	Model    string
+	MaxStep  int    // 最大工具调用步数（0 = 默认 25）
 }
 
 // Agent 核心 Agent，基于 Eino react agent
@@ -57,14 +58,20 @@ type Agent struct {
 	retryConfig       *RetryConfig // 重试 + Key 轮换配置（可选）
 	router            *ModelRouter // 智能模型路由器（可选）
 	skillLearner      *SkillLearner // 技能自学习引擎（可选）
+	maxStep           int          // 最大工具调用步数
 }
 
 // NewAgent 创建 Agent
 func NewAgent(cfg Config, registry *tools.Registry, memMgr *memory.Manager) *Agent {
+	maxStep := 25
+	if cfg.MaxStep > 0 {
+		maxStep = cfg.MaxStep
+	}
 	return &Agent{
 		cfg:      cfg,
 		registry: registry,
 		memMgr:   memMgr,
+		maxStep:  maxStep,
 	}
 }
 
@@ -137,7 +144,7 @@ func (a *Agent) buildReactAgent(ctx context.Context) (*react.Agent, error) {
 		ToolsConfig: compose.ToolsNodeConfig{
 			Tools: baseTools,
 		},
-		MaxStep: 10,
+		MaxStep: a.maxStep,
 		// 默认 firstChunkStreamToolCallChecker 只检查首个非空 chunk，
 		// 对于有 <think> 推理的模型（MiniMax、DeepSeek 等）会先输出
 		// content 再输出 tool_calls，导致工具调用被忽略。

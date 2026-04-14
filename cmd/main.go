@@ -152,7 +152,11 @@ func setupInfra(cfg *config.Config) *infra {
 		APIKey:   cfg.Agent.APIKey,
 		BaseURL:  cfg.Agent.BaseURL,
 		Model:    cfg.Agent.Model,
+		MaxStep:  cfg.Agent.MaxStep,
 	}
+
+	// 应用工具结果截断大小
+	tools.SetMaxToolResultBytes(cfg.Agent.ToolMaxBytes)
 
 	// 构建重试 + 凭证池配置
 	retryCfg := &agent.RetryConfig{MaxAttempts: 3}
