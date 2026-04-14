@@ -57,9 +57,16 @@ type HTTPServer struct {
 }
 
 type httpSession struct {
-	agent    *agent.Agent
-	memMgr   *memory.Manager
-	lastUsed time.Time
+	agent       *agent.Agent
+	memMgr      *memory.Manager
+	lastUsed    time.Time
+	tags        map[string]bool // 会话标签
+	annotations []sessionNote   // 会话备注
+}
+
+type sessionNote struct {
+	Text      string `json:"text"`
+	CreatedAt string `json:"created_at"`
 }
 
 // HTTPServerConfig HTTP API 服务器配置
@@ -191,6 +198,12 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/webhooks", s.handleAddWebhook)
 	mux.HandleFunc("DELETE /v1/webhooks", s.handleRemoveWebhook)
 	mux.HandleFunc("GET /v1/rate-limit", s.handleRateLimitStatus)
+	mux.HandleFunc("PUT /v1/sessions/{session}/tags", s.handleSetTags)
+	mux.HandleFunc("GET /v1/sessions/{session}/tags", s.handleGetTags)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/tags", s.handleDeleteTag)
+	mux.HandleFunc("POST /v1/sessions/{session}/annotate", s.handleAnnotateSession)
+	mux.HandleFunc("GET /v1/sessions/{session}/annotations", s.handleGetAnnotations)
+	mux.HandleFunc("POST /v1/batch/chat", s.handleBatchChat)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -599,23 +612,38 @@ func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
 // handleListSessions 列出所有活跃会话
 func (s *HTTPServer) handleListSessions(w http.ResponseWriter, r *http.Request) {
 	type sessionInfo struct {
-		ID          string `json:"id"`
-		MessageCount int   `json:"message_count"`
-		LastUsed    string `json:"last_used"`
-		IdleSeconds int    `json:"idle_seconds"`
+		ID           string   `json:"id"`
+		MessageCount int      `json:"message_count"`
+		LastUsed     string   `json:"last_used"`
+		IdleSeconds  int      `json:"idle_seconds"`
+		Tags         []string `json:"tags,omitempty"`
 	}
+
+	// 可选 tag 过滤：GET /v1/sessions?tag=xxx
+	filterTag := r.URL.Query().Get("tag")
 
 	var sessions []sessionInfo
 	s.sessions.Range(func(key, val any) bool {
 		id := key.(string)
 		sess := val.(*httpSession)
+
+		if filterTag != "" && (sess.tags == nil || !sess.tags[filterTag]) {
+			return true
+		}
+
 		idle := time.Since(sess.lastUsed)
-		sessions = append(sessions, sessionInfo{
+		info := sessionInfo{
 			ID:           id,
 			MessageCount: len(sess.agent.GetHistory()),
 			LastUsed:     sess.lastUsed.Format(time.RFC3339),
 			IdleSeconds:  int(idle.Seconds()),
-		})
+		}
+		if len(sess.tags) > 0 {
+			for t := range sess.tags {
+				info.Tags = append(info.Tags, t)
+			}
+		}
+		sessions = append(sessions, info)
 		return true
 	})
 
@@ -1469,6 +1497,217 @@ func (s *HTTPServer) saveSession(id string, sess *httpSession) {
 	if err := s.sessionStore.Save(snap); err != nil {
 		log.Printf("[HTTP] 保存会话失败 %s: %v", id, err)
 	}
+}
+
+// -------- Session Tags & Annotations --------
+
+// handleSetTags PUT /v1/sessions/{session}/tags — 添加标签
+func (s *HTTPServer) handleSetTags(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session")
+	val, ok := s.sessions.Load(sessionID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var req struct {
+		Tags []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if len(req.Tags) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tags is required"})
+		return
+	}
+
+	if sess.tags == nil {
+		sess.tags = make(map[string]bool)
+	}
+	for _, t := range req.Tags {
+		if t = strings.TrimSpace(t); t != "" {
+			sess.tags[t] = true
+		}
+	}
+
+	var tags []string
+	for t := range sess.tags {
+		tags = append(tags, t)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sessionID,
+		"tags":    tags,
+	})
+}
+
+// handleGetTags GET /v1/sessions/{session}/tags — 获取标签
+func (s *HTTPServer) handleGetTags(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session")
+	val, ok := s.sessions.Load(sessionID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var tags []string
+	for t := range sess.tags {
+		tags = append(tags, t)
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sessionID,
+		"tags":    tags,
+	})
+}
+
+// handleDeleteTag DELETE /v1/sessions/{session}/tags — 移除标签
+func (s *HTTPServer) handleDeleteTag(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session")
+	val, ok := s.sessions.Load(sessionID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var req struct {
+		Tag string `json:"tag"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Tag == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tag is required"})
+		return
+	}
+
+	delete(sess.tags, req.Tag)
+
+	var tags []string
+	for t := range sess.tags {
+		tags = append(tags, t)
+	}
+	if tags == nil {
+		tags = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sessionID,
+		"tags":    tags,
+	})
+}
+
+// handleAnnotateSession POST /v1/sessions/{session}/annotate — 添加会话备注
+func (s *HTTPServer) handleAnnotateSession(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session")
+	val, ok := s.sessions.Load(sessionID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var req struct {
+		Text string `json:"text"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || strings.TrimSpace(req.Text) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text is required"})
+		return
+	}
+
+	note := sessionNote{
+		Text:      strings.TrimSpace(req.Text),
+		CreatedAt: time.Now().Format(time.RFC3339),
+	}
+	sess.annotations = append(sess.annotations, note)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sessionID,
+		"count":   len(sess.annotations),
+		"note":    note,
+	})
+}
+
+// handleGetAnnotations GET /v1/sessions/{session}/annotations — 获取备注列表
+func (s *HTTPServer) handleGetAnnotations(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.PathValue("session")
+	val, ok := s.sessions.Load(sessionID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	notes := sess.annotations
+	if notes == nil {
+		notes = []sessionNote{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":     sessionID,
+		"count":       len(notes),
+		"annotations": notes,
+	})
+}
+
+// -------- Batch Operations --------
+
+// handleBatchChat POST /v1/batch/chat — 批量对多个会话发送消息
+func (s *HTTPServer) handleBatchChat(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sessions []string `json:"sessions"`
+		Message  string   `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if len(req.Sessions) == 0 || req.Message == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sessions and message are required"})
+		return
+	}
+	if len(req.Sessions) > 20 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 20 sessions per batch"})
+		return
+	}
+
+	type batchResult struct {
+		Session string `json:"session"`
+		Content string `json:"content,omitempty"`
+		Error   string `json:"error,omitempty"`
+	}
+
+	results := make([]batchResult, len(req.Sessions))
+	var wg sync.WaitGroup
+	for i, sid := range req.Sessions {
+		wg.Add(1)
+		go func(idx int, sessionID string) {
+			defer wg.Done()
+			ag := s.getOrCreateSession(sessionID)
+			s.chatCount.Add(1)
+			resp, err := ag.Run(r.Context(), req.Message)
+			if err != nil {
+				results[idx] = batchResult{Session: sessionID, Error: err.Error()}
+			} else {
+				results[idx] = batchResult{Session: sessionID, Content: resp}
+			}
+		}(i, sid)
+	}
+	wg.Wait()
+
+	succeeded := 0
+	for _, res := range results {
+		if res.Error == "" {
+			succeeded++
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total":     len(results),
+		"succeeded": succeeded,
+		"failed":    len(results) - succeeded,
+		"results":   results,
+	})
 }
 
 // -------- 工具函数 --------

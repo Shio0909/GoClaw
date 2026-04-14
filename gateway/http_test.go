@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -1238,5 +1239,214 @@ func TestRateLimitStatusEnabled(t *testing.T) {
 	}
 	if int(resp["window_seconds"].(float64)) != 60 {
 		t.Fatalf("expected window=60, got %v", resp["window_seconds"])
+	}
+}
+
+// ====== Session Tags Tests ======
+
+func TestSetAndGetTags(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/tags", srv.handleSetTags)
+	mux.HandleFunc("GET /v1/sessions/{session}/tags", srv.handleGetTags)
+
+	// 先创建会话
+	srv.getOrCreateSession("tag-test")
+
+	// 设置标签
+	body := `{"tags":["prod","important"]}`
+	req := httptest.NewRequest("PUT", "/v1/sessions/tag-test/tags", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// 获取标签
+	req = httptest.NewRequest("GET", "/v1/sessions/tag-test/tags", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	tags := resp["tags"].([]interface{})
+	if len(tags) != 2 {
+		t.Fatalf("expected 2 tags, got %d", len(tags))
+	}
+}
+
+func TestDeleteTag(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/tags", srv.handleSetTags)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/tags", srv.handleDeleteTag)
+
+	srv.getOrCreateSession("tag-del")
+
+	// 设置标签
+	body := `{"tags":["alpha","beta"]}`
+	req := httptest.NewRequest("PUT", "/v1/sessions/tag-del/tags", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// 删除一个
+	body = `{"tag":"alpha"}`
+	req = httptest.NewRequest("DELETE", "/v1/sessions/tag-del/tags", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	tags := resp["tags"].([]interface{})
+	if len(tags) != 1 {
+		t.Fatalf("expected 1 tag after delete, got %d", len(tags))
+	}
+}
+
+func TestTagsSessionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/tags", srv.handleGetTags)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexistent/tags", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestListSessionsFilterByTag(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/tags", srv.handleSetTags)
+	mux.HandleFunc("GET /v1/sessions", srv.handleListSessions)
+
+	// 创建两个会话，只给一个打标
+	srv.getOrCreateSession("s1")
+	srv.getOrCreateSession("s2")
+
+	body := `{"tags":["vip"]}`
+	req := httptest.NewRequest("PUT", "/v1/sessions/s1/tags", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// 按 tag 过滤
+	req = httptest.NewRequest("GET", "/v1/sessions?tag=vip", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	count := int(resp["count"].(float64))
+	if count != 1 {
+		t.Fatalf("expected 1 session with tag vip, got %d", count)
+	}
+}
+
+// ====== Session Annotations Tests ======
+
+func TestAnnotateAndGetAnnotations(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/annotate", srv.handleAnnotateSession)
+	mux.HandleFunc("GET /v1/sessions/{session}/annotations", srv.handleGetAnnotations)
+
+	srv.getOrCreateSession("note-test")
+
+	// 添加备注
+	body := `{"text":"This session is for testing"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/note-test/annotate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// 再加一条
+	body = `{"text":"Second note"}`
+	req = httptest.NewRequest("POST", "/v1/sessions/note-test/annotate", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// 获取备注
+	req = httptest.NewRequest("GET", "/v1/sessions/note-test/annotations", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	count := int(resp["count"].(float64))
+	if count != 2 {
+		t.Fatalf("expected 2 annotations, got %d", count)
+	}
+}
+
+func TestAnnotateEmptyText(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/annotate", srv.handleAnnotateSession)
+
+	srv.getOrCreateSession("note-empty")
+
+	body := `{"text":"  "}`
+	req := httptest.NewRequest("POST", "/v1/sessions/note-empty/annotate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestAnnotationsSessionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/annotations", srv.handleGetAnnotations)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/ghost/annotations", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ====== Batch Chat Tests ======
+
+func TestBatchChatMissingFields(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/batch/chat", srv.handleBatchChat)
+
+	body := `{"sessions":[],"message":"hi"}`
+	req := httptest.NewRequest("POST", "/v1/batch/chat", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestBatchChatTooManySessions(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/batch/chat", srv.handleBatchChat)
+
+	sessions := make([]string, 21)
+	for i := range sessions {
+		sessions[i] = fmt.Sprintf("s%d", i)
+	}
+	data, _ := json.Marshal(map[string]interface{}{
+		"sessions": sessions,
+		"message":  "test",
+	})
+	req := httptest.NewRequest("POST", "/v1/batch/chat", strings.NewReader(string(data)))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
 	}
 }
