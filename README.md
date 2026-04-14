@@ -25,28 +25,39 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~7000 行 Go（含测试） | — |
+| **代码量** | ~8000 行 Go（含测试） | — |
 
 ## 核心特性
 
 **Runtime 架构**
 - Gateway 接口：HTTP API / CLI / QQ 机器人，可扩展任意平台
 - `goclaw serve` — 启动 HTTP API + 所有 Gateway
-- `goclaw cli` — 交互式 CLI 模式
+- `goclaw cli` — 交互式 CLI 模式（含工具执行确认）
 - YAML 配置 + 环境变量回退，向后兼容
+- 结构化日志（slog，支持 JSON 格式，可配置级别）
 
 **Agent 能力**
 - 多 Provider：Claude、OpenAI、MiniMax、DeepSeek、SiliconFlow、Ollama
 - 智能路由：根据问题复杂度自动选择模型
 - MCP 协议：stdio / SSE / StreamableHTTP 三种传输
-- 17 个内置工具 + 无限 MCP 扩展
+- 20+ 内置工具 + 无限 MCP 扩展
 - 三层记忆：soul（人格）+ user（画像）+ memory（长期），自动提炼
 - 技能系统：Markdown 定义 + 自学习改进
+- 自定义 System Prompt：通过配置注入额外指令
+- 模型参数微调：temperature / max_tokens / reasoning_effort
 
 **生产可靠性**
 - 错误分类（7 类）+ 智能重试 + 凭证池 Key 轮换
+- 工具级自动重试（网络工具瞬时错误 3 次指数退避）
+- 危险工具确认（CLI 模式下 shell/file_write 等需用户确认）
 - 上下文压缩（裁剪→边界保护→LLM 摘要）
 - 沙箱安全 + 技能安装安全扫描
+
+**HTTP API**
+- 原生 REST API + SSE 流式
+- OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
+- CORS 跨域支持（可配置允许域名）
+- Bearer Token 认证 + 请求日志 + 可配置超时
 
 ## 项目结构
 
@@ -55,38 +66,46 @@ GoClaw/
 ├── cmd/main.go             # 入口：serve / cli / version 子命令
 ├── agent/
 │   ├── loop.go             # Eino ReAct Agent 封装（Run / RunStream）
-│   ├── prompt.go           # System Prompt 构建
+│   ├── prompt.go           # System Prompt 构建（记忆+工具+技能+行为指令）
 │   ├── compressor.go       # 三阶段上下文压缩
-│   ├── errors.go           # API 错误分类（7 类）
+│   ├── errors.go           # API 错误分类（7 类 + 重试决策）
 │   ├── retry.go            # 智能重试 + Key 轮换
-│   ├── credential_pool.go  # 多 Key 凭证池
-│   └── router.go           # 智能模型路由
+│   ├── credential_pool.go  # 多 Key 凭证池（3 种策略）
+│   ├── router.go           # 智能模型路由
+│   └── think_filter.go     # 思考过程过滤器
 ├── config/
-│   └── config.go           # YAML 配置 + 环境变量回退
+│   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API Server (REST + SSE)
-│   ├── qq.go               # QQ 机器人 (OneBot v11)
+│   ├── http.go             # HTTP API（REST + SSE + OpenAI 兼容 + CORS）
+│   ├── qq.go               # QQ 机器人 (OneBot v11 WebSocket)
 │   ├── qq_image.go         # 图片消息处理
 │   ├── qq_voice.go         # 语音消息处理 (STT)
 │   ├── qq_reply.go         # 引用回复
 │   └── qq_sticker.go       # 表情包系统
 ├── tools/
 │   ├── registry.go         # 工具注册表
-│   ├── builtins.go         # 17 个内置工具
+│   ├── builtins.go         # 内置工具注册（20+ 个工具）
+│   ├── confirm.go          # 危险工具确认系统
+│   ├── eino_adapter.go     # Eino 适配器 + 工具级重试 + 输出截断
 │   ├── mcp_bridge.go       # MCP Server 连接桥
-│   └── eino_adapter.go     # Eino InvokableTool 适配器
+│   ├── search.go           # grep_search + glob_search（正则/模式搜索）
+│   ├── git.go              # git_status / git_log / git_diff
+│   ├── web.go              # web_fetch + http_request（自动重试）
+│   ├── websearch.go        # Tavily 网络搜索（自动重试）
+│   ├── shell_security.go   # Shell 安全检查（危险命令拦截）
+│   └── sandbox.go          # 文件沙箱 + 路径验证
 ├── memory/
 │   ├── store.go            # 记忆文件读写
 │   ├── manager.go          # 记忆管理 + 自动提炼
 │   └── provider.go         # Provider 接口
+├── rag/                    # RAG 检索增强（接外部知识库）
 ├── skills/                 # 技能定义（Markdown）
-├── .github/workflows/      # CI/CD (lint + test + release)
+├── .github/workflows/      # CI/CD (lint + test + 4 平台编译)
 ├── Dockerfile              # 多阶段构建
 ├── docker-compose.yml      # 一键启动
 ├── Makefile                # build / test / lint / docker
-├── goclaw.example.yaml     # 配置示例
-└── goclaw.yaml             # 你的配置（不提交 git）
+└── goclaw.example.yaml     # 配置示例（完整注释）
 ```
 
 ## 快速开始
@@ -139,56 +158,102 @@ docker compose up -d
 
 ## HTTP API
 
-`goclaw serve` 启动 RESTful API，支持 SSE 流式输出。
+`goclaw serve` 启动 RESTful API，支持 SSE 流式输出和 OpenAI 兼容接口。
+
+### GoClaw 原生 API
 
 | 端点 | 方法 | 说明 |
 |------|------|------|
 | `/v1/chat` | POST | 发送消息（`stream: true` 启用 SSE） |
+| `/v1/chat/:session` | GET | 查看会话状态 |
 | `/v1/chat/:session` | DELETE | 清空会话 |
 | `/v1/tools` | GET | 列出可用工具 |
 | `/v1/memory/:session` | GET | 查看记忆状态 |
 | `/v1/health` | GET | 健康检查 |
 
-```bash
-# 非流式
-curl -X POST http://localhost:8080/v1/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "你好", "session_id": "test"}'
+### OpenAI 兼容 API
 
-# 流式 (SSE)
-curl -X POST http://localhost:8080/v1/chat \
-  -H "Content-Type: application/json" \
-  -d '{"message": "你好", "session_id": "test", "stream": true}'
+GoClaw 可以作为 OpenAI 的代理使用，兼容所有支持 OpenAI API 的客户端：
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/v1/chat/completions` | POST | OpenAI 格式的聊天补全（支持流式） |
+| `/v1/models` | GET | 列出可用模型 |
+
+```bash
+# 使用 OpenAI Python SDK 连接 GoClaw
+from openai import OpenAI
+client = OpenAI(base_url="http://localhost:8080/v1", api_key="your-token")
+
+response = client.chat.completions.create(
+    model="goclaw",
+    messages=[{"role": "user", "content": "你好"}],
+    stream=True  # 支持流式
+)
 ```
 
-配置 Bearer Token 认证：
+### 示例
+
+```bash
+# 原生 API - 非流式
+curl -X POST http://localhost:8080/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "你好", "session": "test"}'
+
+# 原生 API - 流式 (SSE)
+curl -X POST http://localhost:8080/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "你好", "session": "test", "stream": true}'
+
+# OpenAI 兼容 - 非流式
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "goclaw", "messages": [{"role": "user", "content": "你好"}]}'
+```
+
+### 配置
+
 ```yaml
-server:
-  listen: ":8080"
-  auth_token: ${GOCLAW_AUTH_TOKEN}
+gateways:
+  http:
+    api_token: ${GOCLAW_API_TOKEN}  # Bearer Token 认证（留空则无需认证）
+    cors_origins: ["*"]              # CORS 允许域名
+    session_timeout: 30              # 会话超时（分钟）
+    request_timeout: 300             # 请求超时（秒）
 ```
 
 ## 内置工具
 
-| 工具 | 说明 |
-|------|------|
-| `file_read` | 读取文件内容 |
-| `file_write` | 写入文件（受沙箱限制） |
-| `file_edit` | 精确替换文件中的文本（受沙箱限制） |
-| `file_append` | 追加内容到文件末尾（受沙箱限制） |
-| `list_dir` | 列出目录内容 |
-| `shell` | 执行 Shell 命令 |
-| `process_list` | 查看系统进程 |
-| `env` | 查看环境变量（自动隐藏敏感值） |
-| `web_fetch` | 抓取网页内容（自动提取纯文本） |
-| `http_request` | 发送 HTTP 请求（GET/POST） |
-| `web_search` | Tavily 网络搜索（需配置 API Key） |
-| `json_parse` | 解析和格式化 JSON |
-| `reminder` | 延时提醒 |
-| `skill_install` | 安装新技能（含安全扫描 + 预览确认） |
-| `skill_list` | 列出已安装的技能 |
-| `skill_update` | 更新技能内容（自动版本递增） |
-| `skill_delete` | 删除技能 |
+| 工具 | 说明 | 特性 |
+|------|------|------|
+| `file_read` | 读取文件内容 | |
+| `file_write` | 写入文件 | 🔒沙箱 ⚠️需确认 |
+| `file_edit` | 精确替换文件中的文本 | 🔒沙箱 ⚠️需确认 |
+| `file_append` | 追加内容到文件末尾 | 🔒沙箱 ⚠️需确认 |
+| `list_dir` | 列出目录内容（支持递归 + 深度控制） | |
+| `shell` | 执行 Shell 命令 | ⚠️需确认 🛡️安全检查 |
+| `process_list` | 查看系统进程 | ⚠️需确认 |
+| `grep_search` | 正则搜索文件内容 | |
+| `glob_search` | 按模式查找文件 | |
+| `git_status` | 查看 Git 仓库状态 | |
+| `git_log` | 查看 Git 提交历史 | |
+| `git_diff` | 查看 Git 文件差异 | |
+| `web_fetch` | 抓取网页内容（自动提取纯文本） | 🔄自动重试 |
+| `http_request` | 发送 HTTP 请求（GET/POST） | 🔄自动重试 |
+| `web_search` | Tavily 网络搜索 | 🔄自动重试 |
+| `json_parse` | 解析和格式化 JSON | |
+| `env` | 查看环境变量（自动隐藏敏感值） | |
+| `reminder` | 延时提醒 | |
+| `skill_install` | 安装新技能（含安全扫描 + 预览确认） | ⚠️需确认 |
+| `skill_list` | 列出已安装的技能 | |
+| `skill_update` | 更新技能内容（自动版本递增） | |
+| `skill_delete` | 删除技能 | |
+| `mcp_install` | 动态安装 MCP Server | ⚠️需确认 |
+| `mcp_search` | 搜索可用 MCP Server | |
+
+⚠️ **需确认** = CLI 模式下执行前需要用户确认，HTTP 模式自动通过
+🔄 **自动重试** = 遇到网络错误/超时自动重试 3 次（指数退避）
+🔒 **沙箱** = 受沙箱目录限制
 
 通过 `mcp_servers.json` 还可以接入任意 MCP Server 扩展工具（见下方 MCP 章节）。
 
@@ -396,28 +461,32 @@ make run         # CLI 模式运行
 
 GoClaw 基于 Eino 框架的 ReAct Agent 模式：
 
-1. 用户输入 → 构建 System Prompt（记忆 + 工具描述 + 技能 + 行为指令）
+1. 用户输入 → 构建 System Prompt（记忆 + 工具描述 + 技能 + 用户自定义指令）
 2. 智能路由判断问题复杂度，选择合适的模型
-3. Eino ReAct Agent 自动管理 LLM ↔ 工具调用循环（最多 10 步）
+3. Eino ReAct Agent 自动管理 LLM ↔ 工具调用循环（最多 25 步，可配置）
 4. 工具通过 `ToolDef` → `EinoTool` 适配器桥接到 Eino 的 `InvokableTool` 接口
-5. MCP Server 工具通过 `MCPBridge` 动态注册
-6. 错误自动分类 + 重试 + Key 轮换
-7. 上下文过长时自动三阶段压缩
+5. 危险工具执行前通过 `ConfirmFunc` 回调请求确认
+6. 网络工具自动重试（瞬时错误检测 + 指数退避）
+7. MCP Server 工具通过 `MCPBridge` 动态注册
+8. 错误自动分类 + 重试 + Key 轮换
+9. 上下文过长时自动三阶段压缩
 
 ```
 用户输入 (HTTP / CLI / QQ)
   ↓
-Gateway 接口路由
+Gateway 接口路由 (CORS + 认证 + 请求日志)
   ↓
-BuildSystemPrompt (memory + tools + skills)
+BuildSystemPrompt (memory + tools + skills + custom prompt)
   ↓
 ModelRouter (复杂度分类 → 选择模型)
   ↓
 Eino ReAct Agent
-  ↓ ←→ Tool Calls (17 内置 + MCP)
+  ↓ ←→ Tool Calls (20+ 内置 + MCP)
+  ↓ ←→ Confirmation (CLI 模式危险工具确认)
+  ↓ ←→ Tool Retry (网络工具自动重试)
   ↓ ←→ Error Recovery (retry + key rotation + compress)
   ↓
-流式输出 → Gateway 回复
+流式输出 (Think 过滤) → Gateway 回复
 ```
 
 ## 部署
