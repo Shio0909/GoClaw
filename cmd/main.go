@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"log/slog"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -18,6 +17,7 @@ import (
 	"github.com/goclaw/goclaw/agent"
 	"github.com/goclaw/goclaw/config"
 	"github.com/goclaw/goclaw/gateway"
+	"github.com/goclaw/goclaw/logger"
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/rag"
 	"github.com/goclaw/goclaw/tools"
@@ -105,34 +105,16 @@ func main() {
 }
 
 // initLogging 初始化结构化日志（slog）
-// 设置 slog 为默认 logger，所有现有 log.Printf 调用自动受益
+// 使用 logger 包统一配置，所有现有 log.Printf 调用自动路由到 slog
 func initLogging(level string, jsonFormat bool) {
-	var slogLevel slog.Level
-	switch strings.ToLower(level) {
-	case "debug":
-		slogLevel = slog.LevelDebug
-	case "warn", "warning":
-		slogLevel = slog.LevelWarn
-	case "error":
-		slogLevel = slog.LevelError
-	default:
-		slogLevel = slog.LevelInfo
-	}
-
-	opts := &slog.HandlerOptions{Level: slogLevel}
-
-	var handler slog.Handler
+	format := "text"
 	if jsonFormat {
-		handler = slog.NewJSONHandler(os.Stderr, opts)
-	} else {
-		handler = slog.NewTextHandler(os.Stderr, opts)
+		format = "json"
 	}
-
-	logger := slog.New(handler)
-	slog.SetDefault(logger)
-
-	// Bridge stdlib log to slog so all existing log.Printf calls use structured output
-	slog.SetLogLoggerLevel(slogLevel)
+	logger.Init(logger.Config{
+		Level:  level,
+		Format: format,
+	})
 }
 
 // infra 共享基础设施
