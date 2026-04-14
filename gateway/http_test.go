@@ -282,6 +282,55 @@ func TestRequestLogMiddleware(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200, got %d", w.Code)
 	}
+	// Should generate X-Request-ID when not provided
+	xrid := w.Header().Get("X-Request-ID")
+	if xrid == "" {
+		t.Error("expected X-Request-ID in response header")
+	}
+	if !strings.HasPrefix(xrid, "goclaw-") {
+		t.Errorf("auto-generated X-Request-ID should start with goclaw-, got %s", xrid)
+	}
+}
+
+func TestRequestIDPassthrough(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+	handler := srv.withRequestLog(inner)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	req.Header.Set("X-Request-ID", "custom-trace-abc123")
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	xrid := w.Header().Get("X-Request-ID")
+	if xrid != "custom-trace-abc123" {
+		t.Errorf("expected passthrough X-Request-ID, got %s", xrid)
+	}
+}
+
+func TestHealthEndpointEnhanced(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.fallbackCfg = &agent.FallbackConfig{Model: "gpt-4o-mini", Provider: "openai"}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/health", srv.handleHealth)
+
+	req := httptest.NewRequest("GET", "/v1/health", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if _, ok := resp["uptime_seconds"]; !ok {
+		t.Error("expected uptime_seconds in health response")
+	}
+	if _, ok := resp["active_sessions"]; !ok {
+		t.Error("expected active_sessions in health response")
+	}
+	if resp["fallback_model"] != "gpt-4o-mini" {
+		t.Errorf("expected fallback_model gpt-4o-mini, got %v", resp["fallback_model"])
+	}
 }
 
 func TestChatCompletionsValidation(t *testing.T) {

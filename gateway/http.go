@@ -243,14 +243,19 @@ func (s *HTTPServer) withCORS(next http.Handler) http.Handler {
 	})
 }
 
-// withRequestLog 记录每个请求的方法、路径和耗时
+// withRequestLog 记录每个请求的方法、路径和耗时，并注入 X-Request-ID
 func (s *HTTPServer) withRequestLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reqID := requestCounter.Add(1)
+		xRequestID := r.Header.Get("X-Request-ID")
+		if xRequestID == "" {
+			xRequestID = fmt.Sprintf("goclaw-%d-%d", s.startedAt.Unix(), reqID)
+		}
+		w.Header().Set("X-Request-ID", xRequestID)
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, status: 200}
 		next.ServeHTTP(rw, r)
-		log.Printf("[HTTP] #%d %s %s → %d (%v)", reqID, r.Method, r.URL.Path, rw.status, time.Since(start).Round(time.Millisecond))
+		log.Printf("[HTTP] #%d %s %s %s → %d (%v)", reqID, xRequestID, r.Method, r.URL.Path, rw.status, time.Since(start).Round(time.Millisecond))
 	})
 }
 
@@ -441,13 +446,32 @@ func (s *HTTPServer) handleGetMemory(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"status":   "ok",
-		"gateway":  s.Name(),
-		"provider": s.agentCfg.Provider,
-		"model":    s.agentCfg.Model,
-		"tools":    len(s.registry.Names()),
+	sessionCount := 0
+	s.sessions.Range(func(_, _ any) bool {
+		sessionCount++
+		return true
 	})
+
+	resp := map[string]interface{}{
+		"status":          "ok",
+		"gateway":         s.Name(),
+		"provider":        s.agentCfg.Provider,
+		"model":           s.agentCfg.Model,
+		"tools":           len(s.registry.Names()),
+		"uptime_seconds":  int(time.Since(s.startedAt).Seconds()),
+		"active_sessions": sessionCount,
+		"total_chats":     s.chatCount.Load(),
+	}
+	if s.fallbackCfg != nil && s.fallbackCfg.Model != "" {
+		resp["fallback_model"] = s.fallbackCfg.Model
+	}
+	if s.rateLimiter != nil {
+		resp["rate_limit_enabled"] = true
+	}
+	if s.ragMgr != nil {
+		resp["rag_enabled"] = true
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *HTTPServer) handleMetrics(w http.ResponseWriter, r *http.Request) {
