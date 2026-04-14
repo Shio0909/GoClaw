@@ -2,7 +2,9 @@ package tools
 
 import (
 	"context"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestRegistryBasic(t *testing.T) {
@@ -54,5 +56,71 @@ func TestRegistryBasic(t *testing.T) {
 	names := r.Names()
 	if len(names) != 1 || names[0] != "test_tool" {
 		t.Fatalf("expected [test_tool], got %v", names)
+	}
+}
+
+func TestToolTimeout(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&ToolDef{
+		Name:        "slow_tool",
+		Description: "Takes too long",
+		Timeout:     50 * time.Millisecond,
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			select {
+			case <-time.After(5 * time.Second):
+				return "done", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	})
+
+	_, err := r.Execute(context.Background(), "slow_tool", nil)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if !strings.Contains(err.Error(), "deadline exceeded") {
+		t.Errorf("expected deadline exceeded, got: %v", err)
+	}
+}
+
+func TestDefaultTimeout(t *testing.T) {
+	r := NewRegistry()
+	r.SetDefaultTimeout(50 * time.Millisecond)
+	r.Register(&ToolDef{
+		Name: "no_timeout_tool",
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			select {
+			case <-time.After(5 * time.Second):
+				return "done", nil
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		},
+	})
+
+	_, err := r.Execute(context.Background(), "no_timeout_tool", nil)
+	if err == nil {
+		t.Fatal("expected timeout error from default timeout")
+	}
+}
+
+func TestToolTimeoutOverridesDefault(t *testing.T) {
+	r := NewRegistry()
+	r.SetDefaultTimeout(1 * time.Millisecond)
+	r.Register(&ToolDef{
+		Name:    "fast_tool",
+		Timeout: 2 * time.Second,
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			return "ok", nil
+		},
+	})
+
+	result, err := r.Execute(context.Background(), "fast_tool", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result != "ok" {
+		t.Errorf("expected ok, got %s", result)
 	}
 }

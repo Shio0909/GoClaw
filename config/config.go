@@ -46,6 +46,7 @@ type AgentConfig struct {
 	Temperature   *float32 `yaml:"temperature"`     // 采样温度（nil = 使用模型默认值）
 	MaxTokens     int      `yaml:"max_tokens"`      // 最大输出 token 数（0 = 使用模型默认值）
 	ReasoningEffort string `yaml:"reasoning_effort"` // 推理力度: low, medium, high（仅 o1/o3 等推理模型）
+	ToolTimeout     int    `yaml:"tool_timeout"`     // 工具执行默认超时秒数（0 = 无限制）
 }
 
 type GatewayConfig struct {
@@ -164,6 +165,7 @@ func applyEnvFallback(cfg *Config) {
 	envInt(&cfg.Agent.MaxTokens, "GOCLAW_MAX_TOKENS")
 	envInt(&cfg.Agent.MaxStep, "GOCLAW_MAX_STEP")
 	envInt(&cfg.Agent.ToolMaxBytes, "GOCLAW_TOOL_MAX_BYTES")
+	envInt(&cfg.Agent.ToolTimeout, "GOCLAW_TOOL_TIMEOUT")
 
 	// Provider-specific API keys
 	if cfg.Agent.APIKey == "" {

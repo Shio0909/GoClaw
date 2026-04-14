@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/goclaw/goclaw/agent"
 	"github.com/goclaw/goclaw/config"
@@ -143,6 +144,9 @@ func setupInfra(cfg *config.Config) *infra {
 	tools.InitSandbox()
 	registry := tools.NewRegistry()
 	tools.RegisterBuiltins(registry)
+	if cfg.Agent.ToolTimeout > 0 {
+		registry.SetDefaultTimeout(time.Duration(cfg.Agent.ToolTimeout) * time.Second)
+	}
 
 	// 设置技能目录
 	agent.SkillsDir = cfg.Tools.SkillsDir

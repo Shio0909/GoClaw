@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"sync"
+	"time"
 )
 
 // ToolFunc 是工具的执行函数签名
@@ -15,7 +16,8 @@ type ToolDef struct {
 	Description string
 	Parameters  []ParamDef
 	Fn          ToolFunc
-	Retryable   bool // 是否对瞬时错误自动重试（适用于网络工具等）
+	Retryable   bool          // 是否对瞬时错误自动重试（适用于网络工具等）
+	Timeout     time.Duration // 执行超时（0 表示无限制）
 }
 
 // ParamDef 定义工具参数
@@ -28,9 +30,10 @@ type ParamDef struct {
 
 // Registry 工具注册中心
 type Registry struct {
-	mu        sync.RWMutex
-	tools     map[string]*ToolDef
-	mcpBridge *MCPBridge
+	mu             sync.RWMutex
+	tools          map[string]*ToolDef
+	mcpBridge      *MCPBridge
+	defaultTimeout time.Duration // 全局默认超时
 }
 
 // NewRegistry 创建工具注册中心
@@ -38,6 +41,13 @@ func NewRegistry() *Registry {
 	return &Registry{
 		tools: make(map[string]*ToolDef),
 	}
+}
+
+// SetDefaultTimeout 设置全局默认超时（对没有设置 Timeout 的工具生效）
+func (r *Registry) SetDefaultTimeout(d time.Duration) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.defaultTimeout = d
 }
 
 // Register 注册一个工具
@@ -55,13 +65,26 @@ func (r *Registry) Get(name string) (*ToolDef, bool) {
 	return t, ok
 }
 
-// Execute 执行工具
+// Execute 执行工具，自动应用超时配置
 func (r *Registry) Execute(ctx context.Context, name string, args map[string]interface{}) (string, error) {
 	tool, ok := r.Get(name)
 	if !ok {
 		return "", fmt.Errorf("tool not found: %s", name)
 	}
-	return tool.Fn(ctx, args)
+
+	// 全局默认超时
+	execCtx := ctx
+	timeout := tool.Timeout
+	if timeout == 0 && r.defaultTimeout > 0 {
+		timeout = r.defaultTimeout
+	}
+	if timeout > 0 {
+		var cancel context.CancelFunc
+		execCtx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	return tool.Fn(execCtx, args)
 }
 
 // Names 返回所有已注册工具的名称列表
