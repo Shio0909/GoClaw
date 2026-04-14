@@ -52,6 +52,8 @@ type HTTPServer struct {
 	configPath     string        // 配置文件路径（用于热重载）
 	auditLog       *audit.Log   // 审计日志
 	webhookMgr     *webhook.Manager // Webhook 管理器
+	disabledTools  sync.Map         // toolName -> bool，运行时禁用的工具
+	endpointStats  sync.Map         // endpoint -> *endpointStat，端点延迟统计
 
 	server *http.Server
 }
@@ -67,6 +69,12 @@ type httpSession struct {
 type sessionNote struct {
 	Text      string `json:"text"`
 	CreatedAt string `json:"created_at"`
+}
+
+type endpointStat struct {
+	calls   atomic.Int64
+	totalMs atomic.Int64
+	errors  atomic.Int64
 }
 
 // HTTPServerConfig HTTP API 服务器配置
@@ -207,6 +215,10 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/admin/gc", s.handleAdminGC)
 	mux.HandleFunc("GET /v1/analytics", s.handleAnalytics)
 	mux.HandleFunc("GET /v1/health/deep", s.handleDeepHealth)
+	mux.HandleFunc("POST /v1/tools/{name}/disable", s.handleDisableTool)
+	mux.HandleFunc("POST /v1/tools/{name}/enable", s.handleEnableTool)
+	mux.HandleFunc("GET /v1/tools/disabled", s.handleListDisabledTools)
+	mux.HandleFunc("GET /v1/latency", s.handleLatencyStats)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -318,7 +330,19 @@ func (s *HTTPServer) withRequestLog(next http.Handler) http.Handler {
 		start := time.Now()
 		rw := &responseWriter{ResponseWriter: w, status: 200}
 		next.ServeHTTP(rw, r)
-		log.Printf("[HTTP] #%d %s %s %s → %d (%v)", reqID, xRequestID, r.Method, r.URL.Path, rw.status, time.Since(start).Round(time.Millisecond))
+
+		elapsed := time.Since(start)
+		log.Printf("[HTTP] #%d %s %s %s → %d (%v)", reqID, xRequestID, r.Method, r.URL.Path, rw.status, elapsed.Round(time.Millisecond))
+
+		// 端点延迟统计
+		key := r.Method + " " + r.URL.Path
+		val, _ := s.endpointStats.LoadOrStore(key, &endpointStat{})
+		stat := val.(*endpointStat)
+		stat.calls.Add(1)
+		stat.totalMs.Add(elapsed.Milliseconds())
+		if rw.status >= 400 {
+			stat.errors.Add(1)
+		}
 	})
 }
 
@@ -489,12 +513,14 @@ func (s *HTTPServer) handleListTools(w http.ResponseWriter, r *http.Request) {
 	type toolInfo struct {
 		Name        string `json:"name"`
 		Description string `json:"description,omitempty"`
+		Disabled    bool   `json:"disabled,omitempty"`
 	}
 	toolList := make([]toolInfo, 0, len(names))
 	for _, name := range names {
 		t, _ := s.registry.Get(name)
 		if t != nil {
-			toolList = append(toolList, toolInfo{Name: t.Name, Description: t.Description})
+			_, disabled := s.disabledTools.Load(name)
+			toolList = append(toolList, toolInfo{Name: t.Name, Description: t.Description, Disabled: disabled})
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"tools": toolList, "count": len(toolList)})
@@ -1878,6 +1904,89 @@ func (s *HTTPServer) handleDeepHealth(w http.ResponseWriter, r *http.Request) {
 		"status":         overall,
 		"checks":         checks,
 		"uptime_seconds": int(time.Since(s.startedAt).Seconds()),
+	})
+}
+
+// -------- Tool Management --------
+
+// handleDisableTool POST /v1/tools/{name}/disable — 运行时禁用工具
+func (s *HTTPServer) handleDisableTool(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, ok := s.registry.Get(name); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool not found: " + name})
+		return
+	}
+	s.disabledTools.Store(name, true)
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, "", "tool disabled: "+name, clientIP(r), nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "tool disabled", "tool": name})
+}
+
+// handleEnableTool POST /v1/tools/{name}/enable — 重新启用工具
+func (s *HTTPServer) handleEnableTool(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, ok := s.registry.Get(name); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool not found: " + name})
+		return
+	}
+	s.disabledTools.Delete(name)
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, "", "tool enabled: "+name, clientIP(r), nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"message": "tool enabled", "tool": name})
+}
+
+// handleListDisabledTools GET /v1/tools/disabled — 列出禁用的工具
+func (s *HTTPServer) handleListDisabledTools(w http.ResponseWriter, r *http.Request) {
+	var disabled []string
+	s.disabledTools.Range(func(key, _ any) bool {
+		disabled = append(disabled, key.(string))
+		return true
+	})
+	if disabled == nil {
+		disabled = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"disabled": disabled,
+		"count":    len(disabled),
+	})
+}
+
+// -------- Latency Stats --------
+
+// handleLatencyStats GET /v1/latency — 端点延迟统计
+func (s *HTTPServer) handleLatencyStats(w http.ResponseWriter, r *http.Request) {
+	type latencyEntry struct {
+		Endpoint string  `json:"endpoint"`
+		Calls    int64   `json:"calls"`
+		Errors   int64   `json:"errors"`
+		AvgMs    float64 `json:"avg_ms"`
+	}
+
+	var entries []latencyEntry
+	s.endpointStats.Range(func(key, val any) bool {
+		stat := val.(*endpointStat)
+		calls := stat.calls.Load()
+		avgMs := 0.0
+		if calls > 0 {
+			avgMs = float64(stat.totalMs.Load()) / float64(calls)
+		}
+		entries = append(entries, latencyEntry{
+			Endpoint: key.(string),
+			Calls:    calls,
+			Errors:   stat.errors.Load(),
+			AvgMs:    avgMs,
+		})
+		return true
+	})
+
+	if entries == nil {
+		entries = []latencyEntry{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"endpoints": entries,
+		"count":     len(entries),
 	})
 }
 

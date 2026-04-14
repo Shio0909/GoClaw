@@ -1604,3 +1604,147 @@ func TestDeepHealthNoAPIKey(t *testing.T) {
 		t.Fatal("expected model_config check with warning status")
 	}
 }
+
+// ====== Tool Enable/Disable Tests ======
+
+func TestDisableAndEnableTool(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.registry.Register(&tools.ToolDef{Name: "test_tool", Description: "test"})
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/{name}/disable", srv.handleDisableTool)
+	mux.HandleFunc("POST /v1/tools/{name}/enable", srv.handleEnableTool)
+	mux.HandleFunc("GET /v1/tools/disabled", srv.handleListDisabledTools)
+	mux.HandleFunc("GET /v1/tools", srv.handleListTools)
+
+	// Disable
+	req := httptest.NewRequest("POST", "/v1/tools/test_tool/disable", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// Check disabled list
+	req = httptest.NewRequest("GET", "/v1/tools/disabled", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if int(resp["count"].(float64)) != 1 {
+		t.Fatalf("expected 1 disabled, got %v", resp["count"])
+	}
+
+	// Check tools list shows disabled flag
+	req = httptest.NewRequest("GET", "/v1/tools", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	toolsList := resp["tools"].([]interface{})
+	found := false
+	for _, tl := range toolsList {
+		tm := tl.(map[string]interface{})
+		if tm["name"] == "test_tool" && tm["disabled"] == true {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected test_tool to show disabled=true")
+	}
+
+	// Enable
+	req = httptest.NewRequest("POST", "/v1/tools/test_tool/enable", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// Check disabled list is empty
+	req = httptest.NewRequest("GET", "/v1/tools/disabled", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if int(resp["count"].(float64)) != 0 {
+		t.Fatalf("expected 0 disabled after enable, got %v", resp["count"])
+	}
+}
+
+func TestDisableToolNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/{name}/disable", srv.handleDisableTool)
+
+	req := httptest.NewRequest("POST", "/v1/tools/nonexistent/disable", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ====== Latency Stats Tests ======
+
+func TestLatencyStatsEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/latency", srv.handleLatencyStats)
+
+	req := httptest.NewRequest("GET", "/v1/latency", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if int(resp["count"].(float64)) != 0 {
+		t.Fatalf("expected 0 endpoints, got %v", resp["count"])
+	}
+}
+
+func TestLatencyStatsRecorded(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.startedAt = time.Now()
+
+	// 注册完整中间件链 + 端点
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/health", srv.handleHealth)
+	mux.HandleFunc("GET /v1/latency", srv.handleLatencyStats)
+	handler := srv.withRequestLog(mux)
+
+	// 发几个请求
+	for i := 0; i < 3; i++ {
+		req := httptest.NewRequest("GET", "/v1/health", nil)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, req)
+	}
+
+	// 查看延迟统计
+	req := httptest.NewRequest("GET", "/v1/latency", nil)
+	w := httptest.NewRecorder()
+	handler.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	endpoints := resp["endpoints"].([]interface{})
+	if len(endpoints) == 0 {
+		t.Fatal("expected at least 1 endpoint in latency stats")
+	}
+
+	// 找到 health 端点
+	found := false
+	for _, ep := range endpoints {
+		em := ep.(map[string]interface{})
+		if em["endpoint"] == "GET /v1/health" {
+			if int(em["calls"].(float64)) != 3 {
+				t.Fatalf("expected 3 calls, got %v", em["calls"])
+			}
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("expected GET /v1/health in latency stats")
+	}
+}
