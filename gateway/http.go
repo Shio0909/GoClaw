@@ -170,6 +170,7 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)
 	mux.HandleFunc("POST /v1/sessions/{session}/fork", s.handleForkSession)
 	mux.HandleFunc("GET /v1/config", s.handleGetConfig)
+	mux.HandleFunc("GET /v1/openapi.json", s.handleOpenAPISpec)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
