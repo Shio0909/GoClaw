@@ -1,148 +1,171 @@
 # GoClaw
 
-Go 语言构建的轻量级 AI 助手，灵感来自 [OpenClaw](https://github.com/anthropics/claude-code) 和 [Hermes Agent](https://github.com/nousresearch/hermes-agent)。支持 CLI 交互和 QQ 机器人两种模式，内置文件操作、Shell 执行、网络搜索等工具，具备三层记忆系统、可扩展的技能框架和生产级可靠性。
+**轻量级 Go AI Agent Runtime** — 单二进制、<30MB 内存、即插即用的 AI Agent 引擎。
 
-基于 [Eino](https://github.com/cloudwego/eino)（字节跳动开源 AI 应用框架）的 ReAct Agent 实现，支持 Claude、OpenAI、MiniMax、DeepSeek、SiliconFlow 等任意 OpenAI 兼容 API。
+[![CI](https://github.com/Shio0909/GoClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/Shio0909/GoClaw/actions/workflows/ci.yml)
 
-## 为什么用 Go？
+灵感来自 [Claude Code](https://github.com/anthropics/claude-code) 和 [Hermes Agent](https://github.com/nousresearch/hermes-agent)，基于 [Eino](https://github.com/cloudwego/eino)（字节跳动 AI 框架）的 ReAct Agent 实现。
 
-同类项目（Claude Code、OpenClaw、Aider）大多基于 TypeScript/Python，GoClaw 选择 Go 是因为：
+```
+               ┌─────────────────────────────────┐
+               │         GoClaw Runtime           │
+               │                                  │
+  HTTP API ──→ │  ┌──────┐  ┌──────┐  ┌────────┐ │
+  CLI      ──→ │  │Agent │──│Tools │──│Memory  │ │
+  QQ Bot   ──→ │  │Loop  │  │17+MCP│  │3-Layer │ │
+  (扩展)   ──→ │  └──────┘  └──────┘  └────────┘ │
+               └─────────────────────────────────┘
+```
 
-- **单二进制部署**：`go build` 一次编译，产出一个可执行文件，不需要 Node.js/Python 运行时，不需要 `npm install` 或 `pip install`，复制到服务器直接跑
-- **极低资源占用**：GoClaw 进程本身运行时内存约 20-30MB（对比 Node.js 项目通常 150MB+），适合部署在 2C2G 的小服务器上
-- **快速启动**：冷启动 < 100ms，没有解释器预热、没有依赖加载
-- **交叉编译**：一行命令编译 Linux/macOS/Windows/ARM，不需要目标机器上安装任何东西
-- **~5000 行代码**：整个项目约 5000 行 Go 代码（含测试），结构清晰，易于理解和二次开发
+## 为什么选择 GoClaw
 
-## 特性
+| | GoClaw | Node.js/Python 方案 |
+|---|---|---|
+| **部署** | 单二进制，复制即跑 | npm install / pip install + 运行时 |
+| **内存** | ~20-30MB | 150MB+ |
+| **启动** | <100ms | 数秒 |
+| **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
+| **代码量** | ~7000 行 Go（含测试） | — |
 
-- **双模式运行**：CLI 交互（流式输出）+ QQ 机器人（OneBot v11）
-- **多模型支持**：Claude、OpenAI、MiniMax、DeepSeek、SiliconFlow、豆包、Ollama 等任意 OpenAI 兼容 API
-- **智能路由**：根据问题复杂度自动选择模型（简单→便宜模型，复杂→强力模型）
-- **内置工具链**：文件读写编辑、Shell 命令、进程管理、网页抓取、HTTP 请求、JSON 解析、定时提醒、Tavily 搜索
-- **MCP 协议**：通过 `mcp_servers.json` 接入任意 MCP Server，动态扩展工具
-- **三层记忆**：人格定义（soul）+ 用户画像（user）+ 长期记忆（memory），自动从对话中提炼
-- **技能系统**：文件夹式技能定义，YAML frontmatter + Markdown 指令，支持自改进
-- **上下文压缩**：三阶段上下文压缩（裁剪→边界保护→LLM摘要），防止对话过长溢出
-- **生产级可靠性**：指数退避重连、心跳检测、消息去重、发送限流、优雅关闭
-- **错误恢复**：API 错误分类（7类）+ 智能重试 + 凭证池 Key 轮换
-- **沙箱安全**：文件写入操作限制在指定目录内，技能安装内容安全扫描，读取不受限
+## 核心特性
+
+**Runtime 架构**
+- Gateway 接口：HTTP API / CLI / QQ 机器人，可扩展任意平台
+- `goclaw serve` — 启动 HTTP API + 所有 Gateway
+- `goclaw cli` — 交互式 CLI 模式
+- YAML 配置 + 环境变量回退，向后兼容
+
+**Agent 能力**
+- 多 Provider：Claude、OpenAI、MiniMax、DeepSeek、SiliconFlow、Ollama
+- 智能路由：根据问题复杂度自动选择模型
+- MCP 协议：stdio / SSE / StreamableHTTP 三种传输
+- 17 个内置工具 + 无限 MCP 扩展
+- 三层记忆：soul（人格）+ user（画像）+ memory（长期），自动提炼
+- 技能系统：Markdown 定义 + 自学习改进
+
+**生产可靠性**
+- 错误分类（7 类）+ 智能重试 + 凭证池 Key 轮换
+- 上下文压缩（裁剪→边界保护→LLM 摘要）
+- 沙箱安全 + 技能安装安全扫描
 
 ## 项目结构
 
 ```
 GoClaw/
-├── cmd/main.go          # 入口：CLI 模式 + QQ 机器人模式
+├── cmd/main.go             # 入口：serve / cli / version 子命令
 ├── agent/
-│   ├── loop.go          # Eino ReAct Agent 封装（Run / RunStream）
-│   ├── prompt.go        # System Prompt 构建（记忆 + 工具 + 技能 + 指令）
-│   ├── compressor.go    # 三阶段上下文压缩
-│   ├── errors.go        # API 错误分类（7 类）
-│   ├── retry.go         # 智能重试 + Key 轮换
-│   ├── credential_pool.go # 多 Key 凭证池管理
-│   └── router.go        # 智能模型路由（复杂度分类）
-├── tools/
-│   ├── registry.go      # 工具注册表
-│   ├── builtins.go      # 内置工具注册入口
-│   ├── file_ops.go      # file_edit, file_append
-│   ├── system.go        # process_list, reminder, env, json_parse
-│   ├── web.go           # web_fetch, http_request
-│   ├── websearch.go     # Tavily 网络搜索
-│   ├── skill_install.go # 技能安装（含安全扫描）
-│   ├── skill_tools.go   # 技能自改进（list/update/delete）
-│   ├── sandbox.go       # 沙箱路径检查
-│   ├── eino_adapter.go  # ToolDef → Eino InvokableTool 适配器
-│   └── mcp_bridge.go    # MCP Server 连接桥
-├── memory/
-│   ├── store.go         # 记忆文件读写（soul/user/memory + JSONL 日志）
-│   ├── manager.go       # 记忆管理（上下文构建 + 自动提炼）
-│   └── provider.go      # Provider 接口定义
+│   ├── loop.go             # Eino ReAct Agent 封装（Run / RunStream）
+│   ├── prompt.go           # System Prompt 构建
+│   ├── compressor.go       # 三阶段上下文压缩
+│   ├── errors.go           # API 错误分类（7 类）
+│   ├── retry.go            # 智能重试 + Key 轮换
+│   ├── credential_pool.go  # 多 Key 凭证池
+│   └── router.go           # 智能模型路由
+├── config/
+│   └── config.go           # YAML 配置 + 环境变量回退
 ├── gateway/
-│   ├── qq.go            # QQ 机器人网关（OneBot v11 WebSocket）
-│   ├── qq_image.go      # 图片消息处理
-│   ├── qq_voice.go      # 语音消息处理（STT 转文字）
-│   ├── qq_reply.go      # 引用回复 + API 请求-响应
-│   └── qq_sticker.go    # 表情包系统
-├── skills/              # 技能定义（文件夹格式）
-│   ├── scaffold/SKILL.md
-│   ├── code_review/SKILL.md
-│   └── daily_brief/SKILL.md
-├── memory_data/         # 运行时记忆数据（不提交到 git）
-├── .env.example         # 环境变量模板
-├── mcp_servers.json     # MCP Server 配置
-└── build.sh             # 交叉编译脚本
+│   ├── gateway.go          # Gateway 接口定义
+│   ├── http.go             # HTTP API Server (REST + SSE)
+│   ├── qq.go               # QQ 机器人 (OneBot v11)
+│   ├── qq_image.go         # 图片消息处理
+│   ├── qq_voice.go         # 语音消息处理 (STT)
+│   ├── qq_reply.go         # 引用回复
+│   └── qq_sticker.go       # 表情包系统
+├── tools/
+│   ├── registry.go         # 工具注册表
+│   ├── builtins.go         # 17 个内置工具
+│   ├── mcp_bridge.go       # MCP Server 连接桥
+│   └── eino_adapter.go     # Eino InvokableTool 适配器
+├── memory/
+│   ├── store.go            # 记忆文件读写
+│   ├── manager.go          # 记忆管理 + 自动提炼
+│   └── provider.go         # Provider 接口
+├── skills/                 # 技能定义（Markdown）
+├── .github/workflows/      # CI/CD (lint + test + release)
+├── Dockerfile              # 多阶段构建
+├── docker-compose.yml      # 一键启动
+├── Makefile                # build / test / lint / docker
+├── goclaw.example.yaml     # 配置示例
+└── goclaw.yaml             # 你的配置（不提交 git）
 ```
 
 ## 快速开始
-
-### 环境要求
-
-- Go 1.24+
-- （可选）[NapCatQQ](https://github.com/NapNeko/NapCatQQ) 或 [Lagrange.Core](https://github.com/LagrangeDev/Lagrange.Core)（QQ 机器人模式）
 
 ### 安装
 
 ```bash
 git clone https://github.com/Shio0909/GoClaw.git
 cd GoClaw
-go mod tidy
+go build -o goclaw ./cmd/
 ```
+
+或直接从 [Releases](https://github.com/Shio0909/GoClaw/releases) 下载预编译二进制。
 
 ### 配置
 
-复制环境变量模板并填入你的 API Key：
-
 ```bash
-cp .env.example .env
+cp goclaw.example.yaml goclaw.yaml
 ```
 
-编辑 `.env`：
+最小配置（编辑 `goclaw.yaml`）：
 
-```env
-# Claude 模式（推荐）
-GOCLAW_PROVIDER=claude
-ANTHROPIC_API_KEY=your-api-key
-GOCLAW_MODEL=claude-sonnet-4-6
-
-# 或 OpenAI 兼容模式（DeepSeek / MiniMax / SiliconFlow / Ollama）
-# GOCLAW_PROVIDER=openai
-# OPENAI_API_KEY=your-key
-# OPENAI_BASE_URL=https://api.deepseek.com/v1
-# GOCLAW_MODEL=deepseek-chat
-
-# MiniMax CodingPlan（注意用 api.minimax.chat）
-# GOCLAW_PROVIDER=minimax
-# OPENAI_API_KEY=sk-cp-xxx
-# OPENAI_BASE_URL=https://api.minimax.chat/v1
-# GOCLAW_MODEL=MiniMax-M2.7
-
-# 可选：多 Key 轮换（逗号分隔）
-# GOCLAW_API_KEYS=key1,key2,key3
-
-# 可选：智能模型路由（简单问题用便宜模型）
-# GOCLAW_SIMPLE_MODEL=deepseek-chat
-# GOCLAW_SIMPLE_PROVIDER=openai
-# GOCLAW_SIMPLE_BASE_URL=https://api.deepseek.com/v1
-
-# 可选：上下文窗口大小（默认 128000）
-# GOCLAW_CONTEXT_LENGTH=128000
-
-# 可选：网络搜索
-# TAVILY_API_KEY=your-tavily-key
-
-# 可选：文件写入沙箱
-# GOCLAW_SANDBOX=/path/to/sandbox
+```yaml
+agent:
+  provider: minimax
+  model: MiniMax-M2.7
+  api_key: ${MINIMAX_API_KEY}  # 或直接填入 Key
 ```
+
+也支持传统 `.env` 方式（向后兼容）。
 
 ### 运行
 
 ```bash
-# CLI 模式
-go run ./cmd/
+# CLI 交互模式（默认）
+./goclaw cli
 
-# 或编译后运行
-go build -o goclaw ./cmd/
-./goclaw
+# HTTP API + Gateway 服务模式
+./goclaw serve
+
+# 指定配置文件
+./goclaw serve -c /path/to/config.yaml
+```
+
+### Docker
+
+```bash
+docker compose up -d
+```
+
+## HTTP API
+
+`goclaw serve` 启动 RESTful API，支持 SSE 流式输出。
+
+| 端点 | 方法 | 说明 |
+|------|------|------|
+| `/v1/chat` | POST | 发送消息（`stream: true` 启用 SSE） |
+| `/v1/chat/:session` | DELETE | 清空会话 |
+| `/v1/tools` | GET | 列出可用工具 |
+| `/v1/memory/:session` | GET | 查看记忆状态 |
+| `/v1/health` | GET | 健康检查 |
+
+```bash
+# 非流式
+curl -X POST http://localhost:8080/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "你好", "session_id": "test"}'
+
+# 流式 (SSE)
+curl -X POST http://localhost:8080/v1/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "你好", "session_id": "test", "stream": true}'
+```
+
+配置 Bearer Token 认证：
+```yaml
+server:
+  listen: ":8080"
+  auth_token: ${GOCLAW_AUTH_TOKEN}
 ```
 
 ## 内置工具
@@ -361,23 +384,15 @@ GoClaw 的 agent 会在对话中主动学习和改进技能：
 
 ## 开发
 
-### 运行测试
-
 ```bash
-go test ./...
+make build       # 编译
+make test        # 运行测试（含 race 检测）
+make lint        # golangci-lint
+make docker      # 构建 Docker 镜像
+make run         # CLI 模式运行
 ```
 
-### 交叉编译
-
-```bash
-# Linux amd64
-GOOS=linux GOARCH=amd64 go build -o goclaw-linux ./cmd/
-
-# 或使用 build.sh
-bash build.sh
-```
-
-### 架构说明
+### 架构
 
 GoClaw 基于 Eino 框架的 ReAct Agent 模式：
 
@@ -390,27 +405,27 @@ GoClaw 基于 Eino 框架的 ReAct Agent 模式：
 7. 上下文过长时自动三阶段压缩
 
 ```
-用户输入
+用户输入 (HTTP / CLI / QQ)
+  ↓
+Gateway 接口路由
   ↓
 BuildSystemPrompt (memory + tools + skills)
   ↓
 ModelRouter (复杂度分类 → 选择模型)
   ↓
 Eino ReAct Agent
-  ↓ ←→ Tool Calls (file_read, shell, web_search, ...)
+  ↓ ←→ Tool Calls (17 内置 + MCP)
   ↓ ←→ Error Recovery (retry + key rotation + compress)
   ↓
-流式输出 / QQ 消息回复（自动引用 + 分段）
+流式输出 → Gateway 回复
 ```
 
-## 部署建议
+## 部署
 
-- **本地运行**：无特殊要求，Go 编译后单二进制即可
-- **服务器部署**：建议 4GB+ 内存（NapCatQQ 本身需要约 1-2GB）
-- 如果服务器内存有限（2GB），可以用 [Lagrange.Core](https://github.com/LagrangeDev/Lagrange.Core) 替代 NapCatQQ，内存占用约 50MB
+- **本地**：单二进制，无依赖
+- **Docker**：`docker compose up -d`
+- **服务器**：QQ 机器人模式需 4GB+ 内存（NapCat 需 1-2GB），纯 HTTP API 512MB 足够
 
 ## License
 
 MIT
-
-
