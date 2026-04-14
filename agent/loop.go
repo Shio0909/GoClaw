@@ -20,7 +20,7 @@ import (
 	"github.com/goclaw/goclaw/tools"
 )
 
-// loggingTransport 记录 HTTP 请求体大小
+// loggingTransport 记录 HTTP 请求大小
 type loggingTransport struct {
 	base http.RoundTripper
 }
@@ -138,7 +138,30 @@ func (a *Agent) buildReactAgent(ctx context.Context) (*react.Agent, error) {
 			Tools: baseTools,
 		},
 		MaxStep: 10,
+		// 默认 firstChunkStreamToolCallChecker 只检查首个非空 chunk，
+		// 对于有 <think> 推理的模型（MiniMax、DeepSeek 等）会先输出
+		// content 再输出 tool_calls，导致工具调用被忽略。
+		// 这里用 allChunksToolCallChecker 遍历全部 chunk。
+		StreamToolCallChecker: allChunksToolCallChecker,
 	})
+}
+
+// allChunksToolCallChecker 遍历所有 stream chunk 检测 tool_calls。
+// 解决 "thinking" 模型先输出 <think> 内容、后输出 tool_calls 的兼容问题。
+func allChunksToolCallChecker(_ context.Context, sr *schema.StreamReader[*schema.Message]) (bool, error) {
+	defer sr.Close()
+	for {
+		msg, err := sr.Recv()
+		if err == io.EOF {
+			return false, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		if len(msg.ToolCalls) > 0 {
+			return true, nil
+		}
+	}
 }
 
 // buildMessages 构建发送给 Eino agent 的消息列表
