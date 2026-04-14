@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/goclaw/goclaw/agent"
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/tools"
@@ -424,5 +426,102 @@ func TestExportSessionMarkdown(t *testing.T) {
 	contentType := w.Header().Get("Content-Type")
 	if !strings.Contains(contentType, "text/markdown") {
 		t.Errorf("expected markdown content type, got %s", contentType)
+	}
+}
+
+func TestWebSocketPingPong(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/ws", srv.handleWebSocket)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Send ping
+	msg, _ := json.Marshal(wsMessage{Type: "ping"})
+	if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	// Read pong
+	_, respBytes, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var resp wsResponse
+	json.Unmarshal(respBytes, &resp)
+	if resp.Type != "pong" {
+		t.Errorf("expected pong, got %s", resp.Type)
+	}
+}
+
+func TestWebSocketInvalidJSON(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/ws", srv.handleWebSocket)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	if err := conn.WriteMessage(websocket.TextMessage, []byte("not json")); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, respBytes, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var resp wsResponse
+	json.Unmarshal(respBytes, &resp)
+	if resp.Type != "error" {
+		t.Errorf("expected error, got %s", resp.Type)
+	}
+}
+
+func TestWebSocketClearSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	// 预创建一个会话
+	srv.getOrCreateSession("ws-clear-test")
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/ws", srv.handleWebSocket)
+
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	wsURL := "ws" + strings.TrimPrefix(ts.URL, "http") + "/v1/ws"
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	msg, _ := json.Marshal(wsMessage{Type: "clear", Session: "ws-clear-test"})
+	if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+
+	_, respBytes, err := conn.ReadMessage()
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	var resp wsResponse
+	json.Unmarshal(respBytes, &resp)
+	if resp.Type != "done" {
+		t.Errorf("expected done, got %s", resp.Type)
 	}
 }

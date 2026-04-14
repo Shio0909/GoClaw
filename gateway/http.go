@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/gorilla/websocket"
+
 	"github.com/goclaw/goclaw/agent"
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/rag"
@@ -135,6 +137,8 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
+	// WebSocket
+	mux.HandleFunc("GET /v1/ws", s.handleWebSocket)
 
 	// 中间件链：CORS → 请求日志 → 认证
 	handler := s.withAuth(s.withRequestLog(mux))
@@ -694,6 +698,126 @@ func hashStr(s string) string {
 		h = h*31 + uint64(c)
 	}
 	return fmt.Sprintf("%x", h)
+}
+
+// -------- WebSocket --------
+
+var wsUpgrader = websocket.Upgrader{
+	ReadBufferSize:  1024,
+	WriteBufferSize: 4096,
+	CheckOrigin: func(r *http.Request) bool {
+		return true // CORS 已由中间件处理
+	},
+}
+
+type wsMessage struct {
+	Type    string `json:"type"`    // "chat", "clear", "ping"
+	Session string `json:"session"` // 会话 ID
+	Message string `json:"message"` // 用户消息
+}
+
+type wsResponse struct {
+	Type    string `json:"type"`              // "chunk", "done", "error", "pong"
+	Content string `json:"content,omitempty"`
+	Session string `json:"session,omitempty"`
+}
+
+func (s *HTTPServer) handleWebSocket(w http.ResponseWriter, r *http.Request) {
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[WS] 升级失败: %v", err)
+		return
+	}
+	defer conn.Close()
+	log.Printf("[WS] 新连接: %s", r.RemoteAddr)
+
+	conn.SetReadLimit(64 * 1024)
+	conn.SetPongHandler(func(string) error {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		return nil
+	})
+
+	// 心跳
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second)); err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_, msgBytes, err := conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure) {
+				log.Printf("[WS] 读取错误: %v", err)
+			}
+			return
+		}
+
+		var msg wsMessage
+		if err := json.Unmarshal(msgBytes, &msg); err != nil {
+			s.wsWrite(conn, wsResponse{Type: "error", Content: "invalid json"})
+			continue
+		}
+
+		switch msg.Type {
+		case "ping":
+			s.wsWrite(conn, wsResponse{Type: "pong"})
+		case "clear":
+			if msg.Session != "" {
+				ag := s.getOrCreateSession(msg.Session)
+				ag.ClearHistory()
+				s.wsWrite(conn, wsResponse{Type: "done", Session: msg.Session, Content: "history cleared"})
+			}
+		case "chat", "":
+			if msg.Session == "" {
+				msg.Session = fmt.Sprintf("ws-%d", time.Now().UnixNano())
+			}
+			s.handleWSChat(conn, msg)
+		default:
+			s.wsWrite(conn, wsResponse{Type: "error", Content: "unknown message type: " + msg.Type})
+		}
+	}
+}
+
+func (s *HTTPServer) handleWSChat(conn *websocket.Conn, msg wsMessage) {
+	ag := s.getOrCreateSession(msg.Session)
+	s.chatCount.Add(1)
+
+	stream, err := ag.RunStream(context.Background(), msg.Message)
+	if err != nil {
+		s.wsWrite(conn, wsResponse{Type: "error", Content: err.Error(), Session: msg.Session})
+		return
+	}
+
+	filter := &agent.ThinkFilter{}
+	for {
+		chunk, err := stream.Recv()
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			s.wsWrite(conn, wsResponse{Type: "error", Content: err.Error(), Session: msg.Session})
+			return
+		}
+		if chunk != nil && chunk.Content != "" {
+			filtered := filter.Process(chunk.Content)
+			if filtered != "" {
+				s.wsWrite(conn, wsResponse{Type: "chunk", Content: filtered, Session: msg.Session})
+			}
+		}
+	}
+	s.wsWrite(conn, wsResponse{Type: "done", Session: msg.Session})
+}
+
+func (s *HTTPServer) wsWrite(conn *websocket.Conn, resp wsResponse) {
+	data, _ := json.Marshal(resp)
+	conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	conn.WriteMessage(websocket.TextMessage, data)
 }
 
 // -------- 会话管理 --------
