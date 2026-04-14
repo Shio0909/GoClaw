@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudwego/eino/schema"
 	"github.com/gorilla/websocket"
 
 	"github.com/goclaw/goclaw/agent"
@@ -151,6 +152,8 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/health", s.handleHealth)
 	mux.HandleFunc("GET /v1/metrics", s.handleMetrics)
 	mux.HandleFunc("GET /v1/sessions", s.handleListSessions)
+	mux.HandleFunc("POST /v1/sessions/{session}/fork", s.handleForkSession)
+	mux.HandleFunc("GET /v1/config", s.handleGetConfig)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -560,6 +563,87 @@ func (s *HTTPServer) handleListSessions(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"count":    len(sessions),
 		"sessions": sessions,
+	})
+}
+
+// handleForkSession POST /v1/sessions/{session}/fork — 克隆会话到新 ID
+func (s *HTTPServer) handleForkSession(w http.ResponseWriter, r *http.Request) {
+	sourceID := r.PathValue("session")
+	val, ok := s.sessions.Load(sourceID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sourceSess := val.(*httpSession)
+
+	var req struct {
+		NewSession string `json:"new_session"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.NewSession == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_session is required"})
+		return
+	}
+
+	if _, exists := s.sessions.Load(req.NewSession); exists {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "target session already exists"})
+		return
+	}
+
+	// 复制对话历史到新会话
+	newAgent := s.getOrCreateSession(req.NewSession)
+	history := sourceSess.agent.GetHistory()
+	copied := make([]*schema.Message, len(history))
+	copy(copied, history)
+	newAgent.SetHistory(copied)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"source":        sourceID,
+		"new_session":   req.NewSession,
+		"messages_copied": len(copied),
+	})
+}
+
+// handleGetConfig GET /v1/config — 返回脱敏后的运行时配置
+func (s *HTTPServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
+	maskKey := func(key string) string {
+		if len(key) <= 8 {
+			return "***"
+		}
+		return key[:4] + "..." + key[len(key)-4:]
+	}
+
+	cfg := map[string]interface{}{
+		"provider": s.agentCfg.Provider,
+		"model":    s.agentCfg.Model,
+		"base_url": s.agentCfg.BaseURL,
+		"api_key":  maskKey(s.agentCfg.APIKey),
+		"max_step": s.agentCfg.MaxStep,
+	}
+	if s.agentCfg.Temperature != nil {
+		cfg["temperature"] = *s.agentCfg.Temperature
+	}
+	if s.agentCfg.MaxTokens > 0 {
+		cfg["max_tokens"] = s.agentCfg.MaxTokens
+	}
+	if s.agentCfg.ReasoningEffort != "" {
+		cfg["reasoning_effort"] = s.agentCfg.ReasoningEffort
+	}
+
+	features := map[string]bool{
+		"rate_limit":  s.rateLimiter != nil,
+		"rag":         s.ragMgr != nil,
+		"persistence": s.sessionStore != nil,
+	}
+	if s.fallbackCfg != nil && s.fallbackCfg.Model != "" {
+		features["fallback"] = true
+		cfg["fallback_model"] = s.fallbackCfg.Model
+		cfg["fallback_provider"] = s.fallbackCfg.Provider
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"config":   cfg,
+		"features": features,
+		"tools":    len(s.registry.Names()),
 	})
 }
 

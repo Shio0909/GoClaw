@@ -496,6 +496,100 @@ func TestListSessionsWithSessions(t *testing.T) {
 	}
 }
 
+func TestForkSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.getOrCreateSession("source-session")
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/fork", srv.handleForkSession)
+
+	body := `{"new_session":"forked-session"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/source-session/fork", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp["source"] != "source-session" {
+		t.Errorf("expected source=source-session, got %v", resp["source"])
+	}
+	if resp["new_session"] != "forked-session" {
+		t.Errorf("expected new_session=forked-session, got %v", resp["new_session"])
+	}
+
+	// 验证新会话已创建
+	if _, ok := srv.sessions.Load("forked-session"); !ok {
+		t.Error("forked session not found")
+	}
+}
+
+func TestForkSessionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/fork", srv.handleForkSession)
+
+	body := `{"new_session":"new"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexistent/fork", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestForkSessionConflict(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.getOrCreateSession("source")
+	srv.getOrCreateSession("already-exists")
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/fork", srv.handleForkSession)
+
+	body := `{"new_session":"already-exists"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/source/fork", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", w.Code)
+	}
+}
+
+func TestGetConfig(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/config", srv.handleGetConfig)
+
+	req := httptest.NewRequest("GET", "/v1/config", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.Unmarshal(w.Body.Bytes(), &resp)
+
+	cfg := resp["config"].(map[string]interface{})
+	if cfg["provider"] != "openai" {
+		t.Errorf("expected provider openai, got %v", cfg["provider"])
+	}
+	apiKey := cfg["api_key"].(string)
+	if apiKey == "test-key" {
+		t.Error("API key should be masked, not raw")
+	}
+	if apiKey != "***" && !strings.Contains(apiKey, "...") {
+		t.Error("masked API key should be *** or contain ...")
+	}
+
+	features := resp["features"].(map[string]interface{})
+	if features == nil {
+		t.Error("expected features in config response")
+	}
+}
+
 func TestExportSessionNotFound(t *testing.T) {
 	srv := newTestHTTPServer(t)
 	mux := http.NewServeMux()
