@@ -185,11 +185,14 @@ func setupInfra(cfg *config.Config) *infra {
 	registry.SetMCPBridge(mcpBridge)
 
 	agentCfg := agent.Config{
-		Provider: cfg.Agent.Provider,
-		APIKey:   cfg.Agent.APIKey,
-		BaseURL:  cfg.Agent.BaseURL,
-		Model:    cfg.Agent.Model,
-		MaxStep:  cfg.Agent.MaxStep,
+		Provider:        cfg.Agent.Provider,
+		APIKey:          cfg.Agent.APIKey,
+		BaseURL:         cfg.Agent.BaseURL,
+		Model:           cfg.Agent.Model,
+		MaxStep:         cfg.Agent.MaxStep,
+		Temperature:     cfg.Agent.Temperature,
+		MaxTokens:       cfg.Agent.MaxTokens,
+		ReasoningEffort: cfg.Agent.ReasoningEffort,
 	}
 
 	// 应用工具结果截断大小
@@ -380,7 +383,22 @@ func runCLI(cfg *config.Config, inf *infra) {
 
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
-	ctx := context.Background()
+
+	// CLI 确认回调 — 危险工具调用前提示用户
+	confirmFn := func(toolName, summary string) bool {
+		fmt.Printf("\n%s⚠️  %s%s\n", colorYellow, summary, colorReset)
+		fmt.Printf("%s允许执行? [Y/n]%s ", colorDim, colorReset)
+		confirmScanner := bufio.NewScanner(os.Stdin)
+		if confirmScanner.Scan() {
+			answer := strings.TrimSpace(strings.ToLower(confirmScanner.Text()))
+			if answer == "" || answer == "y" || answer == "yes" {
+				return true
+			}
+		}
+		fmt.Printf("%s已拒绝%s\n", colorRed, colorReset)
+		return false
+	}
+	ctx := tools.WithConfirmFunc(context.Background(), confirmFn)
 
 	for {
 		fmt.Printf("%s%sYou >%s ", colorBold, colorGreen, colorReset)

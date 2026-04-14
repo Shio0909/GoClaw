@@ -41,11 +41,14 @@ func (t *loggingTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 
 // Config Agent 配置
 type Config struct {
-	Provider string // "openai", "claude", "mimo", ...
-	APIKey   string
-	BaseURL  string
-	Model    string
-	MaxStep  int    // 最大工具调用步数（0 = 默认 25）
+	Provider        string   // "openai", "claude", "mimo", ...
+	APIKey          string
+	BaseURL         string
+	Model           string
+	MaxStep         int      // 最大工具调用步数（0 = 默认 25）
+	Temperature     *float32 // 采样温度（nil = 使用默认值）
+	MaxTokens       int      // 最大输出 token（0 = 使用默认值）
+	ReasoningEffort string   // 推理力度: low, medium, high（仅推理模型）
 }
 
 // Agent 核心 Agent，基于 Eino react agent
@@ -116,20 +119,32 @@ func (a *Agent) createModel(ctx context.Context) (model.ToolCallingChatModel, er
 		if baseURL != "" {
 			baseURLPtr = &baseURL
 		}
+		maxTokens := 4096
+		if a.cfg.MaxTokens > 0 {
+			maxTokens = a.cfg.MaxTokens
+		}
 		return claudemodel.NewChatModel(ctx, &claudemodel.Config{
 			BaseURL:    baseURLPtr,
 			APIKey:     a.cfg.APIKey,
 			Model:      a.cfg.Model,
-			MaxTokens:  4096,
+			MaxTokens:  maxTokens,
 			HTTPClient: &http.Client{Transport: &loggingTransport{base: http.DefaultTransport}},
 		})
 	default: // openai 兼容
-		return openaimodel.NewChatModel(ctx, &openaimodel.ChatModelConfig{
-			APIKey:     a.cfg.APIKey,
-			BaseURL:    a.cfg.BaseURL,
-			Model:      a.cfg.Model,
-			HTTPClient: &http.Client{Transport: &loggingTransport{base: http.DefaultTransport}},
-		})
+		cfg := &openaimodel.ChatModelConfig{
+			APIKey:      a.cfg.APIKey,
+			BaseURL:     a.cfg.BaseURL,
+			Model:       a.cfg.Model,
+			Temperature: a.cfg.Temperature,
+			HTTPClient:  &http.Client{Transport: &loggingTransport{base: http.DefaultTransport}},
+		}
+		if a.cfg.MaxTokens > 0 {
+			cfg.MaxCompletionTokens = &a.cfg.MaxTokens
+		}
+		if a.cfg.ReasoningEffort != "" {
+			cfg.ReasoningEffort = openaimodel.ReasoningEffortLevel(a.cfg.ReasoningEffort)
+		}
+		return openaimodel.NewChatModel(ctx, cfg)
 	}
 }
 

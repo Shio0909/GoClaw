@@ -3,12 +3,44 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
+	"net"
+	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 )
+
+const (
+	toolRetryMax    = 3
+	toolRetryBaseMs = 500
+)
+
+// isTransientError 判断是否为可重试的瞬时错误（网络超时、连接重置等）
+func isTransientError(err error) bool {
+	if err == nil {
+		return false
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, p := range []string{
+		"connection reset", "connection refused", "eof",
+		"broken pipe", "timeout", "i/o timeout",
+		"tls handshake", "server closed",
+		"503", "502", "429",
+	} {
+		if strings.Contains(msg, p) {
+			return true
+		}
+	}
+	return false
+}
 
 // maxToolResultBytes 工具结果最大字节数，超出则截断
 var maxToolResultBytes = 30 * 1024 // 30KB, can be overridden via config
@@ -62,7 +94,34 @@ func (t *EinoTool) InvokableRun(ctx context.Context, argumentsInJSON string, opt
 	if args == nil {
 		args = make(map[string]interface{})
 	}
-	result, err := t.def.Fn(ctx, args)
+
+	// 危险工具确认（CLI 模式下提示用户）
+	if err := requestConfirmation(ctx, t.def.Name, args); err != nil {
+		return err.Error(), nil // return as tool result, not error
+	}
+
+	// 执行工具（可重试工具遇到瞬时错误时自动重试）
+	var result string
+	var err error
+	maxAttempts := 1
+	if t.def.Retryable {
+		maxAttempts = toolRetryMax
+	}
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		result, err = t.def.Fn(ctx, args)
+		if err == nil || !t.def.Retryable || !isTransientError(err) {
+			break
+		}
+		if attempt < maxAttempts {
+			wait := time.Duration(toolRetryBaseMs*(1<<(attempt-1))) * time.Millisecond
+			log.Printf("[Tool] %s 瞬时错误 (尝试 %d/%d): %v — %v 后重试", t.def.Name, attempt, maxAttempts, err, wait)
+			select {
+			case <-time.After(wait):
+			case <-ctx.Done():
+				return "", ctx.Err()
+			}
+		}
+	}
 
 	// 头尾保留截断策略：保留开头和结尾，中间插入截断提示
 	if len(result) > maxToolResultBytes {

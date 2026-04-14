@@ -15,6 +15,7 @@ type ToolDef struct {
 	Description string
 	Parameters  []ParamDef
 	Fn          ToolFunc
+	Retryable   bool // 是否对瞬时错误自动重试（适用于网络工具等）
 }
 
 // ParamDef 定义工具参数

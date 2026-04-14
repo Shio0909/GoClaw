@@ -18,6 +18,7 @@ func NewWebFetchTool() *ToolDef {
 	return &ToolDef{
 		Name:        "web_fetch",
 		Description: "抓取指定 URL 的网页内容，返回纯文本（自动去除 HTML 标签）",
+		Retryable:   true,
 		Parameters: []ParamDef{
 			{Name: "url", Type: "string", Description: "要抓取的网页 URL", Required: true},
 		},
@@ -101,6 +102,7 @@ func NewHTTPRequestTool() *ToolDef {
 	return &ToolDef{
 		Name:        "http_request",
 		Description: "发送 HTTP 请求（GET/POST），用于调用外部 API",
+		Retryable:   true,
 		Parameters: []ParamDef{
 			{Name: "method", Type: "string", Description: "HTTP 方法: GET 或 POST", Required: true},
 			{Name: "url", Type: "string", Description: "请求 URL", Required: true},

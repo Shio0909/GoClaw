@@ -14,6 +14,7 @@ func NewWebSearchTool(apiKey string) *ToolDef {
 	return &ToolDef{
 		Name:        "web_search",
 		Description: "使用 Tavily 搜索引擎搜索网络信息，返回相关结果摘要",
+		Retryable:   true,
 		Parameters: []ParamDef{
 			{Name: "query", Type: "string", Description: "搜索关键词", Required: true},
 		},
