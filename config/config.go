@@ -18,6 +18,14 @@ type Config struct {
 	Tools   ToolsConfig             `yaml:"tools"`
 	MCP     map[string]MCPServer    `yaml:"mcp_servers"`
 	RAG     RAGConfig               `yaml:"rag"`
+	Tracing TracingConfig           `yaml:"tracing"`
+}
+
+// TracingConfig OpenTelemetry 分布式追踪配置
+type TracingConfig struct {
+	Enabled  bool   `yaml:"enabled"`  // 是否启用（默认 false）
+	Exporter string `yaml:"exporter"` // "otlp", "stdout", "none"
+	Endpoint string `yaml:"endpoint"` // OTLP endpoint（默认 localhost:4318）
 }
 
 type ServerConfig struct {

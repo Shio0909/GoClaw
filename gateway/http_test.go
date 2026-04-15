@@ -5160,3 +5160,316 @@ func TestQuotaEnforcement(t *testing.T) {
 		t.Fatalf("expected 429 quota exceeded, got %d: %s", w.Code, w.Body.String())
 	}
 }
+
+// ──────── Batch 4: Turn Tracking, Stats, Sentiment, Word Cloud ────────
+
+func TestGetTurnSummary(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/turns/summary", srv.handleGetTurnSummary)
+
+	srv.getOrCreateSession("turn-test")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/turn-test/turns/summary", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total_turns"].(float64) != 0 {
+		t.Errorf("expected 0 total turns, got %v", resp["total_turns"])
+	}
+	if resp["session"].(string) != "turn-test" {
+		t.Errorf("expected session 'turn-test', got %v", resp["session"])
+	}
+}
+
+func TestGetTurns(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/turns", srv.handleGetTurns)
+
+	srv.getOrCreateSession("turn-list-test")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/turn-list-test/turns?limit=10", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestGetTurnsNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/turns", srv.handleGetTurns)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexistent/turns", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestCompareSessionStats(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/compare", srv.handleCompareSessionStats)
+
+	srv.getOrCreateSession("cmp-a")
+	srv.getOrCreateSession("cmp-b")
+
+	body := `{"sessions":["cmp-a","cmp-b"]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/compare", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["compared"].(float64) != 2 {
+		t.Errorf("expected 2 compared, got %v", resp["compared"])
+	}
+}
+
+func TestCompareSessionStatsTooFew(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/compare", srv.handleCompareSessionStats)
+
+	body := `{"sessions":["only-one"]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/compare", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestWordCloud(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/word-cloud", srv.handleWordCloud)
+
+	srv.getOrCreateSession("wc-test")
+	if val, ok := srv.sessions.Load("wc-test"); ok {
+		sess := val.(*httpSession)
+		sess.agent.AppendAssistantMessage(context.Background(), "hello world hello Go programming Go")
+	}
+
+	req := httptest.NewRequest("GET", "/v1/sessions/wc-test/word-cloud", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["unique_words"].(float64) < 1 {
+		t.Error("expected at least 1 unique word")
+	}
+}
+
+func TestSessionHealth(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/health", srv.handleSessionHealth)
+
+	srv.getOrCreateSession("health-test")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/health-test/health", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	score := resp["health_score"].(float64)
+	if score < 0 || score > 100 {
+		t.Errorf("health score out of range: %v", score)
+	}
+}
+
+func TestBulkTag(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/bulk-tag", srv.handleBulkTag)
+
+	srv.getOrCreateSession("tag-a")
+	srv.getOrCreateSession("tag-b")
+
+	body := `{"sessions":["tag-a","tag-b"],"tags":["important","review"]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/bulk-tag", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["updated"].(float64) != 2 {
+		t.Errorf("expected 2 updated, got %v", resp["updated"])
+	}
+
+	// 验证标签
+	if val, ok := srv.sessions.Load("tag-a"); ok {
+		sess := val.(*httpSession)
+		if !sess.tags["important"] || !sess.tags["review"] {
+			t.Error("tags not applied correctly")
+		}
+	}
+}
+
+func TestBulkUntag(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/bulk-untag", srv.handleBulkUntag)
+
+	srv.getOrCreateSession("untag-a")
+	if val, ok := srv.sessions.Load("untag-a"); ok {
+		sess := val.(*httpSession)
+		sess.tags = map[string]bool{"keep": true, "remove": true}
+	}
+
+	body := `{"sessions":["untag-a"],"tags":["remove"]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/bulk-untag", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	if val, ok := srv.sessions.Load("untag-a"); ok {
+		sess := val.(*httpSession)
+		if sess.tags["remove"] {
+			t.Error("tag 'remove' should have been removed")
+		}
+		if !sess.tags["keep"] {
+			t.Error("tag 'keep' should still exist")
+		}
+	}
+}
+
+func TestSessionSentiment(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/sentiment", srv.handleSessionSentiment)
+
+	srv.getOrCreateSession("sent-test")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/sent-test/sentiment", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if _, ok := resp["sentiment"]; !ok {
+		t.Error("expected 'sentiment' field in response")
+	}
+}
+
+func TestTracingConfig(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/tracing", srv.handleGetTracingConfig)
+
+	req := httptest.NewRequest("GET", "/v1/tracing", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["framework"].(string) != "OpenTelemetry" {
+		t.Errorf("expected OpenTelemetry, got %v", resp["framework"])
+	}
+}
+
+func TestExportJSONL(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export/jsonl", srv.handleExportJSONL)
+
+	srv.getOrCreateSession("jsonl-test")
+	if val, ok := srv.sessions.Load("jsonl-test"); ok {
+		sess := val.(*httpSession)
+		sess.agent.AppendAssistantMessage(context.Background(), "hello from agent")
+	}
+
+	req := httptest.NewRequest("GET", "/v1/sessions/jsonl-test/export/jsonl", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	ct := w.Header().Get("Content-Type")
+	if ct != "application/x-ndjson" {
+		t.Errorf("expected ndjson content-type, got %q", ct)
+	}
+	if w.Body.Len() == 0 {
+		t.Error("expected non-empty body")
+	}
+}
+
+func TestMessageCounts(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/message-counts", srv.handleMessageCounts)
+
+	srv.getOrCreateSession("count-test")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/count-test/message-counts", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestPromptPreview(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/prompt-preview", srv.handlePromptPreview)
+
+	body := `{"template":"Hello {{name}}, welcome to {{app}}!","variables":{"name":"Alice","app":"GoClaw"}}`
+	req := httptest.NewRequest("POST", "/v1/prompt-preview", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	rendered := resp["rendered"].(string)
+	if rendered != "Hello Alice, welcome to GoClaw!" {
+		t.Errorf("unexpected rendered: %q", rendered)
+	}
+}
+
+func TestPromptPreviewUnreplaced(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/prompt-preview", srv.handlePromptPreview)
+
+	body := `{"template":"Hello {{name}}, your role is {{role}}","variables":{"name":"Bob"}}`
+	req := httptest.NewRequest("POST", "/v1/prompt-preview", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	unreplaced := resp["unreplaced"].([]interface{})
+	if len(unreplaced) != 1 || unreplaced[0].(string) != "role" {
+		t.Errorf("expected unreplaced ['role'], got %v", unreplaced)
+	}
+}

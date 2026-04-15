@@ -16,7 +16,7 @@
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
   飞书Bot  ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
   (扩展)   ──→ │  └───────┘  └─────────┘  └──────────┘   │
-               │  134 API Endpoints · Audit · Webhooks    │
+               │  146 API Endpoints · Audit · Webhooks    │
                └──────────────────────────────────────────┘
 ```
 
@@ -28,7 +28,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~20,000 行 Go（含 396 个测试） | — |
+| **代码量** | ~22,000 行 Go（含 420 个测试） | — |
 
 ## 核心特性
 
@@ -60,7 +60,7 @@
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 121 个端点，完整 OpenAPI 3.0 规范
+- 146 个端点，完整 OpenAPI 3.0 规范
 - X-Request-ID 请求追踪（自动生成或透传客户端 ID）
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
@@ -130,6 +130,17 @@
 - **会话模板**（CRUD + 应用模板到会话，含 system_prompt/tags/priority/quota）
 - **重复会话检测**（基于标题和首条消息的相似度匹配）
 - **会话内容差异对比**（逐条消息对比，报告差异/缺失/相同）
+- **Agent Turn 追踪**（每轮工具调用记录 + 耗时 + 错误 + 回退标记）
+- **OpenTelemetry 分布式追踪**（OTLP/stdout 导出，Agent/Tool/RAG/Memory span）
+- **会话健康评分**（基于消息数/错误率/工具使用率的综合评估）
+- **词云分析**（提取高频词 + 按频率排序）
+- **情感分析统计**（基于关键词的正面/负面/中性分类）
+- **JSONL 格式导出**（流式 JSONL 下载）
+- **消息计数统计**（按角色维度统计消息数量）
+- **Prompt 预览**（模板变量替换 + 未替换变量检测）
+- **批量标签操作**（一次为多个会话添加/移除标签）
+- **多会话统计对比**（消息数/标签/创建时间横向对比）
+- **追踪配置查询**（查看当前 OTel 追踪状态）
 
 ## 项目结构
 
@@ -138,6 +149,8 @@ GoClaw/
 ├── cmd/main.go             # 入口：serve / cli / version 子命令
 ├── agent/
 │   ├── loop.go             # Eino ReAct Agent 封装（Run / RunStream）
+│   ├── tracker.go          # Agent Turn 追踪（每轮工具调用记录 + 统计）
+│   ├── otel.go             # OpenTelemetry 分布式追踪集成
 │   ├── prompt.go           # System Prompt 构建（记忆+工具+技能+行为指令）
 │   ├── compressor.go       # 三阶段上下文压缩
 │   ├── errors.go           # API 错误分类（7 类 + 重试决策）
@@ -152,7 +165,7 @@ GoClaw/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（121 端点，REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── http.go             # HTTP API（146 端点，REST + SSE + WebSocket + OpenAI 兼容）
 │   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
@@ -348,6 +361,18 @@ docker compose up -d
 | `/v1/sessions/:session/apply-template` | POST | 应用模板到会话 |
 | `/v1/sessions/detect-duplicates` | GET | 重复会话检测 |
 | `/v1/sessions/diff` | POST | 会话内容差异对比 |
+| `/v1/sessions/:session/turns` | GET | Agent Turn 历史（工具调用记录） |
+| `/v1/sessions/:session/turns/summary` | GET | Turn 统计摘要（调用次数/错误率/Top 工具） |
+| `/v1/sessions/compare` | POST | 多会话横向统计对比 |
+| `/v1/sessions/:session/word-cloud` | GET | 词云数据（高频词提取） |
+| `/v1/sessions/:session/health` | GET | 会话健康评分（综合指标评估） |
+| `/v1/sessions/bulk/tag` | POST | 批量添加标签 |
+| `/v1/sessions/bulk/untag` | POST | 批量移除标签 |
+| `/v1/sessions/:session/sentiment` | GET | 情感分析统计 |
+| `/v1/tracing` | GET | 追踪配置查询 |
+| `/v1/sessions/:session/export/jsonl` | GET | JSONL 格式导出 |
+| `/v1/sessions/:session/message-counts` | GET | 消息计数统计（按角色） |
+| `/v1/prompt-preview` | POST | Prompt 模板预览 |
 
 ### OpenAI 兼容 API
 

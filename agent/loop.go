@@ -15,6 +15,7 @@ import (
 	"github.com/cloudwego/eino/schema"
 	claudemodel "github.com/cloudwego/eino-ext/components/model/claude"
 	openaimodel "github.com/cloudwego/eino-ext/components/model/openai"
+	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/rag"
@@ -65,6 +66,7 @@ type Agent struct {
 	router            *ModelRouter // 智能模型路由器（可选）
 	skillLearner      *SkillLearner // 技能自学习引擎（可选）
 	fallbackCfg       *FallbackConfig // 模型回退配置（可选）
+	tracker           *TurnTracker   // 工具调用追踪器
 	maxStep           int          // 最大工具调用步数
 }
 
@@ -78,6 +80,7 @@ func NewAgent(cfg Config, registry *tools.Registry, memMgr *memory.Manager) *Age
 		cfg:      cfg,
 		registry: registry,
 		memMgr:   memMgr,
+		tracker:  NewTurnTracker(200),
 		maxStep:  maxStep,
 	}
 }
@@ -95,6 +98,11 @@ func (a *Agent) SetMemoryManager(mgr *memory.Manager) {
 // SetCompressor 设置上下文压缩器
 func (a *Agent) SetCompressor(c *Compressor) {
 	a.compressor = c
+}
+
+// GetTracker 获取工具调用追踪器
+func (a *Agent) GetTracker() *TurnTracker {
+	return a.tracker
 }
 
 // SetRetryConfig 设置重试 + Key 轮换配置
@@ -241,14 +249,24 @@ func (a *Agent) buildMessages(ctx context.Context, userInput string) ([]*schema.
 
 // Run 执行一轮对话（非流式，用于记忆系统等内部调用）
 func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
+	// OTel tracing
+	ctx, span := SpanAgentRun(ctx, userInput)
+	defer span.End()
+
+	// Turn tracking
+	a.tracker.StartTurn(userInput, a.cfg.Model)
+
 	msgs, err := a.buildMessages(ctx, userInput)
 	if err != nil {
+		SetSpanError(span, err)
+		a.tracker.EndTurn("", false, err)
 		return "", err
 	}
 
 	a.memMgr.OnTurn(ctx, "user", userInput)
 
 	var resp *schema.Message
+	wasFallback := false
 	runFn := func(cfg Config) error {
 		origKey := a.cfg.APIKey
 		a.cfg.APIKey = cfg.APIKey
@@ -274,6 +292,7 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 	}
 	if err != nil {
 		// 尝试回退到备用模型
+		wasFallback = true
 		fbErr := a.runWithFallback(ctx, err, func(fbModel model.ToolCallingChatModel) error {
 			einoTools := a.registry.ToEinoTools()
 			baseTools := make([]tool.BaseTool, len(einoTools))
@@ -297,6 +316,8 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 			return nil
 		})
 		if fbErr != nil {
+			SetSpanError(span, fbErr)
+			a.tracker.EndTurn("", wasFallback, fbErr)
 			return "", fmt.Errorf("agent generate: %w", fbErr)
 		}
 	}
@@ -306,13 +327,26 @@ func (a *Agent) Run(ctx context.Context, userInput string) (string, error) {
 	a.history = append(a.history, schema.UserMessage(userInput), cleanResp)
 	a.memMgr.OnTurn(ctx, "assistant", content)
 	a.CheckSkillLearning(ctx, content)
+
+	SetSpanResult(span, "agent.output", content)
+	span.SetAttributes(attribute.Bool("agent.fallback", wasFallback))
+	a.tracker.EndTurn(content, wasFallback, nil)
+
 	return content, nil
 }
 
 // RunStream 执行一轮对话（流式输出）
 func (a *Agent) RunStream(ctx context.Context, userInput string) (*schema.StreamReader[*schema.Message], error) {
+	ctx, span := SpanAgentRun(ctx, userInput)
+	span.SetAttributes(attribute.Bool("agent.streaming", true))
+
+	a.tracker.StartTurn(userInput, a.cfg.Model)
+
 	msgs, err := a.buildMessages(ctx, userInput)
 	if err != nil {
+		SetSpanError(span, err)
+		span.End()
+		a.tracker.EndTurn("", false, err)
 		return nil, err
 	}
 
@@ -368,9 +402,13 @@ func (a *Agent) RunStream(ctx context.Context, userInput string) (*schema.Stream
 			return nil
 		})
 		if fbErr != nil {
+			SetSpanError(span, fbErr)
+			span.End()
+			a.tracker.EndTurn("", true, fbErr)
 			return nil, fmt.Errorf("agent stream: %w", fbErr)
 		}
 	}
+	// span 和 tracker 在 AppendAssistantMessage 中结束
 	return stream, nil
 }
 
@@ -379,6 +417,7 @@ func (a *Agent) AppendAssistantMessage(ctx context.Context, content string) {
 	a.history = append(a.history, schema.AssistantMessage(content, nil))
 	a.memMgr.OnTurn(ctx, "assistant", content)
 	a.CheckSkillLearning(ctx, content)
+	a.tracker.EndTurn(content, false, nil)
 }
 
 // ImageInput 图片输入（base64 编码）

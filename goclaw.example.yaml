@@ -88,3 +88,9 @@ tools:
 #       type: http
 #       base_url: http://localhost:8000/api/search
 #       api_key: ${RAG_API_KEY}
+
+# OpenTelemetry 分布式追踪
+# tracing:
+#   enabled: true
+#   exporter: otlp              # otlp / stdout / none
+#   endpoint: localhost:4318    # OTLP HTTP endpoint (Jaeger/Tempo/etc.)

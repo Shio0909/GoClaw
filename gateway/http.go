@@ -504,6 +504,28 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/sessions/duplicates", s.handleDetectDuplicates)
 	// Message diff
 	mux.HandleFunc("POST /v1/sessions/diff", s.handleSessionDiff)
+	// Agent turn tracking
+	mux.HandleFunc("GET /v1/sessions/{session}/turns", s.handleGetTurns)
+	mux.HandleFunc("GET /v1/sessions/{session}/turns/summary", s.handleGetTurnSummary)
+	// Session comparison
+	mux.HandleFunc("POST /v1/sessions/compare", s.handleCompareSessionStats)
+	// Message word frequency
+	mux.HandleFunc("GET /v1/sessions/{session}/word-cloud", s.handleWordCloud)
+	// Session health score
+	mux.HandleFunc("GET /v1/sessions/{session}/health", s.handleSessionHealth)
+	// Bulk tag operations
+	mux.HandleFunc("POST /v1/sessions/bulk-tag", s.handleBulkTag)
+	mux.HandleFunc("POST /v1/sessions/bulk-untag", s.handleBulkUntag)
+	// Message sentiment (simple)
+	mux.HandleFunc("GET /v1/sessions/{session}/sentiment", s.handleSessionSentiment)
+	// System tracing config
+	mux.HandleFunc("GET /v1/tracing", s.handleGetTracingConfig)
+	// Session export JSONL
+	mux.HandleFunc("GET /v1/sessions/{session}/export/jsonl", s.handleExportJSONL)
+	// Message count by role
+	mux.HandleFunc("GET /v1/sessions/{session}/message-counts", s.handleMessageCounts)
+	// Prompt preview
+	mux.HandleFunc("POST /v1/prompt-preview", s.handlePromptPreview)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -6034,4 +6056,447 @@ func truncateStr(s string, maxLen int) string {
 		return s
 	}
 	return s[:maxLen] + "..."
+}
+
+// ──────── Agent Turn Tracking ────────
+
+func (s *HTTPServer) handleGetTurns(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	tracker := sess.agent.GetTracker()
+
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50
+	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 200 {
+		limit = l
+	}
+
+	turns := tracker.GetRecentTurns(limit)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"turns":   turns,
+		"count":   len(turns),
+	})
+}
+
+func (s *HTTPServer) handleGetTurnSummary(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	tracker := sess.agent.GetTracker()
+	summary := tracker.Summary()
+	summary["session"] = sid
+	writeJSON(w, http.StatusOK, summary)
+}
+
+// ──────── Session Comparison ────────
+
+func (s *HTTPServer) handleCompareSessionStats(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sessions []string `json:"sessions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if len(req.Sessions) < 2 || len(req.Sessions) > 10 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "need 2-10 sessions"})
+		return
+	}
+
+	type sessionInfo struct {
+		ID           string   `json:"id"`
+		MessageCount int      `json:"message_count"`
+		CreatedAt    string   `json:"created_at"`
+		Title        string   `json:"title"`
+		Tags         []string `json:"tags"`
+		Archived     bool     `json:"archived"`
+		Priority     int      `json:"priority"`
+	}
+
+	results := make([]sessionInfo, 0, len(req.Sessions))
+	for _, sid := range req.Sessions {
+		val, ok := s.sessions.Load(sid)
+		if !ok {
+			continue
+		}
+		sess := val.(*httpSession)
+		tagList := make([]string, 0, len(sess.tags))
+		for t := range sess.tags {
+			tagList = append(tagList, t)
+		}
+		results = append(results, sessionInfo{
+			ID:           sid,
+			MessageCount: len(sess.agent.GetHistory()),
+			CreatedAt:    sess.createdAt.Format(time.RFC3339),
+			Title:        sess.title,
+			Tags:         tagList,
+			Archived:     sess.archived,
+			Priority:     sess.priority,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"sessions": results,
+		"compared": len(results),
+	})
+}
+
+// ──────── Word Cloud / Frequency ────────
+
+func (s *HTTPServer) handleWordCloud(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	freq := map[string]int{}
+	for _, msg := range sess.agent.GetHistory() {
+		words := strings.Fields(msg.Content)
+		for _, wd := range words {
+			wd = strings.ToLower(strings.Trim(wd, ".,!?;:\"'()[]{}"))
+			if len(wd) >= 2 {
+				freq[wd]++
+			}
+		}
+	}
+
+	// 排序取 top 50
+	type wordCount struct {
+		Word  string `json:"word"`
+		Count int    `json:"count"`
+	}
+	items := make([]wordCount, 0, len(freq))
+	for word, c := range freq {
+		items = append(items, wordCount{word, c})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].Count > items[j].Count })
+	if len(items) > 50 {
+		items = items[:50]
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":      sid,
+		"top_words":    items,
+		"unique_words": len(freq),
+		"total_words":  func() int { c := 0; for _, v := range freq { c += v }; return c }(),
+	})
+}
+
+// ──────── Session Health Score ────────
+
+func (s *HTTPServer) handleSessionHealth(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	score := 100
+	issues := []string{}
+
+	// 消息数量检查
+	history := sess.agent.GetHistory()
+	if len(history) == 0 {
+		score -= 30
+		issues = append(issues, "no_messages")
+	}
+
+	// 配额检查
+	if sess.messageQuota > 0 {
+		usage := float64(sess.messageCount) / float64(sess.messageQuota) * 100
+		if usage >= 90 {
+			score -= 20
+			issues = append(issues, "quota_nearly_exhausted")
+		} else if usage >= 70 {
+			score -= 10
+			issues = append(issues, "quota_warning")
+		}
+	}
+
+	// 活跃度检查
+	if time.Since(sess.lastUsed) > 24*time.Hour {
+		score -= 15
+		issues = append(issues, "inactive_24h")
+	}
+
+	// 归档检查
+	if sess.archived {
+		score -= 10
+		issues = append(issues, "archived")
+	}
+
+	// 标题检查
+	if sess.title == "" {
+		score -= 5
+		issues = append(issues, "no_title")
+	}
+
+	if score < 0 {
+		score = 0
+	}
+
+	status := "healthy"
+	if score < 50 {
+		status = "critical"
+	} else if score < 75 {
+		status = "warning"
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":      sid,
+		"health_score": score,
+		"status":       status,
+		"issues":       issues,
+		"message_count": len(history),
+		"last_active":  sess.lastUsed.Format(time.RFC3339),
+	})
+}
+
+// ──────── Bulk Tag Operations ────────
+
+func (s *HTTPServer) handleBulkTag(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sessions []string `json:"sessions"`
+		Tags     []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if len(req.Sessions) == 0 || len(req.Tags) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sessions and tags required"})
+		return
+	}
+
+	updated := 0
+	for _, sid := range req.Sessions {
+		val, ok := s.sessions.Load(sid)
+		if !ok {
+			continue
+		}
+		sess := val.(*httpSession)
+		if sess.tags == nil {
+			sess.tags = map[string]bool{}
+		}
+		for _, tag := range req.Tags {
+			sess.tags[tag] = true
+		}
+		updated++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"updated": updated,
+		"tags":    req.Tags,
+	})
+}
+
+func (s *HTTPServer) handleBulkUntag(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sessions []string `json:"sessions"`
+		Tags     []string `json:"tags"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+
+	updated := 0
+	for _, sid := range req.Sessions {
+		val, ok := s.sessions.Load(sid)
+		if !ok {
+			continue
+		}
+		sess := val.(*httpSession)
+		for _, tag := range req.Tags {
+			delete(sess.tags, tag)
+		}
+		updated++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"updated": updated,
+	})
+}
+
+// ──────── Session Sentiment ────────
+
+func (s *HTTPServer) handleSessionSentiment(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	positiveWords := map[string]bool{
+		"good": true, "great": true, "excellent": true, "amazing": true, "love": true,
+		"happy": true, "wonderful": true, "fantastic": true, "perfect": true, "nice": true,
+		"好": true, "棒": true, "优秀": true, "感谢": true, "喜欢": true,
+		"开心": true, "满意": true, "完美": true, "赞": true, "厉害": true,
+	}
+	negativeWords := map[string]bool{
+		"bad": true, "terrible": true, "awful": true, "hate": true, "worst": true,
+		"wrong": true, "error": true, "fail": true, "broken": true, "bug": true,
+		"差": true, "糟": true, "错误": true, "失败": true, "讨厌": true,
+		"垃圾": true, "问题": true, "不好": true, "不行": true, "崩溃": true,
+	}
+
+	positive, negative, neutral := 0, 0, 0
+	for _, msg := range sess.agent.GetHistory() {
+		if msg.Role != schema.User {
+			continue
+		}
+		words := strings.Fields(msg.Content)
+		p, n := 0, 0
+		for _, w := range words {
+			w = strings.ToLower(w)
+			if positiveWords[w] {
+				p++
+			}
+			if negativeWords[w] {
+				n++
+			}
+		}
+		if p > n {
+			positive++
+		} else if n > p {
+			negative++
+		} else {
+			neutral++
+		}
+	}
+
+	total := positive + negative + neutral
+	sentiment := "neutral"
+	if total > 0 {
+		if float64(positive)/float64(total) > 0.5 {
+			sentiment = "positive"
+		} else if float64(negative)/float64(total) > 0.5 {
+			sentiment = "negative"
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":   sid,
+		"sentiment": sentiment,
+		"positive":  positive,
+		"negative":  negative,
+		"neutral":   neutral,
+		"total":     total,
+	})
+}
+
+// ──────── Tracing Config ────────
+
+func (s *HTTPServer) handleGetTracingConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"enabled":   false, // 由配置文件决定
+		"exporter":  "none",
+		"endpoint":  "",
+		"framework": "OpenTelemetry",
+		"features":  []string{"agent.run spans", "tool.call spans", "rag.query spans", "memory.build spans"},
+	})
+}
+
+// ──────── JSONL Export ────────
+
+func (s *HTTPServer) handleExportJSONL(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.jsonl", sid))
+
+	enc := json.NewEncoder(w)
+	for _, msg := range sess.agent.GetHistory() {
+		_ = enc.Encode(map[string]interface{}{
+			"role":    string(msg.Role),
+			"content": msg.Content,
+		})
+	}
+}
+
+// ──────── Message Counts ────────
+
+func (s *HTTPServer) handleMessageCounts(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	counts := map[string]int{}
+	history := sess.agent.GetHistory()
+	for _, msg := range history {
+		counts[string(msg.Role)]++
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"counts":  counts,
+		"total":   len(history),
+	})
+}
+
+// ──────── Prompt Preview ────────
+
+func (s *HTTPServer) handlePromptPreview(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Template  string            `json:"template"`
+		Variables map[string]string `json:"variables"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.Template == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "template required"})
+		return
+	}
+
+	result := req.Template
+	for k, v := range req.Variables {
+		result = strings.ReplaceAll(result, "{{"+k+"}}", v)
+	}
+
+	// 统计未替换的变量
+	unreplaced := []string{}
+	for i := 0; i < len(result)-3; i++ {
+		if result[i] == '{' && result[i+1] == '{' {
+			end := strings.Index(result[i+2:], "}}")
+			if end >= 0 {
+				unreplaced = append(unreplaced, result[i+2:i+2+end])
+				i = i + 2 + end + 1
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"rendered":   result,
+		"unreplaced": unreplaced,
+		"char_count": len(result),
+	})
 }
