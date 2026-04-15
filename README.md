@@ -14,8 +14,8 @@
   WebSocket──→ │  │ Agent │──│  Tools  │──│ Memory   │   │
   CLI      ──→ │  │ Loop  │  │20+MCP   │  │ 3-Layer  │   │
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
-  (扩展)   ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
-               │  └───────┘  └─────────┘  └──────────┘   │
+  飞书Bot  ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
+  (扩展)   ──→ │  └───────┘  └─────────┘  └──────────┘   │
                │  121 API Endpoints · Audit · Webhooks    │
                └──────────────────────────────────────────┘
 ```
@@ -28,12 +28,12 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~18,000 行 Go（含 376 个测试） | — |
+| **代码量** | ~19,000 行 Go（含 383 个测试） | — |
 
 ## 核心特性
 
 **Runtime 架构**
-- Gateway 接口：HTTP API / CLI / QQ 机器人，可扩展任意平台
+- Gateway 接口：HTTP API / CLI / QQ 机器人 / 飞书机器人，可扩展任意平台
 - `goclaw serve` — 启动 HTTP API + 所有 Gateway
 - `goclaw cli` — 交互式 CLI 模式（含工具执行确认）
 - YAML 配置 + 环境变量回退，向后兼容
@@ -153,6 +153,7 @@ GoClaw/
 │   ├── qq_image.go         # 图片消息处理
 │   ├── qq_voice.go         # 语音消息处理 (STT)
 │   ├── qq_reply.go         # 引用回复
+│   ├── feishu.go           # 飞书机器人 (Webhook + 官方 SDK)
 │   └── qq_sticker.go       # 表情包系统
 ├── tools/
 │   ├── registry.go         # 工具注册表

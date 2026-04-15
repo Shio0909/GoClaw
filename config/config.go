@@ -50,8 +50,9 @@ type AgentConfig struct {
 }
 
 type GatewayConfig struct {
-	QQ   *QQConfig   `yaml:"qq"`
-	HTTP *HTTPConfig `yaml:"http"`
+	QQ     *QQConfig     `yaml:"qq"`
+	HTTP   *HTTPConfig   `yaml:"http"`
+	Feishu *FeishuConfig `yaml:"feishu"`
 }
 
 // HTTPConfig HTTP API 网关配置
@@ -71,6 +72,16 @@ type QQConfig struct {
 	Admins      []string `yaml:"admins"`
 	StickersDir string   `yaml:"stickers_dir"`
 	STT         STTConfig `yaml:"stt"`
+}
+
+// FeishuConfig 飞书机器人网关配置
+type FeishuConfig struct {
+	Enabled           bool   `yaml:"enabled"`
+	AppID             string `yaml:"app_id"`
+	AppSecret         string `yaml:"app_secret"`
+	VerificationToken string `yaml:"verification_token"`
+	EncryptKey        string `yaml:"encrypt_key"`
+	WebhookPort       string `yaml:"webhook_port"` // 默认 ":9090"
 }
 
 type STTConfig struct {

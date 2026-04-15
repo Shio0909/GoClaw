@@ -315,6 +315,37 @@ func runServe(cfg *config.Config, inf *infra) {
 		gateways = append(gateways, bot)
 	}
 
+	// Feishu Gateway
+	if cfg.Gateway.Feishu != nil && cfg.Gateway.Feishu.Enabled {
+		var skillCfg *agent.SkillLearnerConfig
+		if cfg.Tools.SkillNudge > 0 {
+			skillCfg = &agent.SkillLearnerConfig{
+				NudgeInterval: cfg.Tools.SkillNudge,
+				SkillsDir:     cfg.Tools.SkillsDir,
+			}
+		}
+
+		webhookPort := cfg.Gateway.Feishu.WebhookPort
+		if webhookPort == "" {
+			webhookPort = ":9090"
+		}
+
+		feishuBot := gateway.NewFeishuBot(gateway.FeishuBotConfig{
+			AppID:           cfg.Gateway.Feishu.AppID,
+			AppSecret:       cfg.Gateway.Feishu.AppSecret,
+			ListenAddr:      webhookPort,
+			VerifyToken:     cfg.Gateway.Feishu.VerificationToken,
+			EncryptKey:      cfg.Gateway.Feishu.EncryptKey,
+			AgentCfg:        inf.agentCfg,
+			Registry:        inf.registry,
+			MemStore:        inf.memStore,
+			ContextLength:   cfg.Agent.ContextLength,
+			RetryConfig:     inf.retryCfg,
+			SkillLearnerCfg: skillCfg,
+		})
+		gateways = append(gateways, feishuBot)
+	}
+
 	if len(gateways) == 0 {
 		log.Fatal("serve 模式需要至少一个 gateway 或 HTTP API 监听地址")
 	}
