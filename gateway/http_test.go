@@ -2294,3 +2294,245 @@ func TestToolDryRunNotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
+
+func TestLockUnlockSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/lock", srv.handleLockSession)
+	mux.HandleFunc("POST /v1/sessions/{session}/unlock", srv.handleUnlockSession)
+
+	// Create session
+	sess := &httpSession{agent: srv.getOrCreateSession("lock-test")}
+	srv.sessions.Store("lock-test", sess)
+
+	// Lock
+	req := httptest.NewRequest("POST", "/v1/sessions/lock-test/lock", strings.NewReader(`{"locked_by":"admin"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("lock: expected 200, got %d", w.Code)
+	}
+	var resp map[string]string
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["locked_by"] != "admin" {
+		t.Fatalf("expected locked_by=admin, got %s", resp["locked_by"])
+	}
+
+	// Lock again → conflict
+	req = httptest.NewRequest("POST", "/v1/sessions/lock-test/lock", strings.NewReader(`{}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("double lock: expected 409, got %d", w.Code)
+	}
+
+	// Unlock
+	req = httptest.NewRequest("POST", "/v1/sessions/lock-test/unlock", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unlock: expected 200, got %d", w.Code)
+	}
+	var unlockResp map[string]string
+	json.NewDecoder(w.Body).Decode(&unlockResp)
+	if unlockResp["previous_locker"] != "admin" {
+		t.Fatalf("expected previous_locker=admin, got %s", unlockResp["previous_locker"])
+	}
+
+	// Unlock again → already unlocked
+	req = httptest.NewRequest("POST", "/v1/sessions/lock-test/unlock", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("double unlock: expected 200, got %d", w.Code)
+	}
+}
+
+func TestLockSessionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/lock", srv.handleLockSession)
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexistent/lock", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestLockedSessionBlocksChat(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/chat", srv.handleChat)
+
+	// Create and lock session
+	ag := srv.getOrCreateSession("blocked-sess")
+	sess := &httpSession{agent: ag, locked: true, lockedBy: "test"}
+	srv.sessions.Store("blocked-sess", sess)
+
+	body := `{"session":"blocked-sess","message":"hello"}`
+	req := httptest.NewRequest("POST", "/v1/chat", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusLocked {
+		t.Fatalf("expected 423 Locked, got %d", w.Code)
+	}
+}
+
+func TestHTMLExport(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export", srv.handleExportSession)
+
+	// Create a session with some history
+	ag := srv.getOrCreateSession("html-test")
+	sess := &httpSession{agent: ag}
+	srv.sessions.Store("html-test", sess)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/html-test/export?format=html", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	ct := w.Header().Get("Content-Type")
+	if ct != "text/html; charset=utf-8" {
+		t.Fatalf("expected text/html content type, got %s", ct)
+	}
+	respBody := w.Body.String()
+	if !strings.Contains(respBody, "<!DOCTYPE html>") {
+		t.Fatal("expected HTML doctype")
+	}
+	if !strings.Contains(respBody, "html-test") {
+		t.Fatal("expected session ID in HTML")
+	}
+}
+
+func TestEstimateCost(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/estimate-cost", srv.handleEstimateCost)
+
+	body := `{"message":"Hello world, this is a test message","model":"gpt-4"}`
+	req := httptest.NewRequest("POST", "/v1/estimate-cost", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["model"] != "gpt-4" {
+		t.Fatalf("expected model=gpt-4, got %v", resp["model"])
+	}
+	if resp["currency"] != "USD" {
+		t.Fatalf("expected currency=USD, got %v", resp["currency"])
+	}
+	if tokens, ok := resp["input_tokens"].(float64); !ok || tokens < 1 {
+		t.Fatalf("expected input_tokens > 0, got %v", resp["input_tokens"])
+	}
+}
+
+func TestEstimateCostEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/estimate-cost", srv.handleEstimateCost)
+
+	body := `{"message":""}`
+	req := httptest.NewRequest("POST", "/v1/estimate-cost", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestSessionStats(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/stats", srv.handleSessionStats)
+
+	ag := srv.getOrCreateSession("stats-test")
+	sess := &httpSession{agent: ag}
+	srv.sessions.Store("stats-test", sess)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/stats-test/stats", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["session"] != "stats-test" {
+		t.Fatalf("expected session=stats-test, got %v", resp["session"])
+	}
+	if resp["locked"] != false {
+		t.Fatalf("expected locked=false")
+	}
+}
+
+func TestSessionStatsNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/stats", srv.handleSessionStats)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexistent/stats", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestBatchTools(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/batch", srv.handleBatchTools)
+
+	body := `{"tools":[{"name":"echo","args":{"input":"hi"}}]}`
+	req := httptest.NewRequest("POST", "/v1/tools/batch", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 1 {
+		t.Fatalf("expected total=1, got %v", resp["total"])
+	}
+}
+
+func TestBatchToolsEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/batch", srv.handleBatchTools)
+
+	body := `{"tools":[]}`
+	req := httptest.NewRequest("POST", "/v1/tools/batch", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestBatchToolsTooMany(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/batch", srv.handleBatchTools)
+
+	// 21 tools
+	tools := make([]map[string]interface{}, 21)
+	for i := range tools {
+		tools[i] = map[string]interface{}{"name": "echo", "args": map[string]interface{}{"input": "x"}}
+	}
+	data, _ := json.Marshal(map[string]interface{}{"tools": tools})
+	req := httptest.NewRequest("POST", "/v1/tools/batch", strings.NewReader(string(data)))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for >20 tools, got %d", w.Code)
+	}
+}

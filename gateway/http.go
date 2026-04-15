@@ -69,6 +69,8 @@ type httpSession struct {
 	tags        map[string]bool // 会话标签
 	annotations []sessionNote   // 会话备注
 	customTTL   time.Duration   // 自定义存活时间（0 = 使用全局默认）
+	locked      bool            // 锁定状态（锁定后禁止新消息）
+	lockedBy    string          // 锁定者标识
 }
 
 type sessionNote struct {
@@ -266,6 +268,15 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/{session}/rename", s.handleRenameSession)
 	// Tool dry-run
 	mux.HandleFunc("POST /v1/tools/{name}/dry-run", s.handleToolDryRun)
+	// Session lock/unlock
+	mux.HandleFunc("POST /v1/sessions/{session}/lock", s.handleLockSession)
+	mux.HandleFunc("POST /v1/sessions/{session}/unlock", s.handleUnlockSession)
+	// Cost estimation
+	mux.HandleFunc("POST /v1/estimate-cost", s.handleEstimateCost)
+	// Session stats
+	mux.HandleFunc("GET /v1/sessions/{session}/stats", s.handleSessionStats)
+	// Batch tool execution
+	mux.HandleFunc("POST /v1/tools/batch", s.handleBatchTools)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -441,6 +452,18 @@ func (s *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ag := s.getOrCreateSession(req.Session)
+
+	// 检查会话锁定状态
+	if val, ok := s.sessions.Load(req.Session); ok {
+		if sess, ok := val.(*httpSession); ok && sess.locked {
+			writeJSON(w, http.StatusLocked, map[string]string{
+				"error":     "session is locked",
+				"locked_by": sess.lockedBy,
+			})
+			return
+		}
+	}
+
 	s.chatCount.Add(1)
 
 	if s.auditLog != nil {
@@ -1112,6 +1135,42 @@ func (s *HTTPServer) handleExportSession(w http.ResponseWriter, r *http.Request)
 			}
 			fmt.Fprintf(w, "## %s\n\n%s\n\n---\n\n", role, msg.Content)
 		}
+		return
+	}
+
+	if format == "html" {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.html", sessionID))
+		fmt.Fprintf(w, `<!DOCTYPE html><html><head><meta charset="utf-8"><title>%s</title>
+<style>body{font-family:system-ui,sans-serif;max-width:800px;margin:0 auto;padding:20px;background:#f5f5f5}
+.msg{margin:12px 0;padding:12px 16px;border-radius:8px;line-height:1.6}
+.user{background:#dcf8c6;margin-left:60px}.assistant{background:#fff;margin-right:60px}
+.tool{background:#e8f4fd;font-family:monospace;font-size:13px}.system{background:#fff3cd;font-size:13px}
+.role{font-weight:bold;margin-bottom:4px;font-size:13px;color:#666}
+pre{background:#2d2d2d;color:#f8f8f2;padding:12px;border-radius:4px;overflow-x:auto}
+h1{text-align:center;color:#333}</style></head><body>`, sessionID)
+		fmt.Fprintf(w, "<h1>%s</h1>", sessionID)
+		for _, msg := range history {
+			cssClass := string(msg.Role)
+			roleLabel := string(msg.Role)
+			switch msg.Role {
+			case "user":
+				roleLabel = "🧑 User"
+			case "assistant":
+				roleLabel = "🤖 Assistant"
+			case "tool":
+				roleLabel = "🔧 Tool"
+			case "system":
+				roleLabel = "⚙️ System"
+			}
+			// 简单 HTML 转义
+			content := strings.ReplaceAll(msg.Content, "&", "&amp;")
+			content = strings.ReplaceAll(content, "<", "&lt;")
+			content = strings.ReplaceAll(content, ">", "&gt;")
+			content = strings.ReplaceAll(content, "\n", "<br>")
+			fmt.Fprintf(w, `<div class="msg %s"><div class="role">%s</div>%s</div>`, cssClass, roleLabel, content)
+		}
+		fmt.Fprintf(w, "</body></html>")
 		return
 	}
 
@@ -2440,6 +2499,222 @@ func (s *HTTPServer) handleToolDryRun(w http.ResponseWriter, r *http.Request) {
 		"parameters":       params,
 		"timeout_ms":       tool.Timeout.Milliseconds(),
 		"retryable":        tool.Retryable,
+	})
+}
+
+// handleLockSession 锁定会话（禁止新消息）
+func (s *HTTPServer) handleLockSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body struct {
+		LockedBy string `json:"locked_by"`
+	}
+	json.NewDecoder(r.Body).Decode(&body)
+	if body.LockedBy == "" {
+		body.LockedBy = "api"
+	}
+
+	if sess.locked {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error":     "session already locked",
+			"locked_by": sess.lockedBy,
+		})
+		return
+	}
+
+	sess.locked = true
+	sess.lockedBy = body.LockedBy
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":    "locked",
+		"session":   sid,
+		"locked_by": sess.lockedBy,
+	})
+}
+
+// handleUnlockSession 解锁会话
+func (s *HTTPServer) handleUnlockSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	if !sess.locked {
+		writeJSON(w, http.StatusOK, map[string]string{
+			"status":  "already_unlocked",
+			"session": sid,
+		})
+		return
+	}
+
+	previousLocker := sess.lockedBy
+	sess.locked = false
+	sess.lockedBy = ""
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status":          "unlocked",
+		"session":         sid,
+		"previous_locker": previousLocker,
+	})
+}
+
+// handleEstimateCost 估算消息的 token 成本
+func (s *HTTPServer) handleEstimateCost(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Message       string  `json:"message"`
+		Model         string  `json:"model"`
+		InputPricePer1K  float64 `json:"input_price_per_1k"`
+		OutputPricePer1K float64 `json:"output_price_per_1k"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Message == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "message is required"})
+		return
+	}
+
+	// 简单 token 估算：英文约 4 字符/token，CJK 约 2 字符/token
+	inputTokens := 0
+	for _, ch := range req.Message {
+		if ch > 0x4E00 && ch < 0x9FFF {
+			inputTokens += 1 // CJK 字符约 1 token
+		} else {
+			inputTokens += 1
+		}
+	}
+	inputTokens = inputTokens * 10 / 40 // 粗略除以 4
+	if inputTokens < 1 {
+		inputTokens = 1
+	}
+
+	// 估算输出（假设 2:1 输出/输入比）
+	estimatedOutputTokens := inputTokens * 2
+
+	// 价格计算
+	if req.InputPricePer1K == 0 {
+		req.InputPricePer1K = 0.003 // 默认价格
+	}
+	if req.OutputPricePer1K == 0 {
+		req.OutputPricePer1K = 0.006
+	}
+
+	inputCost := float64(inputTokens) / 1000.0 * req.InputPricePer1K
+	outputCost := float64(estimatedOutputTokens) / 1000.0 * req.OutputPricePer1K
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"input_tokens":           inputTokens,
+		"estimated_output_tokens": estimatedOutputTokens,
+		"input_cost":             inputCost,
+		"output_cost":            outputCost,
+		"total_estimated_cost":   inputCost + outputCost,
+		"model":                  req.Model,
+		"currency":               "USD",
+		"note":                   "rough estimate based on character count heuristics",
+	})
+}
+
+// handleSessionStats 返回会话统计信息
+func (s *HTTPServer) handleSessionStats(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+
+	// 统计各角色消息数
+	roleCounts := map[string]int{}
+	totalChars := 0
+	for _, msg := range hist {
+		roleCounts[string(msg.Role)]++
+		totalChars += len(msg.Content)
+	}
+
+	// 估算 token 数
+	estimatedTokens := 0
+	for _, ch := range func() string {
+		var sb strings.Builder
+		for _, m := range hist {
+			sb.WriteString(m.Content)
+		}
+		return sb.String()
+	}() {
+		if ch > 0x4E00 && ch < 0x9FFF {
+			estimatedTokens++
+		} else {
+			estimatedTokens++
+		}
+	}
+	estimatedTokens = estimatedTokens * 10 / 40
+	if estimatedTokens < 0 {
+		estimatedTokens = 0
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":          sid,
+		"message_count":    len(hist),
+		"role_counts":      roleCounts,
+		"total_chars":      totalChars,
+		"estimated_tokens": estimatedTokens,
+		"locked":           sess.locked,
+		"locked_by":        sess.lockedBy,
+		"has_custom_ttl":   sess.customTTL > 0,
+	})
+}
+
+// handleBatchTools 批量执行多个工具
+func (s *HTTPServer) handleBatchTools(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session string `json:"session"`
+		Tools   []struct {
+			Name string                 `json:"name"`
+			Args map[string]interface{} `json:"args"`
+		} `json:"tools"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if len(req.Tools) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tools array is required"})
+		return
+	}
+	if len(req.Tools) > 20 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 20 tools per batch"})
+		return
+	}
+
+	type toolResult struct {
+		Name    string      `json:"name"`
+		Success bool        `json:"success"`
+		Result  interface{} `json:"result,omitempty"`
+		Error   string      `json:"error,omitempty"`
+	}
+
+	results := make([]toolResult, 0, len(req.Tools))
+	for _, t := range req.Tools {
+		out, err := s.registry.Execute(r.Context(), t.Name, t.Args)
+		if err != nil {
+			results = append(results, toolResult{Name: t.Name, Success: false, Error: err.Error()})
+		} else {
+			results = append(results, toolResult{Name: t.Name, Success: true, Result: out})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"total":   len(req.Tools),
+		"results": results,
 	})
 }
 
