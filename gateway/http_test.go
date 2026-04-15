@@ -3809,3 +3809,578 @@ func TestBookmarkNotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
+
+// ──────── Star/Unstar Tests ────────
+
+func TestStarSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/star", srv.handleStarSession)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/star", srv.handleUnstarSession)
+	mux.HandleFunc("GET /v1/sessions/starred", srv.handleListStarredSessions)
+
+	srv.getOrCreateSession("star-test")
+
+	// Star
+	req := httptest.NewRequest("POST", "/v1/sessions/star-test/star", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("star: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["starred"] != true {
+		t.Errorf("expected starred=true")
+	}
+
+	// List starred
+	req = httptest.NewRequest("GET", "/v1/sessions/starred", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list starred: expected 200, got %d", w.Code)
+	}
+	var listResp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&listResp)
+	if listResp["count"].(float64) != 1 {
+		t.Errorf("expected 1 starred, got %v", listResp["count"])
+	}
+
+	// Unstar
+	req = httptest.NewRequest("DELETE", "/v1/sessions/star-test/star", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unstar: expected 200, got %d", w.Code)
+	}
+}
+
+func TestStarNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/star", srv.handleStarSession)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/star", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Pin/Unpin Tests ────────
+
+func TestPinMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/pin", srv.handlePinMessage)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/messages/{index}/pin", srv.handleUnpinMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/pins", srv.handleGetPinnedMessages)
+
+	ag := srv.getOrCreateSession("pin-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "hello world"},
+		{Role: "assistant", Content: "hi there"},
+	})
+
+	// Pin message 0
+	req := httptest.NewRequest("POST", "/v1/sessions/pin-test/messages/0/pin", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("pin: expected 200, got %d", w.Code)
+	}
+
+	// Get pinned
+	req = httptest.NewRequest("GET", "/v1/sessions/pin-test/pins", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get pins: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 1 {
+		t.Errorf("expected 1 pinned, got %v", resp["count"])
+	}
+
+	// Unpin
+	req = httptest.NewRequest("DELETE", "/v1/sessions/pin-test/messages/0/pin", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("unpin: expected 200, got %d", w.Code)
+	}
+}
+
+func TestPinNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/pin", srv.handlePinMessage)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/messages/0/pin", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestPinOutOfRange(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/pin", srv.handlePinMessage)
+
+	srv.getOrCreateSession("pin-empty")
+
+	req := httptest.NewRequest("POST", "/v1/sessions/pin-empty/messages/5/pin", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// ──────── Markdown Export Tests ────────
+
+func TestExportMarkdown(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export/markdown", srv.handleExportMarkdown)
+
+	ag := srv.getOrCreateSession("md-export")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "What is Go?"},
+		{Role: "assistant", Content: "Go is a programming language."},
+	})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/md-export/export/markdown", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "# md-export") {
+		t.Errorf("expected title in markdown")
+	}
+	if !strings.Contains(body, "👤 User") {
+		t.Errorf("expected user role label")
+	}
+	if !strings.Contains(body, "🤖 Assistant") {
+		t.Errorf("expected assistant role label")
+	}
+	if w.Header().Get("Content-Type") != "text/markdown; charset=utf-8" {
+		t.Errorf("expected markdown content type, got %s", w.Header().Get("Content-Type"))
+	}
+}
+
+func TestExportMarkdownNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export/markdown", srv.handleExportMarkdown)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexist/export/markdown", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Batch Export Tests ────────
+
+func TestBatchExport(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/export", srv.handleBatchExport)
+
+	ag1 := srv.getOrCreateSession("batch-1")
+	ag1.SetHistory([]*schema.Message{{Role: "user", Content: "hello"}})
+	ag2 := srv.getOrCreateSession("batch-2")
+	ag2.SetHistory([]*schema.Message{{Role: "user", Content: "world"}})
+
+	body := `{"sessions":["batch-1","batch-2","nonexist"]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/export", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 2 {
+		t.Errorf("expected 2 exported, got %v", resp["count"])
+	}
+	notFound := resp["not_found"].([]interface{})
+	if len(notFound) != 1 || notFound[0].(string) != "nonexist" {
+		t.Errorf("expected not_found=[nonexist], got %v", notFound)
+	}
+}
+
+func TestBatchExportEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/export", srv.handleBatchExport)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/export", strings.NewReader(`{"sessions":[]}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// ──────── Branching Tests ────────
+
+func TestCreateBranch(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/branch", srv.handleCreateBranch)
+	mux.HandleFunc("GET /v1/sessions/{session}/branches", srv.handleListBranches)
+
+	ag := srv.getOrCreateSession("branch-src")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "msg1"},
+		{Role: "assistant", Content: "reply1"},
+		{Role: "user", Content: "msg2"},
+	})
+
+	// Create branch at index 2
+	body := `{"name":"alt-path","at_index":2}`
+	req := httptest.NewRequest("POST", "/v1/sessions/branch-src/branch", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create branch: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["branch"] != "alt-path" {
+		t.Errorf("expected branch name alt-path")
+	}
+	if resp["messages_copied"].(float64) != 2 {
+		t.Errorf("expected 2 messages copied")
+	}
+
+	// List branches
+	req = httptest.NewRequest("GET", "/v1/sessions/branch-src/branches", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list branches: expected 200, got %d", w.Code)
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 1 {
+		t.Errorf("expected 1 branch")
+	}
+}
+
+func TestCreateBranchDuplicate(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/branch", srv.handleCreateBranch)
+
+	ag := srv.getOrCreateSession("dup-branch")
+	ag.SetHistory([]*schema.Message{{Role: "user", Content: "test"}})
+	val, _ := srv.sessions.Load("dup-branch")
+	sess := val.(*httpSession)
+	sess.branches = map[string]string{"existing": "some-id"}
+
+	body := `{"name":"existing","at_index":1}`
+	req := httptest.NewRequest("POST", "/v1/sessions/dup-branch/branch", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", w.Code)
+	}
+}
+
+// ──────── Global Search Tests ────────
+
+func TestGlobalSearch(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/search/messages", srv.handleGlobalSearch)
+
+	ag1 := srv.getOrCreateSession("search-1")
+	ag1.SetHistory([]*schema.Message{
+		{Role: "user", Content: "What is Kubernetes?"},
+		{Role: "assistant", Content: "Kubernetes is a container orchestration platform."},
+	})
+	ag2 := srv.getOrCreateSession("search-2")
+	ag2.SetHistory([]*schema.Message{
+		{Role: "user", Content: "Tell me about Docker"},
+	})
+
+	// Search for "kubernetes"
+	req := httptest.NewRequest("GET", "/v1/search/messages?q=kubernetes", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	count := int(resp["count"].(float64))
+	if count != 2 {
+		t.Errorf("expected 2 results for 'kubernetes', got %d", count)
+	}
+
+	// Search with no query
+	req = httptest.NewRequest("GET", "/v1/search/messages", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for empty query, got %d", w.Code)
+	}
+}
+
+// ──────── Session Merge Tests ────────
+
+func TestMergeSessions(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/merge", srv.handleMergeSessions)
+
+	ag1 := srv.getOrCreateSession("merge-a")
+	ag1.SetHistory([]*schema.Message{{Role: "user", Content: "from A"}})
+	ag2 := srv.getOrCreateSession("merge-b")
+	ag2.SetHistory([]*schema.Message{{Role: "user", Content: "from B"}})
+
+	body := `{"sources":["merge-a","merge-b"],"target":"merge-result"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/merge", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total_messages"].(float64) != 2 {
+		t.Errorf("expected 2 total messages, got %v", resp["total_messages"])
+	}
+}
+
+func TestMergeSessionsTargetExists(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/merge", srv.handleMergeSessions)
+
+	srv.getOrCreateSession("existing")
+	srv.getOrCreateSession("src1")
+	srv.getOrCreateSession("src2")
+
+	body := `{"sources":["src1","src2"],"target":"existing"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/merge", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", w.Code)
+	}
+}
+
+func TestMergeSessionsTooFewSources(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/merge", srv.handleMergeSessions)
+
+	body := `{"sources":["only-one"],"target":"new"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/merge", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// ──────── Auto-Title Tests ────────
+
+func TestAutoTitle(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/auto-title", srv.handleAutoTitle)
+
+	ag := srv.getOrCreateSession("title-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "How to deploy a Go application to production?"},
+		{Role: "assistant", Content: "Here are the steps..."},
+	})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/title-test/auto-title", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	title := resp["title"].(string)
+	if title == "" {
+		t.Errorf("expected non-empty title")
+	}
+	if !strings.Contains(title, "How to deploy") {
+		t.Errorf("expected title from first user message, got %s", title)
+	}
+}
+
+func TestAutoTitleLongMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/auto-title", srv.handleAutoTitle)
+
+	ag := srv.getOrCreateSession("title-long")
+	longMsg := strings.Repeat("A very long message about a complex topic ", 10)
+	ag.SetHistory([]*schema.Message{{Role: "user", Content: longMsg}})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/title-long/auto-title", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	title := resp["title"].(string)
+	if len(title) > 70 {
+		t.Errorf("title too long: %d chars", len(title))
+	}
+}
+
+func TestAutoTitleNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/auto-title", srv.handleAutoTitle)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/auto-title", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Timeline Tests ────────
+
+func TestSessionTimeline(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/timeline", srv.handleSessionTimeline)
+
+	srv.getOrCreateSession("timeline-test")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/timeline-test/timeline", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	total := int(resp["total"].(float64))
+	if total < 1 {
+		t.Errorf("expected at least 1 timeline event (created), got %d", total)
+	}
+	events := resp["events"].([]interface{})
+	first := events[0].(map[string]interface{})
+	if first["type"] != "created" {
+		t.Errorf("expected first event type=created, got %s", first["type"])
+	}
+}
+
+func TestSessionTimelineNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/timeline", srv.handleSessionTimeline)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexist/timeline", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Message Voting Tests ────────
+
+func TestMessageVote(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/vote", srv.handleMessageVote)
+	mux.HandleFunc("GET /v1/sessions/{session}/votes", srv.handleGetVotes)
+
+	ag := srv.getOrCreateSession("vote-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "test"},
+		{Role: "assistant", Content: "response"},
+	})
+
+	// Upvote message 1
+	req := httptest.NewRequest("POST", "/v1/sessions/vote-test/messages/1/vote", strings.NewReader(`{"value":1}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("vote: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["score"].(float64) != 1 {
+		t.Errorf("expected score=1")
+	}
+
+	// Upvote again
+	req = httptest.NewRequest("POST", "/v1/sessions/vote-test/messages/1/vote", strings.NewReader(`{"value":1}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["score"].(float64) != 2 {
+		t.Errorf("expected score=2")
+	}
+
+	// Downvote
+	req = httptest.NewRequest("POST", "/v1/sessions/vote-test/messages/1/vote", strings.NewReader(`{"value":-1}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["score"].(float64) != 1 {
+		t.Errorf("expected score=1 after downvote")
+	}
+
+	// Get votes
+	req = httptest.NewRequest("GET", "/v1/sessions/vote-test/votes", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get votes: expected 200, got %d", w.Code)
+	}
+}
+
+func TestMessageVoteInvalidValue(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/vote", srv.handleMessageVote)
+
+	ag := srv.getOrCreateSession("vote-invalid")
+	ag.SetHistory([]*schema.Message{{Role: "user", Content: "test"}})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/vote-invalid/messages/0/vote", strings.NewReader(`{"value":5}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid value, got %d", w.Code)
+	}
+}
+
+func TestMessageVoteNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/vote", srv.handleMessageVote)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/messages/0/vote", strings.NewReader(`{"value":1}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}

@@ -95,6 +95,13 @@ type promptTemplate struct {
 	Variables   []string `json:"variables,omitempty"`
 }
 
+// timelineEvent 会话活动时间线事件
+type timelineEvent struct {
+	Type      string `json:"type"`      // "created", "message", "checkpoint", "branch", "star", etc.
+	Detail    string `json:"detail"`
+	Timestamp string `json:"timestamp"`
+}
+
 type httpSession struct {
 	agent       *agent.Agent
 	memMgr      *memory.Manager
@@ -110,6 +117,13 @@ type httpSession struct {
 	metadata    map[string]string   // 自定义元数据
 	reactions   map[int][]string    // 消息索引 -> 反应 emoji
 	bookmarks   map[int]string      // 消息索引 -> 书签标签
+	starred     bool                // 收藏状态
+	pinned      map[int]bool        // 消息固定索引
+	title       string              // 会话标题
+	branches    map[string]string   // 分支名 -> 目标会话ID
+	votes       map[int]int         // 消息索引 -> 投票值累加
+	timeline    []timelineEvent     // 活动时间线
+	createdAt   time.Time           // 创建时间
 }
 
 type sessionNote struct {
@@ -383,6 +397,32 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	// Message bookmark
 	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/bookmark", s.handleBookmarkMessage)
 	mux.HandleFunc("GET /v1/sessions/{session}/bookmarks", s.handleGetBookmarks)
+	// Session starring
+	mux.HandleFunc("POST /v1/sessions/{session}/star", s.handleStarSession)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/star", s.handleUnstarSession)
+	mux.HandleFunc("GET /v1/sessions/starred", s.handleListStarredSessions)
+	// Message pinning
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/pin", s.handlePinMessage)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/messages/{index}/pin", s.handleUnpinMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/pins", s.handleGetPinnedMessages)
+	// Markdown export
+	mux.HandleFunc("GET /v1/sessions/{session}/export/markdown", s.handleExportMarkdown)
+	// Batch export
+	mux.HandleFunc("POST /v1/sessions/export", s.handleBatchExport)
+	// Conversation branching
+	mux.HandleFunc("POST /v1/sessions/{session}/branch", s.handleCreateBranch)
+	mux.HandleFunc("GET /v1/sessions/{session}/branches", s.handleListBranches)
+	// Global message search
+	mux.HandleFunc("GET /v1/search/messages", s.handleGlobalSearch)
+	// Session merge
+	mux.HandleFunc("POST /v1/sessions/merge", s.handleMergeSessions)
+	// Auto-title
+	mux.HandleFunc("POST /v1/sessions/{session}/auto-title", s.handleAutoTitle)
+	// Session timeline
+	mux.HandleFunc("GET /v1/sessions/{session}/timeline", s.handleSessionTimeline)
+	// Message voting
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/vote", s.handleMessageVote)
+	mux.HandleFunc("GET /v1/sessions/{session}/votes", s.handleGetVotes)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -1657,9 +1697,15 @@ func (s *HTTPServer) getOrCreateSession(id string) *agent.Agent {
 	}
 
 	s.sessions.Store(id, &httpSession{
-		agent:    ag,
-		memMgr:   memMgr,
-		lastUsed: time.Now(),
+		agent:     ag,
+		memMgr:    memMgr,
+		lastUsed:  time.Now(),
+		createdAt: time.Now(),
+		timeline: []timelineEvent{{
+			Type:      "created",
+			Detail:    "session created",
+			Timestamp: time.Now().Format(time.RFC3339),
+		}},
 	})
 	return ag
 }
@@ -4288,4 +4334,594 @@ func clientIP(r *http.Request) string {
 		return host
 	}
 	return r.RemoteAddr
+}
+
+// addTimeline 向会话追加时间线事件
+func (sess *httpSession) addTimeline(typ, detail string) {
+	sess.timeline = append(sess.timeline, timelineEvent{
+		Type:      typ,
+		Detail:    detail,
+		Timestamp: time.Now().Format(time.RFC3339),
+	})
+}
+
+// ──────── Session Starring ────────
+
+func (s *HTTPServer) handleStarSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	sess.starred = true
+	sess.addTimeline("star", "session starred")
+	s.emitEvent("session.starred", sid, nil)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "starred": true})
+}
+
+func (s *HTTPServer) handleUnstarSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	sess.starred = false
+	sess.addTimeline("unstar", "session unstarred")
+	s.emitEvent("session.unstarred", sid, nil)
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "starred": false})
+}
+
+func (s *HTTPServer) handleListStarredSessions(w http.ResponseWriter, r *http.Request) {
+	var starred []map[string]interface{}
+	s.sessions.Range(func(key, val any) bool {
+		sess := val.(*httpSession)
+		if sess.starred {
+			starred = append(starred, map[string]interface{}{
+				"session":    key.(string),
+				"title":      sess.title,
+				"created_at": sess.createdAt.Format(time.RFC3339),
+				"last_used":  sess.lastUsed.Format(time.RFC3339),
+			})
+		}
+		return true
+	})
+	if starred == nil {
+		starred = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"starred": starred, "count": len(starred)})
+}
+
+// ──────── Message Pinning ────────
+
+func (s *HTTPServer) handlePinMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	idxStr := r.PathValue("index")
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+	if sess.pinned == nil {
+		sess.pinned = make(map[int]bool)
+	}
+	sess.pinned[idx] = true
+	sess.addTimeline("pin", fmt.Sprintf("message %d pinned", idx))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "index": idx, "pinned": true})
+}
+
+func (s *HTTPServer) handleUnpinMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	idxStr := r.PathValue("index")
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	if sess.pinned != nil {
+		delete(sess.pinned, idx)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "index": idx, "pinned": false})
+}
+
+func (s *HTTPServer) handleGetPinnedMessages(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+	var pinned []map[string]interface{}
+	if sess.pinned != nil {
+		for idx := range sess.pinned {
+			if idx < len(hist) {
+				content := hist[idx].Content
+				if len(content) > 200 {
+					content = content[:200] + "..."
+				}
+				pinned = append(pinned, map[string]interface{}{
+					"index":   idx,
+					"role":    string(hist[idx].Role),
+					"preview": content,
+				})
+			}
+		}
+	}
+	if pinned == nil {
+		pinned = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "pinned": pinned, "count": len(pinned)})
+}
+
+// ──────── Markdown Export ────────
+
+func (s *HTTPServer) handleExportMarkdown(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+
+	var sb strings.Builder
+	title := sess.title
+	if title == "" {
+		title = sid
+	}
+	sb.WriteString("# " + title + "\n\n")
+	sb.WriteString(fmt.Sprintf("*Exported: %s | Messages: %d*\n\n---\n\n", time.Now().Format(time.RFC3339), len(hist)))
+
+	for i, m := range hist {
+		roleLabel := "🤖 Assistant"
+		switch m.Role {
+		case schema.User:
+			roleLabel = "👤 User"
+		case schema.System:
+			roleLabel = "⚙️ System"
+		case schema.Tool:
+			roleLabel = "🔧 Tool"
+		}
+		sb.WriteString(fmt.Sprintf("### %s (#%d)\n\n", roleLabel, i))
+		sb.WriteString(m.Content + "\n\n")
+		// 标注固定/书签/反应
+		if sess.pinned != nil && sess.pinned[i] {
+			sb.WriteString("📌 *Pinned*\n\n")
+		}
+		if sess.bookmarks != nil {
+			if label, ok := sess.bookmarks[i]; ok {
+				sb.WriteString(fmt.Sprintf("🔖 *Bookmark: %s*\n\n", label))
+			}
+		}
+		if sess.reactions != nil {
+			if emojis, ok := sess.reactions[i]; ok && len(emojis) > 0 {
+				sb.WriteString("Reactions: " + strings.Join(emojis, " ") + "\n\n")
+			}
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/markdown; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s.md\"", sid))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(sb.String()))
+}
+
+// ──────── Batch Export ────────
+
+func (s *HTTPServer) handleBatchExport(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sessions []string `json:"sessions"`
+		Format   string   `json:"format"` // "json" (default) or "markdown"
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if len(req.Sessions) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "sessions list required"})
+		return
+	}
+	if len(req.Sessions) > 50 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 50 sessions per export"})
+		return
+	}
+
+	type exportedSession struct {
+		ID       string                   `json:"id"`
+		Title    string                   `json:"title,omitempty"`
+		Messages []map[string]interface{} `json:"messages"`
+		Tags     []string                 `json:"tags,omitempty"`
+		Starred  bool                     `json:"starred"`
+		Archived bool                     `json:"archived"`
+	}
+	var results []exportedSession
+	var notFound []string
+
+	for _, sid := range req.Sessions {
+		val, ok := s.sessions.Load(sid)
+		if !ok {
+			notFound = append(notFound, sid)
+			continue
+		}
+		sess := val.(*httpSession)
+		hist := sess.agent.GetHistory()
+		var msgs []map[string]interface{}
+		for _, m := range hist {
+			msgs = append(msgs, map[string]interface{}{
+				"role":    string(m.Role),
+				"content": m.Content,
+			})
+		}
+		if msgs == nil {
+			msgs = []map[string]interface{}{}
+		}
+		var tagList []string
+		for t := range sess.tags {
+			tagList = append(tagList, t)
+		}
+		results = append(results, exportedSession{
+			ID:       sid,
+			Title:    sess.title,
+			Messages: msgs,
+			Tags:     tagList,
+			Starred:  sess.starred,
+			Archived: sess.archived,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"exported":  results,
+		"count":     len(results),
+		"not_found": notFound,
+	})
+}
+
+// ──────── Conversation Branching ────────
+
+func (s *HTTPServer) handleCreateBranch(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	var req struct {
+		Name    string `json:"name"`
+		AtIndex int    `json:"at_index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "branch name required"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	if sess.branches == nil {
+		sess.branches = make(map[string]string)
+	}
+	if _, exists := sess.branches[req.Name]; exists {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "branch name already exists"})
+		return
+	}
+	hist := sess.agent.GetHistory()
+	if req.AtIndex < 0 || req.AtIndex > len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at_index out of range"})
+		return
+	}
+
+	branchID := fmt.Sprintf("%s__branch__%s", sid, req.Name)
+	branchAgent := s.getOrCreateSession(branchID)
+	for _, m := range hist[:req.AtIndex] {
+		cp := *m
+		branchAgent.AppendToHistory(&cp)
+	}
+	sess.branches[req.Name] = branchID
+	sess.addTimeline("branch", fmt.Sprintf("branch '%s' created at index %d", req.Name, req.AtIndex))
+	s.emitEvent("session.branched", sid, map[string]interface{}{"branch": req.Name, "branch_session": branchID})
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"branch":         req.Name,
+		"branch_session": branchID,
+		"messages_copied": req.AtIndex,
+	})
+}
+
+func (s *HTTPServer) handleListBranches(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	branches := make(map[string]interface{})
+	if sess.branches != nil {
+		for name, bsid := range sess.branches {
+			info := map[string]interface{}{"session_id": bsid}
+			if bval, ok := s.sessions.Load(bsid); ok {
+				bsess := bval.(*httpSession)
+				info["messages"] = len(bsess.agent.GetHistory())
+			}
+			branches[name] = info
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "branches": branches, "count": len(branches)})
+}
+
+// ──────── Global Message Search ────────
+
+func (s *HTTPServer) handleGlobalSearch(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query().Get("q")
+	if q == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "query parameter 'q' required"})
+		return
+	}
+	limitStr := r.URL.Query().Get("limit")
+	limit := 50
+	if limitStr != "" {
+		if v, err := strconv.Atoi(limitStr); err == nil && v > 0 && v <= 200 {
+			limit = v
+		}
+	}
+	qLower := strings.ToLower(q)
+
+	type searchResult struct {
+		Session string `json:"session"`
+		Index   int    `json:"index"`
+		Role    string `json:"role"`
+		Preview string `json:"preview"`
+	}
+	var results []searchResult
+
+	s.sessions.Range(func(key, val any) bool {
+		sid := key.(string)
+		sess := val.(*httpSession)
+		hist := sess.agent.GetHistory()
+		for i, m := range hist {
+			if strings.Contains(strings.ToLower(m.Content), qLower) {
+				preview := m.Content
+				if len(preview) > 150 {
+					preview = preview[:150] + "..."
+				}
+				results = append(results, searchResult{
+					Session: sid,
+					Index:   i,
+					Role:    string(m.Role),
+					Preview: preview,
+				})
+				if len(results) >= limit {
+					return false
+				}
+			}
+		}
+		return len(results) < limit
+	})
+	if results == nil {
+		results = []searchResult{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"results": results, "count": len(results), "query": q})
+}
+
+// ──────── Session Merge ────────
+
+func (s *HTTPServer) handleMergeSessions(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sources []string `json:"sources"`
+		Target  string   `json:"target"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if len(req.Sources) < 2 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at least 2 source sessions required"})
+		return
+	}
+	if req.Target == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target session id required"})
+		return
+	}
+	if _, ok := s.sessions.Load(req.Target); ok {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "target session already exists"})
+		return
+	}
+
+	targetAgent := s.getOrCreateSession(req.Target)
+	totalMessages := 0
+	var mergedSources []string
+
+	for _, src := range req.Sources {
+		val, ok := s.sessions.Load(src)
+		if !ok {
+			continue
+		}
+		sess := val.(*httpSession)
+		hist := sess.agent.GetHistory()
+		for _, m := range hist {
+			cp := *m
+			targetAgent.AppendToHistory(&cp)
+		}
+		totalMessages += len(hist)
+		mergedSources = append(mergedSources, src)
+	}
+
+	s.emitEvent("session.merged", req.Target, map[string]interface{}{"sources": mergedSources})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"target":          req.Target,
+		"merged_sources":  mergedSources,
+		"total_messages":  totalMessages,
+	})
+}
+
+// ──────── Auto-Title ────────
+
+func (s *HTTPServer) handleAutoTitle(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+
+	// 从首条用户消息提取标题关键词
+	title := ""
+	for _, m := range hist {
+		if m.Role == schema.User && m.Content != "" {
+			title = m.Content
+			break
+		}
+	}
+	if title == "" {
+		title = sid // fallback to session ID
+	}
+	// 截断为合理标题长度
+	if len(title) > 60 {
+		// 尝试在词边界截断
+		cutoff := 60
+		if spaceIdx := strings.LastIndex(title[:cutoff], " "); spaceIdx > 20 {
+			cutoff = spaceIdx
+		}
+		title = title[:cutoff] + "..."
+	}
+
+	sess.title = title
+	sess.addTimeline("title", fmt.Sprintf("auto-titled: %s", title))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "title": title})
+}
+
+// ──────── Session Timeline ────────
+
+func (s *HTTPServer) handleSessionTimeline(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	timeline := sess.timeline
+	if timeline == nil {
+		timeline = []timelineEvent{}
+	}
+
+	// 分页
+	offsetStr := r.URL.Query().Get("offset")
+	limitStr := r.URL.Query().Get("limit")
+	offset := 0
+	limit := 100
+	if offsetStr != "" {
+		if v, err := strconv.Atoi(offsetStr); err == nil && v >= 0 {
+			offset = v
+		}
+	}
+	if limitStr != "" {
+		if v, err := strconv.Atoi(limitStr); err == nil && v > 0 && v <= 500 {
+			limit = v
+		}
+	}
+
+	total := len(timeline)
+	if offset >= total {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "events": []timelineEvent{}, "total": total})
+		return
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"events":  timeline[offset:end],
+		"total":   total,
+		"offset":  offset,
+		"limit":   limit,
+	})
+}
+
+// ──────── Message Voting ────────
+
+func (s *HTTPServer) handleMessageVote(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	idxStr := r.PathValue("index")
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+	var req struct {
+		Value int `json:"value"` // +1 = upvote, -1 = downvote
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Value != 1 && req.Value != -1 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "value must be 1 or -1"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+	if sess.votes == nil {
+		sess.votes = make(map[int]int)
+	}
+	sess.votes[idx] += req.Value
+	sess.addTimeline("vote", fmt.Sprintf("message %d voted %+d", idx, req.Value))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"index":   idx,
+		"score":   sess.votes[idx],
+	})
+}
+
+func (s *HTTPServer) handleGetVotes(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	votes := make(map[string]int)
+	if sess.votes != nil {
+		for idx, score := range sess.votes {
+			votes[strconv.Itoa(idx)] = score
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "votes": votes})
 }

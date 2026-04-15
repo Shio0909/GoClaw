@@ -507,6 +507,11 @@ func (a *Agent) SetHistory(msgs []*schema.Message) {
 	a.history = msgs
 }
 
+// AppendToHistory 向历史追加一条消息
+func (a *Agent) AppendToHistory(msg *schema.Message) {
+	a.history = append(a.history, msg)
+}
+
 // applyRoute 应用模型路由（如果配置了路由器）
 func (a *Agent) applyRoute(input string) {
 	if a.router == nil {

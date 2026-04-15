@@ -16,7 +16,7 @@
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
   (扩展)   ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
                │  └───────┘  └─────────┘  └──────────┘   │
-               │  92 API Endpoints · Audit · Webhooks     │
+               │  108 API Endpoints · Audit · Webhooks    │
                └──────────────────────────────────────────┘
 ```
 
@@ -28,7 +28,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~16,000 行 Go（含 358 个测试） | — |
+| **代码量** | ~18,000 行 Go（含 467 个测试） | — |
 
 ## 核心特性
 
@@ -105,6 +105,16 @@
 - Token 使用量统计（per-role + 上下文使用率）
 - 自定义会话元数据（键值对，支持删除）
 - 服务运行时间端点
+- 会话收藏/星标系统
+- 消息固定（Pin 重要消息）
+- 消息投票系统（+1/-1 评分）
+- Markdown 格式导出
+- 批量会话导出（≤50 个，JSON 格式）
+- 对话分支（树状分支管理，类似 Git）
+- 全局消息搜索（跨会话检索）
+- 会话合并（多会话合并到新会话）
+- 自动生成会话标题
+- 会话活动时间线（分页查看操作记录）
 
 ## 项目结构
 
@@ -127,7 +137,7 @@ GoClaw/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（92 端点，REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── http.go             # HTTP API（108 端点，REST + SSE + WebSocket + OpenAI 兼容）
 │   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
@@ -262,6 +272,20 @@ docker compose up -d
 | `/v1/sessions/:session/messages/:index/react` | POST/GET | 消息反应（emoji） |
 | `/v1/sessions/:session/messages/:index/bookmark` | POST | 消息书签 |
 | `/v1/sessions/:session/bookmarks` | GET | 书签列表（含预览） |
+| `/v1/sessions/:session/star` | POST/DELETE | 会话收藏/取消收藏 |
+| `/v1/sessions/starred` | GET | 列出收藏的会话 |
+| `/v1/sessions/:session/messages/:index/pin` | POST/DELETE | 消息固定/取消固定 |
+| `/v1/sessions/:session/pins` | GET | 获取固定消息列表（含预览） |
+| `/v1/sessions/:session/export/markdown` | GET | 导出为 Markdown 格式 |
+| `/v1/sessions/export` | POST | 批量导出会话（≤50，JSON格式） |
+| `/v1/sessions/:session/branch` | POST | 创建会话分支（树状对话） |
+| `/v1/sessions/:session/branches` | GET | 列出会话分支 |
+| `/v1/search/messages` | GET | 全局消息搜索（跨会话） |
+| `/v1/sessions/merge` | POST | 合并多个会话到新会话 |
+| `/v1/sessions/:session/auto-title` | POST | 自动生成会话标题 |
+| `/v1/sessions/:session/timeline` | GET | 会话活动时间线（分页） |
+| `/v1/sessions/:session/messages/:index/vote` | POST | 消息投票（+1/-1） |
+| `/v1/sessions/:session/votes` | GET | 获取消息投票统计 |
 | `/v1/events` | GET | SSE实时事件流（类型过滤） |
 | `/v1/uptime` | GET | 服务运行时间+统计 |
 | `/v1/batch/chat` | POST | 批量多会话并发聊天（≤20） |
