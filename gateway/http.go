@@ -61,8 +61,25 @@ type HTTPServer struct {
 	toolAliases    sync.Map             // alias -> realName
 	toolUsage      sync.Map             // toolName -> *toolUsageStats
 	promptTemplates sync.Map            // name -> *promptTemplate
+	eventSubs      sync.Map             // subID -> chan *serverEvent (SSE 订阅者)
+	eventSubSeq    atomic.Int64         // 订阅者 ID 自增序列
 
 	server *http.Server
+}
+
+// serverEvent 服务器事件（用于 SSE 推送）
+type serverEvent struct {
+	Type      string      `json:"type"`
+	Session   string      `json:"session,omitempty"`
+	Data      interface{} `json:"data,omitempty"`
+	Timestamp string      `json:"timestamp"`
+}
+
+// sessionCheckpoint 会话检查点
+type sessionCheckpoint struct {
+	Name      string            `json:"name"`
+	History   []*schema.Message `json:"history"`
+	CreatedAt string            `json:"created_at"`
 }
 
 type toolUsageStats struct {
@@ -88,6 +105,7 @@ type httpSession struct {
 	locked      bool            // 锁定状态（锁定后禁止新消息）
 	lockedBy    string          // 锁定者标识
 	systemPromptOverride string // 会话级 system prompt 覆盖
+	checkpoints []sessionCheckpoint // 命名检查点
 }
 
 type sessionNote struct {
@@ -322,6 +340,26 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/{session}/import", s.handleImportSession)
 	// Message injection
 	mux.HandleFunc("POST /v1/sessions/{session}/inject", s.handleInjectMessage)
+	// Event SSE stream
+	mux.HandleFunc("GET /v1/events", s.handleEventStream)
+	// Session checkpoints
+	mux.HandleFunc("POST /v1/sessions/{session}/checkpoint", s.handleCreateCheckpoint)
+	mux.HandleFunc("GET /v1/sessions/{session}/checkpoints", s.handleListCheckpoints)
+	mux.HandleFunc("POST /v1/sessions/{session}/checkpoint/restore", s.handleRestoreCheckpoint)
+	// Message edit / delete / undo
+	mux.HandleFunc("PUT /v1/sessions/{session}/messages/{index}", s.handleEditMessage)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/messages/{index}", s.handleDeleteMessage)
+	mux.HandleFunc("POST /v1/sessions/{session}/undo", s.handleUndoMessage)
+	// Session clone
+	mux.HandleFunc("POST /v1/sessions/{session}/clone", s.handleCloneSession)
+	// Bulk session delete
+	mux.HandleFunc("POST /v1/sessions/bulk-delete", s.handleBulkDeleteSessions)
+	// Tool pipeline
+	mux.HandleFunc("POST /v1/tools/pipeline", s.handleToolPipeline)
+	// Session persist (manual save)
+	mux.HandleFunc("POST /v1/sessions/{session}/save", s.handleSaveSession)
+	// Fork at index
+	mux.HandleFunc("POST /v1/sessions/{session}/fork-at", s.handleForkAtIndex)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -626,6 +664,7 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	if s.auditLog != nil {
 		s.auditLog.Emit(audit.EventSessionDelete, sessionID, "", clientIP(r), nil)
 	}
+	s.emitEvent("session.deleted", sessionID, nil)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "session deleted"})
 }
 
@@ -3297,6 +3336,536 @@ func (s *HTTPServer) handleInjectMessage(w http.ResponseWriter, r *http.Request)
 		"role":     body.Role,
 		"index":    body.Index,
 		"total":    len(hist),
+	})
+}
+
+// -------- Event SSE Stream --------
+
+// emitEvent 向所有 SSE 订阅者广播事件
+func (s *HTTPServer) emitEvent(evType, session string, data interface{}) {
+	evt := &serverEvent{
+		Type:      evType,
+		Session:   session,
+		Data:      data,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	s.eventSubs.Range(func(_, val any) bool {
+		ch := val.(chan *serverEvent)
+		select {
+		case ch <- evt:
+		default: // 订阅者太慢，丢弃
+		}
+		return true
+	})
+}
+
+// handleEventStream SSE 实时事件流
+func (s *HTTPServer) handleEventStream(w http.ResponseWriter, r *http.Request) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "streaming not supported"})
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	subID := s.eventSubSeq.Add(1)
+	ch := make(chan *serverEvent, 64)
+	s.eventSubs.Store(subID, ch)
+	defer func() {
+		s.eventSubs.Delete(subID)
+		close(ch)
+	}()
+
+	// 发送连接确认
+	fmt.Fprintf(w, "event: connected\ndata: {\"subscriber_id\":%d}\n\n", subID)
+	flusher.Flush()
+
+	filter := r.URL.Query().Get("type") // 可选事件类型过滤
+
+	for {
+		select {
+		case evt, ok := <-ch:
+			if !ok {
+				return
+			}
+			if filter != "" && evt.Type != filter {
+				continue
+			}
+			data, _ := json.Marshal(evt)
+			fmt.Fprintf(w, "event: %s\ndata: %s\n\n", evt.Type, data)
+			flusher.Flush()
+		case <-r.Context().Done():
+			return
+		}
+	}
+}
+
+// -------- Session Checkpoints --------
+
+func (s *HTTPServer) handleCreateCheckpoint(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || strings.TrimSpace(body.Name) == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+
+	// 检查同名检查点
+	for _, cp := range sess.checkpoints {
+		if cp.Name == body.Name {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "checkpoint already exists"})
+			return
+		}
+	}
+
+	hist := sess.agent.GetHistory()
+	// 深拷贝历史
+	copied := make([]*schema.Message, len(hist))
+	for i, m := range hist {
+		cp := *m
+		copied[i] = &cp
+	}
+
+	sess.checkpoints = append(sess.checkpoints, sessionCheckpoint{
+		Name:      body.Name,
+		History:   copied,
+		CreatedAt: time.Now().Format(time.RFC3339),
+	})
+
+	s.emitEvent("checkpoint.created", sid, map[string]string{"name": body.Name})
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"session":    sid,
+		"checkpoint": body.Name,
+		"messages":   len(copied),
+		"total":      len(sess.checkpoints),
+	})
+}
+
+func (s *HTTPServer) handleListCheckpoints(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	items := make([]map[string]interface{}, 0, len(sess.checkpoints))
+	for _, cp := range sess.checkpoints {
+		items = append(items, map[string]interface{}{
+			"name":       cp.Name,
+			"messages":   len(cp.History),
+			"created_at": cp.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":     sid,
+		"checkpoints": items,
+	})
+}
+
+func (s *HTTPServer) handleRestoreCheckpoint(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body struct {
+		Name string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+
+	for _, cp := range sess.checkpoints {
+		if cp.Name == body.Name {
+			// 深拷贝恢复
+			restored := make([]*schema.Message, len(cp.History))
+			for i, m := range cp.History {
+				c := *m
+				restored[i] = &c
+			}
+			sess.agent.SetHistory(restored)
+			s.emitEvent("checkpoint.restored", sid, map[string]string{"name": body.Name})
+			writeJSON(w, http.StatusOK, map[string]interface{}{
+				"session":    sid,
+				"checkpoint": body.Name,
+				"restored":   len(restored),
+			})
+			return
+		}
+	}
+	writeJSON(w, http.StatusNotFound, map[string]string{"error": "checkpoint not found"})
+}
+
+// -------- Message Edit / Delete / Undo --------
+
+func (s *HTTPServer) handleEditMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+
+	hist := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+
+	var body struct {
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Content == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content is required"})
+		return
+	}
+
+	oldContent := hist[idx].Content
+	hist[idx].Content = body.Content
+	sess.agent.SetHistory(hist)
+
+	s.emitEvent("message.edited", sid, map[string]interface{}{
+		"index":       idx,
+		"old_length":  len(oldContent),
+		"new_length":  len(body.Content),
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"index":   idx,
+		"role":    string(hist[idx].Role),
+		"edited":  true,
+	})
+}
+
+func (s *HTTPServer) handleDeleteMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+
+	hist := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+
+	deleted := hist[idx]
+	newHist := make([]*schema.Message, 0, len(hist)-1)
+	newHist = append(newHist, hist[:idx]...)
+	newHist = append(newHist, hist[idx+1:]...)
+	sess.agent.SetHistory(newHist)
+
+	s.emitEvent("message.deleted", sid, map[string]interface{}{"index": idx})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"deleted": map[string]interface{}{
+			"index": idx,
+			"role":  string(deleted.Role),
+		},
+		"remaining": len(newHist),
+	})
+}
+
+func (s *HTTPServer) handleUndoMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	hist := sess.agent.GetHistory()
+	if len(hist) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no messages to undo"})
+		return
+	}
+
+	removed := hist[len(hist)-1]
+	sess.agent.SetHistory(hist[:len(hist)-1])
+
+	s.emitEvent("message.undone", sid, map[string]interface{}{
+		"role": string(removed.Role),
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"removed": map[string]interface{}{
+			"role":    string(removed.Role),
+			"length":  len(removed.Content),
+		},
+		"remaining": len(hist) - 1,
+	})
+}
+
+// -------- Session Clone --------
+
+func (s *HTTPServer) handleCloneSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body struct {
+		NewID string `json:"new_id"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	newID := body.NewID
+	if newID == "" {
+		newID = fmt.Sprintf("%s-clone-%d", sid, time.Now().UnixMilli())
+	}
+
+	if _, exists := s.sessions.Load(newID); exists {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "target session already exists"})
+		return
+	}
+
+	// 深拷贝历史和元数据
+	srcHist := sess.agent.GetHistory()
+	newHist := make([]*schema.Message, len(srcHist))
+	for i, m := range srcHist {
+		cp := *m
+		newHist[i] = &cp
+	}
+
+	newAgent := s.getOrCreateSession(newID)
+	newAgent.SetHistory(newHist)
+
+	// 拷贝标签
+	newSessVal, _ := s.sessions.Load(newID)
+	newSess := newSessVal.(*httpSession)
+	if sess.tags != nil {
+		newSess.tags = make(map[string]bool)
+		for k, v := range sess.tags {
+			newSess.tags[k] = v
+		}
+	}
+	newSess.systemPromptOverride = sess.systemPromptOverride
+
+	s.emitEvent("session.cloned", sid, map[string]string{"new_id": newID})
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"source":   sid,
+		"clone":    newID,
+		"messages": len(newHist),
+	})
+}
+
+// -------- Bulk Delete Sessions --------
+
+func (s *HTTPServer) handleBulkDeleteSessions(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		SessionIDs []string `json:"session_ids"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || len(body.SessionIDs) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session_ids array is required"})
+		return
+	}
+	if len(body.SessionIDs) > 100 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 100 sessions per request"})
+		return
+	}
+
+	deleted := 0
+	notFound := 0
+	for _, id := range body.SessionIDs {
+		if _, ok := s.sessions.LoadAndDelete(id); ok {
+			if s.sessionStore != nil {
+				_ = s.sessionStore.Delete(id)
+			}
+			deleted++
+		} else {
+			notFound++
+		}
+	}
+
+	s.emitEvent("sessions.bulk_deleted", "", map[string]int{"deleted": deleted})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"deleted":   deleted,
+		"not_found": notFound,
+		"total":     len(body.SessionIDs),
+	})
+}
+
+// -------- Tool Pipeline --------
+
+func (s *HTTPServer) handleToolPipeline(w http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Steps []struct {
+			Tool string                 `json:"tool"`
+			Args map[string]interface{} `json:"args"`
+		} `json:"steps"`
+		StopOnError bool `json:"stop_on_error"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+	if len(body.Steps) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "steps array is required"})
+		return
+	}
+	if len(body.Steps) > 10 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max 10 steps per pipeline"})
+		return
+	}
+
+	results := make([]map[string]interface{}, 0, len(body.Steps))
+	var lastOutput string
+	for i, step := range body.Steps {
+		// 支持 {{prev}} 引用上一步输出
+		args := make(map[string]interface{})
+		for k, v := range step.Args {
+			if str, ok := v.(string); ok && strings.Contains(str, "{{prev}}") {
+				args[k] = strings.ReplaceAll(str, "{{prev}}", lastOutput)
+			} else {
+				args[k] = v
+			}
+		}
+
+		start := time.Now()
+		output, err := s.registry.Execute(r.Context(), step.Tool, args)
+		elapsed := time.Since(start).Milliseconds()
+
+		result := map[string]interface{}{
+			"step":     i,
+			"tool":     step.Tool,
+			"elapsed":  elapsed,
+		}
+		if err != nil {
+			result["error"] = err.Error()
+			result["success"] = false
+			results = append(results, result)
+			if body.StopOnError {
+				break
+			}
+			continue
+		}
+
+		lastOutput = output
+		result["output"] = output
+		result["success"] = true
+		results = append(results, result)
+	}
+
+	s.emitEvent("pipeline.completed", "", map[string]int{"steps": len(results)})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"results": results,
+		"total":   len(results),
+	})
+}
+
+// -------- Session Manual Save --------
+
+func (s *HTTPServer) handleSaveSession(w http.ResponseWriter, r *http.Request) {
+	if s.sessionStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "session persistence not configured"})
+		return
+	}
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	s.saveSession(sid, sess)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"saved":   true,
+		"messages": len(sess.agent.GetHistory()),
+	})
+}
+
+// -------- Fork at Index --------
+
+func (s *HTTPServer) handleForkAtIndex(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body struct {
+		NewID    string `json:"new_id"`
+		AtIndex  int    `json:"at_index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	hist := sess.agent.GetHistory()
+	if body.AtIndex < 0 || body.AtIndex > len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at_index out of range"})
+		return
+	}
+
+	newID := body.NewID
+	if newID == "" {
+		newID = fmt.Sprintf("%s-fork-%d", sid, time.Now().UnixMilli())
+	}
+	if _, exists := s.sessions.Load(newID); exists {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "target session already exists"})
+		return
+	}
+
+	// 只复制到 at_index 的历史
+	forked := make([]*schema.Message, body.AtIndex)
+	for i := 0; i < body.AtIndex; i++ {
+		cp := *hist[i]
+		forked[i] = &cp
+	}
+
+	newAgent := s.getOrCreateSession(newID)
+	newAgent.SetHistory(forked)
+
+	s.emitEvent("session.forked", sid, map[string]string{"new_id": newID})
+	writeJSON(w, http.StatusCreated, map[string]interface{}{
+		"source":         sid,
+		"forked":         newID,
+		"at_index":       body.AtIndex,
+		"source_messages": len(hist),
+		"forked_messages": len(forked),
 	})
 }
 

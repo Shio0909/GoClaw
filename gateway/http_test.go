@@ -2988,3 +2988,481 @@ func TestInjectMessageValidation(t *testing.T) {
 		t.Fatalf("expected 400 for invalid role, got %d", w.Code)
 	}
 }
+
+// -------- Session Checkpoint Tests --------
+
+func TestCreateCheckpoint(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/checkpoint", srv.handleCreateCheckpoint)
+	mux.HandleFunc("GET /v1/sessions/{session}/checkpoints", srv.handleListCheckpoints)
+
+	ag := srv.getOrCreateSession("cp-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "hi"},
+	})
+	srv.sessions.Store("cp-test", &httpSession{agent: ag})
+
+	// Create checkpoint
+	body := `{"name":"v1"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/cp-test/checkpoint", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["checkpoint"] != "v1" {
+		t.Fatalf("expected checkpoint=v1, got %v", resp["checkpoint"])
+	}
+	if resp["messages"].(float64) != 2 {
+		t.Fatalf("expected 2 messages in checkpoint, got %v", resp["messages"])
+	}
+
+	// List checkpoints
+	req = httptest.NewRequest("GET", "/v1/sessions/cp-test/checkpoints", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// Duplicate name
+	req = httptest.NewRequest("POST", "/v1/sessions/cp-test/checkpoint", strings.NewReader(`{"name":"v1"}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", w.Code)
+	}
+}
+
+func TestRestoreCheckpoint(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/checkpoint", srv.handleCreateCheckpoint)
+	mux.HandleFunc("POST /v1/sessions/{session}/checkpoint/restore", srv.handleRestoreCheckpoint)
+
+	ag := srv.getOrCreateSession("restore-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "msg1"},
+	})
+	srv.sessions.Store("restore-test", &httpSession{agent: ag})
+
+	// Create checkpoint with 1 message
+	req := httptest.NewRequest("POST", "/v1/sessions/restore-test/checkpoint", strings.NewReader(`{"name":"snap1"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("checkpoint create: expected 201, got %d", w.Code)
+	}
+
+	// Add more messages
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "msg1"},
+		{Role: "assistant", Content: "msg2"},
+		{Role: "user", Content: "msg3"},
+	})
+
+	// Restore checkpoint
+	req = httptest.NewRequest("POST", "/v1/sessions/restore-test/checkpoint/restore", strings.NewReader(`{"name":"snap1"}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("restore: expected 200, got %d", w.Code)
+	}
+
+	// Verify history restored
+	if len(ag.GetHistory()) != 1 {
+		t.Fatalf("expected 1 message after restore, got %d", len(ag.GetHistory()))
+	}
+
+	// Restore non-existent
+	req = httptest.NewRequest("POST", "/v1/sessions/restore-test/checkpoint/restore", strings.NewReader(`{"name":"nope"}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for missing checkpoint, got %d", w.Code)
+	}
+}
+
+func TestCheckpointNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/checkpoint", srv.handleCreateCheckpoint)
+	mux.HandleFunc("GET /v1/sessions/{session}/checkpoints", srv.handleListCheckpoints)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/checkpoint", strings.NewReader(`{"name":"v1"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+
+	req = httptest.NewRequest("GET", "/v1/sessions/nonexist/checkpoints", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// -------- Message Edit / Delete / Undo Tests --------
+
+func TestEditMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/messages/{index}", srv.handleEditMessage)
+
+	ag := srv.getOrCreateSession("edit-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "original"},
+	})
+	srv.sessions.Store("edit-test", &httpSession{agent: ag})
+
+	body := `{"content":"updated"}`
+	req := httptest.NewRequest("PUT", "/v1/sessions/edit-test/messages/0", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	hist := ag.GetHistory()
+	if hist[0].Content != "updated" {
+		t.Fatalf("expected content=updated, got %s", hist[0].Content)
+	}
+}
+
+func TestEditMessageOutOfRange(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/messages/{index}", srv.handleEditMessage)
+
+	ag := srv.getOrCreateSession("edit-oor")
+	srv.sessions.Store("edit-oor", &httpSession{agent: ag})
+
+	req := httptest.NewRequest("PUT", "/v1/sessions/edit-oor/messages/5", strings.NewReader(`{"content":"x"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestDeleteMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /v1/sessions/{session}/messages/{index}", srv.handleDeleteMessage)
+
+	ag := srv.getOrCreateSession("del-msg")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "a"},
+		{Role: "assistant", Content: "b"},
+		{Role: "user", Content: "c"},
+	})
+	srv.sessions.Store("del-msg", &httpSession{agent: ag})
+
+	req := httptest.NewRequest("DELETE", "/v1/sessions/del-msg/messages/1", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["remaining"].(float64) != 2 {
+		t.Fatalf("expected 2 remaining, got %v", resp["remaining"])
+	}
+
+	hist := ag.GetHistory()
+	if len(hist) != 2 || hist[1].Content != "c" {
+		t.Fatal("message not correctly deleted")
+	}
+}
+
+func TestUndoMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/undo", srv.handleUndoMessage)
+
+	ag := srv.getOrCreateSession("undo-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "first"},
+		{Role: "assistant", Content: "second"},
+	})
+	srv.sessions.Store("undo-test", &httpSession{agent: ag})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/undo-test/undo", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["remaining"].(float64) != 1 {
+		t.Fatalf("expected 1 remaining, got %v", resp["remaining"])
+	}
+}
+
+func TestUndoMessageEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/undo", srv.handleUndoMessage)
+
+	ag := srv.getOrCreateSession("undo-empty")
+	srv.sessions.Store("undo-empty", &httpSession{agent: ag})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/undo-empty/undo", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// -------- Session Clone Tests --------
+
+func TestCloneSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/clone", srv.handleCloneSession)
+
+	ag := srv.getOrCreateSession("src-clone")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "world"},
+	})
+	srv.sessions.Store("src-clone", &httpSession{
+		agent: ag,
+		tags:  map[string]bool{"important": true},
+	})
+
+	body := `{"new_id":"my-clone"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/src-clone/clone", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["clone"] != "my-clone" {
+		t.Fatalf("expected clone=my-clone, got %v", resp["clone"])
+	}
+
+	// Verify clone exists
+	cloneVal, ok := srv.sessions.Load("my-clone")
+	if !ok {
+		t.Fatal("clone session not found")
+	}
+	cloneSess := cloneVal.(*httpSession)
+	if len(cloneSess.agent.GetHistory()) != 2 {
+		t.Fatalf("expected 2 messages in clone, got %d", len(cloneSess.agent.GetHistory()))
+	}
+	if !cloneSess.tags["important"] {
+		t.Fatal("tags not copied to clone")
+	}
+}
+
+func TestCloneSessionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/clone", srv.handleCloneSession)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/clone", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// -------- Bulk Delete Tests --------
+
+func TestBulkDeleteSessions(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/bulk-delete", srv.handleBulkDeleteSessions)
+
+	// Create sessions
+	for _, id := range []string{"bd-1", "bd-2", "bd-3"} {
+		ag := srv.getOrCreateSession(id)
+		srv.sessions.Store(id, &httpSession{agent: ag})
+	}
+
+	body := `{"session_ids":["bd-1","bd-2","bd-nonexist"]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/bulk-delete", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["deleted"].(float64) != 2 {
+		t.Fatalf("expected 2 deleted, got %v", resp["deleted"])
+	}
+	if resp["not_found"].(float64) != 1 {
+		t.Fatalf("expected 1 not_found, got %v", resp["not_found"])
+	}
+
+	// Verify bd-3 still exists
+	if _, ok := srv.sessions.Load("bd-3"); !ok {
+		t.Fatal("bd-3 should still exist")
+	}
+}
+
+func TestBulkDeleteEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/bulk-delete", srv.handleBulkDeleteSessions)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/bulk-delete", strings.NewReader(`{"session_ids":[]}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// -------- Tool Pipeline Tests --------
+
+func TestToolPipelineEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/pipeline", srv.handleToolPipeline)
+
+	req := httptest.NewRequest("POST", "/v1/tools/pipeline", strings.NewReader(`{"steps":[]}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestToolPipelineTooMany(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/pipeline", srv.handleToolPipeline)
+
+	steps := make([]map[string]interface{}, 11)
+	for i := range steps {
+		steps[i] = map[string]interface{}{"tool": "test", "args": map[string]interface{}{}}
+	}
+	data, _ := json.Marshal(map[string]interface{}{"steps": steps})
+	req := httptest.NewRequest("POST", "/v1/tools/pipeline", strings.NewReader(string(data)))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for >10 steps, got %d", w.Code)
+	}
+}
+
+// -------- Save Session Tests --------
+
+func TestSaveSessionNoPersistence(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/save", srv.handleSaveSession)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/test/save", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("expected 503 when no persistence, got %d", w.Code)
+	}
+}
+
+// -------- Fork at Index Tests --------
+
+func TestForkAtIndex(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/fork-at", srv.handleForkAtIndex)
+
+	ag := srv.getOrCreateSession("fork-src")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "a"},
+		{Role: "assistant", Content: "b"},
+		{Role: "user", Content: "c"},
+		{Role: "assistant", Content: "d"},
+	})
+	srv.sessions.Store("fork-src", &httpSession{agent: ag})
+
+	body := `{"new_id":"fork-dst","at_index":2}`
+	req := httptest.NewRequest("POST", "/v1/sessions/fork-src/fork-at", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("expected 201, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["forked_messages"].(float64) != 2 {
+		t.Fatalf("expected 2 forked messages, got %v", resp["forked_messages"])
+	}
+
+	// Verify fork has only 2 messages
+	forkVal, ok := srv.sessions.Load("fork-dst")
+	if !ok {
+		t.Fatal("fork session not found")
+	}
+	forkSess := forkVal.(*httpSession)
+	if len(forkSess.agent.GetHistory()) != 2 {
+		t.Fatalf("expected 2 messages in fork, got %d", len(forkSess.agent.GetHistory()))
+	}
+}
+
+func TestForkAtIndexNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/fork-at", srv.handleForkAtIndex)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/fork-at", strings.NewReader(`{"at_index":0}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestForkAtIndexOutOfRange(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/fork-at", srv.handleForkAtIndex)
+
+	ag := srv.getOrCreateSession("fork-oor")
+	ag.SetHistory([]*schema.Message{{Role: "user", Content: "a"}})
+	srv.sessions.Store("fork-oor", &httpSession{agent: ag})
+
+	body := `{"at_index":5}`
+	req := httptest.NewRequest("POST", "/v1/sessions/fork-oor/fork-at", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+// -------- Event Stream Tests --------
+
+func TestEventStreamConnects(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/events", srv.handleEventStream)
+
+	req := httptest.NewRequest("GET", "/v1/events", nil)
+	ctx, cancel := context.WithTimeout(req.Context(), 100*time.Millisecond)
+	defer cancel()
+	req = req.WithContext(ctx)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	body := w.Body.String()
+	if !strings.Contains(body, "event: connected") {
+		t.Fatalf("expected connected event, got: %s", body)
+	}
+}
