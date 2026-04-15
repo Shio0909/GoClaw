@@ -106,6 +106,10 @@ type httpSession struct {
 	lockedBy    string          // 锁定者标识
 	systemPromptOverride string // 会话级 system prompt 覆盖
 	checkpoints []sessionCheckpoint // 命名检查点
+	archived    bool                // 归档状态
+	metadata    map[string]string   // 自定义元数据
+	reactions   map[int][]string    // 消息索引 -> 反应 emoji
+	bookmarks   map[int]string      // 消息索引 -> 书签标签
 }
 
 type sessionNote struct {
@@ -360,6 +364,25 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/{session}/save", s.handleSaveSession)
 	// Fork at index
 	mux.HandleFunc("POST /v1/sessions/{session}/fork-at", s.handleForkAtIndex)
+	// Message reactions
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/react", s.handleMessageReaction)
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/{index}/reactions", s.handleGetReactions)
+	// Session archive
+	mux.HandleFunc("POST /v1/sessions/{session}/archive", s.handleArchiveSession)
+	mux.HandleFunc("POST /v1/sessions/{session}/unarchive", s.handleUnarchiveSession)
+	mux.HandleFunc("GET /v1/sessions/archived", s.handleListArchivedSessions)
+	// Session history pagination
+	mux.HandleFunc("GET /v1/sessions/{session}/messages", s.handleGetMessages)
+	// Token count
+	mux.HandleFunc("GET /v1/sessions/{session}/tokens", s.handleTokenCount)
+	// Uptime
+	mux.HandleFunc("GET /v1/uptime", s.handleUptime)
+	// Session metadata
+	mux.HandleFunc("GET /v1/sessions/{session}/meta", s.handleGetSessionMeta)
+	mux.HandleFunc("PUT /v1/sessions/{session}/meta", s.handleSetSessionMeta)
+	// Message bookmark
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/bookmark", s.handleBookmarkMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/bookmarks", s.handleGetBookmarks)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -3866,6 +3889,385 @@ func (s *HTTPServer) handleForkAtIndex(w http.ResponseWriter, r *http.Request) {
 		"at_index":       body.AtIndex,
 		"source_messages": len(hist),
 		"forked_messages": len(forked),
+	})
+}
+
+// -------- Message Reactions --------
+
+func (s *HTTPServer) handleMessageReaction(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+
+	hist := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+
+	var body struct {
+		Reaction string `json:"reaction"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.Reaction == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "reaction is required"})
+		return
+	}
+
+	if sess.reactions == nil {
+		sess.reactions = make(map[int][]string)
+	}
+	sess.reactions[idx] = append(sess.reactions[idx], body.Reaction)
+
+	s.emitEvent("message.reacted", sid, map[string]interface{}{
+		"index":    idx,
+		"reaction": body.Reaction,
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":   sid,
+		"index":     idx,
+		"reaction":  body.Reaction,
+		"total":     len(sess.reactions[idx]),
+	})
+}
+
+func (s *HTTPServer) handleGetReactions(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+
+	reactions := sess.reactions[idx]
+	if reactions == nil {
+		reactions = []string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":   sid,
+		"index":     idx,
+		"reactions": reactions,
+	})
+}
+
+// -------- Session Archive --------
+
+func (s *HTTPServer) handleArchiveSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	sess.archived = true
+	s.emitEvent("session.archived", sid, nil)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"archived": true,
+	})
+}
+
+func (s *HTTPServer) handleUnarchiveSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	sess.archived = false
+	s.emitEvent("session.unarchived", sid, nil)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"archived": false,
+	})
+}
+
+func (s *HTTPServer) handleListArchivedSessions(w http.ResponseWriter, r *http.Request) {
+	var archived []map[string]interface{}
+	s.sessions.Range(func(key, val any) bool {
+		sess := val.(*httpSession)
+		if sess.archived {
+			archived = append(archived, map[string]interface{}{
+				"id":       key.(string),
+				"messages": len(sess.agent.GetHistory()),
+			})
+		}
+		return true
+	})
+	if archived == nil {
+		archived = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"archived": archived,
+		"count":    len(archived),
+	})
+}
+
+// -------- Session History Pagination --------
+
+func (s *HTTPServer) handleGetMessages(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	hist := sess.agent.GetHistory()
+	offset := 0
+	limit := 50
+
+	if v := r.URL.Query().Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 200 {
+			limit = n
+		}
+	}
+
+	// 角色过滤
+	roleFilter := r.URL.Query().Get("role")
+
+	var filtered []*schema.Message
+	if roleFilter != "" {
+		for _, m := range hist {
+			if string(m.Role) == roleFilter {
+				filtered = append(filtered, m)
+			}
+		}
+	} else {
+		filtered = hist
+	}
+
+	total := len(filtered)
+	if offset >= total {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"session":  sid,
+			"messages": []*schema.Message{},
+			"total":    total,
+			"offset":   offset,
+			"limit":    limit,
+		})
+		return
+	}
+
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"messages": filtered[offset:end],
+		"total":    total,
+		"offset":   offset,
+		"limit":    limit,
+		"has_more": end < total,
+	})
+}
+
+// -------- Token Count --------
+
+func (s *HTTPServer) handleTokenCount(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+
+	totalChars := 0
+	perRole := make(map[string]int)
+	for _, m := range hist {
+		totalChars += len(m.Content)
+		perRole[string(m.Role)] += len(m.Content)
+	}
+
+	// 估算 token 数（CJK 约 1 字/token，英文约 4 字符/token）
+	estimateTokens := func(chars int) int {
+		return chars/2 + 1 // 保守估计
+	}
+
+	roleTokens := make(map[string]int)
+	for role, chars := range perRole {
+		roleTokens[role] = estimateTokens(chars)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":         sid,
+		"total_chars":     totalChars,
+		"estimated_tokens": estimateTokens(totalChars),
+		"per_role_tokens": roleTokens,
+		"messages":        len(hist),
+		"context_limit":   s.contextLength,
+		"usage_percent":   float64(estimateTokens(totalChars)) / float64(s.contextLength) * 100,
+	})
+}
+
+// -------- Uptime --------
+
+func (s *HTTPServer) handleUptime(w http.ResponseWriter, r *http.Request) {
+	uptime := time.Since(s.startedAt)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"started_at":   s.startedAt.Format(time.RFC3339),
+		"uptime":       uptime.String(),
+		"uptime_seconds": int(uptime.Seconds()),
+		"chat_count":   s.chatCount.Load(),
+		"active_conns": s.activeConns.Load(),
+	})
+}
+
+// -------- Session Metadata --------
+
+func (s *HTTPServer) handleGetSessionMeta(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	meta := sess.metadata
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"metadata": meta,
+	})
+}
+
+func (s *HTTPServer) handleSetSessionMeta(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body map[string]string
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON object"})
+		return
+	}
+
+	if sess.metadata == nil {
+		sess.metadata = make(map[string]string)
+	}
+	for k, v := range body {
+		if v == "" {
+			delete(sess.metadata, k)
+		} else {
+			sess.metadata[k] = v
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"metadata": sess.metadata,
+	})
+}
+
+// -------- Message Bookmark --------
+
+func (s *HTTPServer) handleBookmarkMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+
+	hist := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+
+	var body struct {
+		Label string `json:"label"`
+	}
+	_ = json.NewDecoder(r.Body).Decode(&body)
+	if body.Label == "" {
+		body.Label = fmt.Sprintf("bookmark-%d", idx)
+	}
+
+	if sess.bookmarks == nil {
+		sess.bookmarks = make(map[int]string)
+	}
+	sess.bookmarks[idx] = body.Label
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"index":   idx,
+		"label":   body.Label,
+	})
+}
+
+func (s *HTTPServer) handleGetBookmarks(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	items := make([]map[string]interface{}, 0)
+	hist := sess.agent.GetHistory()
+	for idx, label := range sess.bookmarks {
+		item := map[string]interface{}{
+			"index": idx,
+			"label": label,
+		}
+		if idx < len(hist) {
+			item["role"] = string(hist[idx].Role)
+			preview := hist[idx].Content
+			if len(preview) > 100 {
+				preview = preview[:100] + "..."
+			}
+			item["preview"] = preview
+		}
+		items = append(items, item)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":   sid,
+		"bookmarks": items,
+		"count":     len(items),
 	})
 }
 

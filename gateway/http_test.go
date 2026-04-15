@@ -3466,3 +3466,346 @@ func TestEventStreamConnects(t *testing.T) {
 		t.Fatalf("expected connected event, got: %s", body)
 	}
 }
+
+// -------- Message Reaction Tests --------
+
+func TestMessageReaction(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/react", srv.handleMessageReaction)
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/{index}/reactions", srv.handleGetReactions)
+
+	ag := srv.getOrCreateSession("react-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "hello"},
+	})
+	srv.sessions.Store("react-test", &httpSession{agent: ag})
+
+	// Add reaction
+	body := `{"reaction":"👍"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/react-test/messages/0/react", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// Get reactions
+	req = httptest.NewRequest("GET", "/v1/sessions/react-test/messages/0/reactions", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	reactions := resp["reactions"].([]interface{})
+	if len(reactions) != 1 || reactions[0] != "👍" {
+		t.Fatalf("expected [👍], got %v", reactions)
+	}
+}
+
+func TestMessageReactionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/react", srv.handleMessageReaction)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/messages/0/react", strings.NewReader(`{"reaction":"👍"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// -------- Session Archive Tests --------
+
+func TestArchiveSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/archive", srv.handleArchiveSession)
+	mux.HandleFunc("POST /v1/sessions/{session}/unarchive", srv.handleUnarchiveSession)
+	mux.HandleFunc("GET /v1/sessions/archived", srv.handleListArchivedSessions)
+
+	ag := srv.getOrCreateSession("arch-test")
+	srv.sessions.Store("arch-test", &httpSession{agent: ag})
+
+	// Archive
+	req := httptest.NewRequest("POST", "/v1/sessions/arch-test/archive", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// List archived
+	req = httptest.NewRequest("GET", "/v1/sessions/archived", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 1 {
+		t.Fatalf("expected 1 archived, got %v", resp["count"])
+	}
+
+	// Unarchive
+	req = httptest.NewRequest("POST", "/v1/sessions/arch-test/unarchive", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// List should be empty
+	req = httptest.NewRequest("GET", "/v1/sessions/archived", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 0 {
+		t.Fatalf("expected 0 archived after unarchive, got %v", resp["count"])
+	}
+}
+
+func TestArchiveNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/archive", srv.handleArchiveSession)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/archive", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// -------- Messages Pagination Tests --------
+
+func TestGetMessagesPagination(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/messages", srv.handleGetMessages)
+
+	ag := srv.getOrCreateSession("page-test")
+	msgs := make([]*schema.Message, 10)
+	for i := range msgs {
+		msgs[i] = &schema.Message{Role: "user", Content: fmt.Sprintf("msg-%d", i)}
+	}
+	ag.SetHistory(msgs)
+	srv.sessions.Store("page-test", &httpSession{agent: ag})
+
+	// Get first 3
+	req := httptest.NewRequest("GET", "/v1/sessions/page-test/messages?offset=0&limit=3", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 10 {
+		t.Fatalf("expected total=10, got %v", resp["total"])
+	}
+	if resp["has_more"] != true {
+		t.Fatal("expected has_more=true")
+	}
+	msgArr := resp["messages"].([]interface{})
+	if len(msgArr) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgArr))
+	}
+}
+
+func TestGetMessagesWithRoleFilter(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/messages", srv.handleGetMessages)
+
+	ag := srv.getOrCreateSession("role-filter")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+	})
+	srv.sessions.Store("role-filter", &httpSession{agent: ag})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/role-filter/messages?role=user", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 2 {
+		t.Fatalf("expected 2 user messages, got %v", resp["total"])
+	}
+}
+
+// -------- Token Count Tests --------
+
+func TestTokenCount(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/tokens", srv.handleTokenCount)
+
+	ag := srv.getOrCreateSession("token-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "hello world"},
+		{Role: "assistant", Content: "hi there"},
+	})
+	srv.sessions.Store("token-test", &httpSession{agent: ag})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/token-test/tokens", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["messages"].(float64) != 2 {
+		t.Fatalf("expected 2 messages, got %v", resp["messages"])
+	}
+	if resp["estimated_tokens"].(float64) <= 0 {
+		t.Fatal("expected positive token estimate")
+	}
+}
+
+func TestTokenCountNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/tokens", srv.handleTokenCount)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexist/tokens", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// -------- Uptime Tests --------
+
+func TestUptime(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.startedAt = time.Now().Add(-5 * time.Minute)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/uptime", srv.handleUptime)
+
+	req := httptest.NewRequest("GET", "/v1/uptime", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["uptime_seconds"].(float64) < 290 {
+		t.Fatalf("expected ~300s uptime, got %v", resp["uptime_seconds"])
+	}
+}
+
+// -------- Session Metadata Tests --------
+
+func TestSessionMetadata(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/meta", srv.handleGetSessionMeta)
+	mux.HandleFunc("PUT /v1/sessions/{session}/meta", srv.handleSetSessionMeta)
+
+	ag := srv.getOrCreateSession("meta-test")
+	srv.sessions.Store("meta-test", &httpSession{agent: ag})
+
+	// Set metadata
+	body := `{"project":"goclaw","version":"1.0"}`
+	req := httptest.NewRequest("PUT", "/v1/sessions/meta-test/meta", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// Get metadata
+	req = httptest.NewRequest("GET", "/v1/sessions/meta-test/meta", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	meta := resp["metadata"].(map[string]interface{})
+	if meta["project"] != "goclaw" {
+		t.Fatalf("expected project=goclaw, got %v", meta["project"])
+	}
+
+	// Delete key by setting empty
+	body = `{"project":""}`
+	req = httptest.NewRequest("PUT", "/v1/sessions/meta-test/meta", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&resp)
+	meta = resp["metadata"].(map[string]interface{})
+	if _, exists := meta["project"]; exists {
+		t.Fatal("expected project key deleted")
+	}
+}
+
+func TestSessionMetaNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/meta", srv.handleGetSessionMeta)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexist/meta", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// -------- Bookmark Tests --------
+
+func TestBookmarkMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/bookmark", srv.handleBookmarkMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/bookmarks", srv.handleGetBookmarks)
+
+	ag := srv.getOrCreateSession("bm-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "important question"},
+		{Role: "assistant", Content: "critical answer"},
+	})
+	srv.sessions.Store("bm-test", &httpSession{agent: ag})
+
+	// Bookmark message 1
+	body := `{"label":"key-insight"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/bm-test/messages/1/bookmark", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// List bookmarks
+	req = httptest.NewRequest("GET", "/v1/sessions/bm-test/bookmarks", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 1 {
+		t.Fatalf("expected 1 bookmark, got %v", resp["count"])
+	}
+}
+
+func TestBookmarkNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/bookmark", srv.handleBookmarkMessage)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/messages/0/bookmark", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
