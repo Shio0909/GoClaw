@@ -193,6 +193,12 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		_, disabled := srv.disabledTools.Load(name)
 		return disabled
 	})
+	srv.registry.SetAliasResolver(func(alias string) (string, bool) {
+		if val, ok := srv.toolAliases.Load(alias); ok {
+			return val.(string), true
+		}
+		return "", false
+	})
 
 	// 加载插件
 	if cfg.PluginDir != "" {
@@ -312,6 +318,10 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/compare", s.handleCompareSessions)
 	// Conversation summary
 	mux.HandleFunc("GET /v1/sessions/{session}/summary", s.handleSessionSummary)
+	// Session import
+	mux.HandleFunc("POST /v1/sessions/{session}/import", s.handleImportSession)
+	// Message injection
+	mux.HandleFunc("POST /v1/sessions/{session}/inject", s.handleInjectMessage)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -490,12 +500,18 @@ func (s *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	// 检查会话锁定状态
 	if val, ok := s.sessions.Load(req.Session); ok {
-		if sess, ok := val.(*httpSession); ok && sess.locked {
-			writeJSON(w, http.StatusLocked, map[string]string{
-				"error":     "session is locked",
-				"locked_by": sess.lockedBy,
-			})
-			return
+		if sess, ok := val.(*httpSession); ok {
+			if sess.locked {
+				writeJSON(w, http.StatusLocked, map[string]string{
+					"error":     "session is locked",
+					"locked_by": sess.lockedBy,
+				})
+				return
+			}
+			// 应用会话级 system prompt 覆盖
+			if sess.systemPromptOverride != "" {
+				ag.SetExtraSystemPrompt(sess.systemPromptOverride)
+			}
 		}
 	}
 
@@ -3164,6 +3180,123 @@ func (s *HTTPServer) handleSessionSummary(w http.ResponseWriter, r *http.Request
 		"avg_user_msg_length":  avgUserLen,
 		"avg_assistant_msg_length": avgAssistantLen,
 		"total_chars":          totalUserChars + totalAssistantChars,
+	})
+}
+
+// handleImportSession 导入对话历史到会话
+func (s *HTTPServer) handleImportSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+
+	var body struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content string `json:"content"`
+		} `json:"messages"`
+		Append bool `json:"append"` // true=追加，false=替换
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if len(body.Messages) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "messages array is required"})
+		return
+	}
+
+	// 验证角色
+	for i, m := range body.Messages {
+		switch m.Role {
+		case "user", "assistant", "system", "tool":
+		default:
+			writeJSON(w, http.StatusBadRequest, map[string]string{
+				"error": fmt.Sprintf("invalid role at index %d: %s", i, m.Role),
+			})
+			return
+		}
+	}
+
+	ag := s.getOrCreateSession(sid)
+	imported := make([]*schema.Message, 0, len(body.Messages))
+	for _, m := range body.Messages {
+		imported = append(imported, &schema.Message{
+			Role:    schema.RoleType(m.Role),
+			Content: m.Content,
+		})
+	}
+
+	if body.Append {
+		existing := ag.GetHistory()
+		combined := make([]*schema.Message, 0, len(existing)+len(imported))
+		combined = append(combined, existing...)
+		combined = append(combined, imported...)
+		ag.SetHistory(combined)
+	} else {
+		ag.SetHistory(imported)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"imported": len(body.Messages),
+		"mode":     map[bool]string{true: "append", false: "replace"}[body.Append],
+		"total":    len(ag.GetHistory()),
+	})
+}
+
+// handleInjectMessage 注入单条消息到会话历史
+func (s *HTTPServer) handleInjectMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+		Index   int    `json:"index"` // -1 或省略 = 追加到末尾
+	}
+	body.Index = -1
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if body.Content == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content is required"})
+		return
+	}
+	switch body.Role {
+	case "user", "assistant", "system", "tool":
+	case "":
+		body.Role = "user"
+	default:
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid role: " + body.Role})
+		return
+	}
+
+	msg := &schema.Message{
+		Role:    schema.RoleType(body.Role),
+		Content: body.Content,
+	}
+
+	hist := sess.agent.GetHistory()
+	if body.Index < 0 || body.Index >= len(hist) {
+		// 追加到末尾
+		hist = append(hist, msg)
+	} else {
+		// 在指定位置插入
+		hist = append(hist[:body.Index+1], hist[body.Index:]...)
+		hist[body.Index] = msg
+	}
+	sess.agent.SetHistory(hist)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"injected": true,
+		"role":     body.Role,
+		"index":    body.Index,
+		"total":    len(hist),
 	})
 }
 

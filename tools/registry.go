@@ -31,6 +31,9 @@ type ParamDef struct {
 // DisabledChecker 返回指定工具是否被禁用
 type DisabledChecker func(name string) bool
 
+// AliasResolver 返回别名对应的真实工具名
+type AliasResolver func(alias string) (realName string, ok bool)
+
 // Registry 工具注册中心
 type Registry struct {
 	mu              sync.RWMutex
@@ -38,6 +41,7 @@ type Registry struct {
 	mcpBridge       *MCPBridge
 	defaultTimeout  time.Duration   // 全局默认超时
 	disabledChecker DisabledChecker // 可选：运行时禁用检查
+	aliasResolver   AliasResolver   // 可选：工具别名解析
 }
 
 // NewRegistry 创建工具注册中心
@@ -76,6 +80,26 @@ func (r *Registry) SetDisabledChecker(fn DisabledChecker) {
 	r.disabledChecker = fn
 }
 
+// SetAliasResolver 设置工具别名解析函数
+func (r *Registry) SetAliasResolver(fn AliasResolver) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.aliasResolver = fn
+}
+
+// resolveAlias 解析工具别名，返回真实名称
+func (r *Registry) resolveAlias(name string) string {
+	r.mu.RLock()
+	fn := r.aliasResolver
+	r.mu.RUnlock()
+	if fn != nil {
+		if real, ok := fn(name); ok {
+			return real
+		}
+	}
+	return name
+}
+
 // IsDisabled 检查工具是否被禁用
 func (r *Registry) IsDisabled(name string) bool {
 	r.mu.RLock()
@@ -89,6 +113,9 @@ func (r *Registry) IsDisabled(name string) bool {
 
 // Execute 执行工具，自动应用超时配置
 func (r *Registry) Execute(ctx context.Context, name string, args map[string]interface{}) (string, error) {
+	// 解析别名
+	name = r.resolveAlias(name)
+
 	if r.IsDisabled(name) {
 		return "", fmt.Errorf("tool %q is disabled by runtime policy", name)
 	}

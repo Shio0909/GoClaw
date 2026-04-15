@@ -2872,3 +2872,119 @@ func TestSessionSummaryNotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
+
+func TestImportSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/import", srv.handleImportSession)
+
+	body := `{"messages":[{"role":"user","content":"hello"},{"role":"assistant","content":"hi"}],"append":false}`
+	req := httptest.NewRequest("POST", "/v1/sessions/import-test/import", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["imported"].(float64) != 2 {
+		t.Fatalf("expected 2 imported, got %v", resp["imported"])
+	}
+	if resp["mode"] != "replace" {
+		t.Fatalf("expected mode=replace, got %v", resp["mode"])
+	}
+}
+
+func TestImportSessionInvalidRole(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/import", srv.handleImportSession)
+
+	body := `{"messages":[{"role":"invalid","content":"test"}]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/import-test/import", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestImportSessionEmpty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/import", srv.handleImportSession)
+
+	body := `{"messages":[]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/import-test/import", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestInjectMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/inject", srv.handleInjectMessage)
+
+	ag := srv.getOrCreateSession("inject-test")
+	srv.sessions.Store("inject-test", &httpSession{agent: ag})
+
+	body := `{"role":"user","content":"injected message"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/inject-test/inject", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["injected"] != true {
+		t.Fatal("expected injected=true")
+	}
+	if resp["total"].(float64) != 1 {
+		t.Fatalf("expected total=1, got %v", resp["total"])
+	}
+}
+
+func TestInjectMessageNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/inject", srv.handleInjectMessage)
+
+	body := `{"content":"test"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexistent/inject", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestInjectMessageValidation(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/inject", srv.handleInjectMessage)
+
+	ag := srv.getOrCreateSession("inject-val")
+	srv.sessions.Store("inject-val", &httpSession{agent: ag})
+
+	// Empty content
+	body := `{"content":""}`
+	req := httptest.NewRequest("POST", "/v1/sessions/inject-val/inject", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+
+	// Invalid role
+	body = `{"role":"invalid","content":"test"}`
+	req = httptest.NewRequest("POST", "/v1/sessions/inject-val/inject", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for invalid role, got %d", w.Code)
+	}
+}

@@ -165,3 +165,37 @@ func TestDisabledChecker(t *testing.T) {
 		t.Fatalf("expected ok after re-enable, got err=%v", err)
 	}
 }
+
+func TestAliasResolver(t *testing.T) {
+	r := NewRegistry()
+	r.Register(&ToolDef{
+		Name:        "file_search",
+		Description: "Search files",
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			return "found", nil
+		},
+	})
+
+	// Without alias, "search" should not resolve
+	_, err := r.Execute(context.Background(), "search", nil)
+	if err == nil {
+		t.Fatal("expected error for unknown tool 'search'")
+	}
+
+	// Set alias resolver
+	r.SetAliasResolver(func(alias string) (string, bool) {
+		if alias == "search" {
+			return "file_search", true
+		}
+		return "", false
+	})
+
+	// Now "search" should resolve to "file_search"
+	result, err := r.Execute(context.Background(), "search", nil)
+	if err != nil {
+		t.Fatalf("expected alias to resolve, got err=%v", err)
+	}
+	if result != "found" {
+		t.Fatalf("expected 'found', got %q", result)
+	}
+}
