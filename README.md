@@ -16,7 +16,7 @@
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
   飞书Bot  ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
   (扩展)   ──→ │  └───────┘  └─────────┘  └──────────┘   │
-               │  159 API Endpoints · Audit · Webhooks    │
+               │  166 API Endpoints · Audit · Webhooks    │
                └──────────────────────────────────────────┘
 ```
 
@@ -28,7 +28,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~24,000 行 Go（含 435 个测试） | — |
+| **代码量** | ~29,000 行 Go（含 565 个测试） | — |
 
 ## 核心特性
 
@@ -60,7 +60,7 @@
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 159 个端点，完整 OpenAPI 3.0 规范
+- 166 个端点，完整 OpenAPI 3.0 规范
 - X-Request-ID 请求追踪（自动生成或透传客户端 ID）
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
@@ -154,6 +154,12 @@
 - **批量重命名**（一次重命名多个会话）
 - **会话成本估算**（基于 Token 和提供商定价）
 - **工具目录**（完整工具列表 + 描述 + 分类）
+- **会话分组**（按标签组织管理多个会话）
+- **检查点对比**（两个检查点之间的差异分析）
+- **API 使用统计**（端点调用次数/错误率/平均延迟）
+- **消息翻译**（多语言翻译提示生成）
+- **会话参与者**（按角色分析消息分布）
+- **变更日志**（版本历史 + 功能摘要）
 
 ## 项目结构
 
@@ -178,7 +184,7 @@ GoClaw/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（159 端点，REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── http.go             # HTTP API（166 端点，REST + SSE + WebSocket + OpenAI 兼容）
 │   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
@@ -399,6 +405,13 @@ docker compose up -d
 | `/v1/sessions/bulk-rename` | POST | 批量重命名 |
 | `/v1/sessions/:session/cost` | GET | 会话成本估算 |
 | `/v1/tool-catalog` | GET | 工具目录 |
+| `/v1/sessions/group` | POST | 创建会话分组 |
+| `/v1/sessions/groups` | GET | 列出所有会话分组 |
+| `/v1/sessions/:session/checkpoints/diff` | GET | 检查点对比 |
+| `/v1/stats/api` | GET | API 使用统计 |
+| `/v1/sessions/:session/messages/:index/translate` | POST | 消息翻译 |
+| `/v1/sessions/:session/participants` | GET | 会话参与者分析 |
+| `/v1/changelog` | GET | 变更日志 |
 
 ### OpenAI 兼容 API
 

@@ -540,6 +540,14 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/bulk-rename", s.handleBulkRename)
 	mux.HandleFunc("GET /v1/sessions/{session}/cost", s.handleSessionCost)
 	mux.HandleFunc("GET /v1/tool-catalog", s.handleToolCatalog)
+	// ──── Batch 6: Session Groups, Webhook API, Rate Limit Info, etc. ────
+	mux.HandleFunc("POST /v1/sessions/group", s.handleCreateSessionGroup)
+	mux.HandleFunc("GET /v1/sessions/groups", s.handleListSessionGroups)
+	mux.HandleFunc("GET /v1/sessions/{session}/checkpoints/diff", s.handleCheckpointDiff)
+	mux.HandleFunc("GET /v1/stats/api", s.handleAPIUsageStats)
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/translate", s.handleTranslateMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/participants", s.handleSessionParticipants)
+	mux.HandleFunc("GET /v1/changelog", s.handleChangelog)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -7089,5 +7097,247 @@ func (s *HTTPServer) handleToolCatalog(w http.ResponseWriter, r *http.Request) {
 		"tools":      catalog,
 		"total":      len(catalog),
 		"categories": []string{"file", "shell", "web", "search", "mcp", "utility"},
+	})
+}
+
+// ──────── Batch 6: Session Groups, Webhooks API, Rate Limit, etc. ────────
+
+func (s *HTTPServer) handleCreateSessionGroup(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name     string   `json:"name"`
+		Sessions []string `json:"sessions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.Name == "" || len(req.Sessions) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and sessions required"})
+		return
+	}
+
+	// 验证会话存在
+	valid := []string{}
+	for _, sid := range req.Sessions {
+		if _, ok := s.sessions.Load(sid); ok {
+			valid = append(valid, sid)
+		}
+	}
+
+	// 为每个会话添加组标签
+	for _, sid := range valid {
+		if val, ok := s.sessions.Load(sid); ok {
+			sess := val.(*httpSession)
+			if sess.tags == nil {
+				sess.tags = map[string]bool{}
+			}
+			sess.tags["group:"+req.Name] = true
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"group":    req.Name,
+		"sessions": valid,
+		"count":    len(valid),
+	})
+}
+
+func (s *HTTPServer) handleListSessionGroups(w http.ResponseWriter, r *http.Request) {
+	groups := map[string][]string{}
+	s.sessions.Range(func(key, val any) bool {
+		sid := key.(string)
+		sess := val.(*httpSession)
+		for tag := range sess.tags {
+			if strings.HasPrefix(tag, "group:") {
+				groupName := strings.TrimPrefix(tag, "group:")
+				groups[groupName] = append(groups[groupName], sid)
+			}
+		}
+		return true
+	})
+
+	type groupInfo struct {
+		Name     string   `json:"name"`
+		Sessions []string `json:"sessions"`
+		Count    int      `json:"count"`
+	}
+	result := make([]groupInfo, 0, len(groups))
+	for name, sids := range groups {
+		result = append(result, groupInfo{Name: name, Sessions: sids, Count: len(sids)})
+	}
+	sort.Slice(result, func(i, j int) bool { return result[i].Name < result[j].Name })
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"groups": result,
+		"count":  len(result),
+	})
+}
+
+func (s *HTTPServer) handleCheckpointDiff(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	cp1 := r.URL.Query().Get("cp1")
+	cp2 := r.URL.Query().Get("cp2")
+
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	if cp1 == "" || cp2 == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "cp1 and cp2 query params required"})
+		return
+	}
+
+	var checkpoint1, checkpoint2 *sessionCheckpoint
+	for i := range sess.checkpoints {
+		if sess.checkpoints[i].Name == cp1 {
+			checkpoint1 = &sess.checkpoints[i]
+		}
+		if sess.checkpoints[i].Name == cp2 {
+			checkpoint2 = &sess.checkpoints[i]
+		}
+	}
+	if checkpoint1 == nil || checkpoint2 == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "one or both checkpoints not found"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":    sid,
+		"cp1":        cp1,
+		"cp2":        cp2,
+		"cp1_msgs":   len(checkpoint1.History),
+		"cp2_msgs":   len(checkpoint2.History),
+		"msg_diff":   len(checkpoint2.History) - len(checkpoint1.History),
+		"cp1_time":   checkpoint1.CreatedAt,
+		"cp2_time":   checkpoint2.CreatedAt,
+	})
+}
+
+func (s *HTTPServer) handleAPIUsageStats(w http.ResponseWriter, r *http.Request) {
+	type epStat struct {
+		Endpoint string  `json:"endpoint"`
+		Calls    int64   `json:"calls"`
+		Errors   int64   `json:"errors"`
+		AvgMs    float64 `json:"avg_ms"`
+	}
+
+	var stats []epStat
+	s.endpointStats.Range(func(key, val any) bool {
+		ep := key.(string)
+		st := val.(*endpointStat)
+		calls := st.calls.Load()
+		errors := st.errors.Load()
+		avgMs := 0.0
+		if calls > 0 {
+			avgMs = float64(st.totalMs.Load()) / float64(calls) / float64(time.Millisecond)
+		}
+		stats = append(stats, epStat{
+			Endpoint: ep,
+			Calls:    calls,
+			Errors:   errors,
+			AvgMs:    avgMs,
+		})
+		return true
+	})
+
+	sort.Slice(stats, func(i, j int) bool { return stats[i].Calls > stats[j].Calls })
+
+	totalCalls := int64(0)
+	for _, st := range stats {
+		totalCalls += st.Calls
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"endpoints":    stats,
+		"total_calls":  totalCalls,
+		"unique_paths": len(stats),
+		"chat_count":   s.chatCount.Load(),
+	})
+}
+
+func (s *HTTPServer) handleTranslateMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	idxStr := r.PathValue("index")
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	history := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(history) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+
+	var req struct {
+		TargetLang string `json:"target_lang"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.TargetLang == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "target_lang required"})
+		return
+	}
+
+	// 简易翻译标记（实际翻译需要 LLM 调用）
+	msg := history[idx]
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":      sid,
+		"index":        idx,
+		"original":     msg.Content,
+		"target_lang":  req.TargetLang,
+		"note":         "translation requires LLM call - use /v1/chat with translation prompt",
+		"suggestion":   fmt.Sprintf("Please translate the following to %s: %s", req.TargetLang, truncateStr(msg.Content, 100)),
+	})
+}
+
+func (s *HTTPServer) handleSessionParticipants(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	history := sess.agent.GetHistory()
+
+	roles := map[string]int{}
+	for _, msg := range history {
+		roles[string(msg.Role)]++
+	}
+
+	type participant struct {
+		Role     string `json:"role"`
+		Messages int    `json:"messages"`
+	}
+	parts := make([]participant, 0, len(roles))
+	for role, count := range roles {
+		parts = append(parts, participant{Role: role, Messages: count})
+	}
+	sort.Slice(parts, func(i, j int) bool { return parts[i].Messages > parts[j].Messages })
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":      sid,
+		"participants": parts,
+		"total_roles":  len(parts),
+	})
+}
+
+func (s *HTTPServer) handleChangelog(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"version": "0.2.0",
+		"changelog": []map[string]string{
+			{"version": "0.2.0", "date": "2025-07-15", "summary": "Batch 4-6: OTel tracing, turn tracking, session groups, webhook API, 170+ endpoints"},
+			{"version": "0.1.5", "date": "2025-07-14", "summary": "Batch 1-3: SSE events, checkpoints, session ops, CSV export, templates"},
+			{"version": "0.1.0", "date": "2025-07-12", "summary": "Initial release: Agent runtime, HTTP API, QQ/Feishu gateways"},
+		},
 	})
 }

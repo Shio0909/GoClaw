@@ -5812,3 +5812,220 @@ func TestToolCatalog(t *testing.T) {
 		t.Error("expected non-negative tool count")
 	}
 }
+
+// ──── Batch 6 Tests ────
+
+func TestCreateSessionGroup(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/group", srv.handleCreateSessionGroup)
+
+	// 创建一些会话
+	for _, id := range []string{"g1", "g2", "g3"} {
+		srv.getOrCreateSession(id)
+	}
+
+	body := `{"name":"test-group","sessions":["g1","g2","nonexistent"]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/group", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["group"] != "test-group" {
+		t.Errorf("expected group name test-group, got %v", resp["group"])
+	}
+	// nonexistent 不应该包含在结果中
+	count := int(resp["count"].(float64))
+	if count != 2 {
+		t.Errorf("expected 2 valid sessions, got %d", count)
+	}
+}
+
+func TestCreateSessionGroupMissingFields(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/group", srv.handleCreateSessionGroup)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/group", strings.NewReader(`{"name":""}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestListSessionGroups(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/groups", srv.handleListSessionGroups)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/groups", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"] == nil {
+		t.Error("expected count field")
+	}
+}
+
+func TestCheckpointDiff(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/checkpoints/diff", srv.handleCheckpointDiff)
+
+	srv.getOrCreateSession("cp-diff-test")
+
+	// 缺少 cp2 参数
+	req := httptest.NewRequest("GET", "/v1/sessions/cp-diff-test/checkpoints/diff?cp1=a", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expected 400 for missing cp2, got %d", w.Code)
+	}
+
+	// 不存在的检查点
+	req = httptest.NewRequest("GET", "/v1/sessions/cp-diff-test/checkpoints/diff?cp1=a&cp2=b", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404 for nonexistent checkpoints, got %d", w.Code)
+	}
+}
+
+func TestCheckpointDiffSessionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/checkpoints/diff", srv.handleCheckpointDiff)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexistent/checkpoints/diff?cp1=a&cp2=b", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestAPIUsageStats(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/stats/api", srv.handleAPIUsageStats)
+
+	req := httptest.NewRequest("GET", "/v1/stats/api", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if _, ok := resp["total_calls"]; !ok {
+		t.Error("expected total_calls field")
+	}
+	if _, ok := resp["unique_paths"]; !ok {
+		t.Error("expected unique_paths field")
+	}
+}
+
+func TestTranslateMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/translate", srv.handleTranslateMessage)
+
+	ag := srv.getOrCreateSession("translate-test")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "hello world"})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/translate-test/messages/0/translate", strings.NewReader(`{"target_lang":"zh"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["target_lang"] != "zh" {
+		t.Errorf("expected target_lang zh, got %v", resp["target_lang"])
+	}
+}
+
+func TestTranslateMessageBadIndex(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/translate", srv.handleTranslateMessage)
+
+	srv.getOrCreateSession("translate-bad")
+
+	req := httptest.NewRequest("POST", "/v1/sessions/translate-bad/messages/999/translate", strings.NewReader(`{"target_lang":"en"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expected 400 for out of range index, got %d", w.Code)
+	}
+}
+
+func TestSessionParticipants(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/participants", srv.handleSessionParticipants)
+
+	ag := srv.getOrCreateSession("parts-test")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "test"})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/parts-test/participants", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total_roles"] == nil {
+		t.Error("expected total_roles field")
+	}
+}
+
+func TestSessionParticipantsNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/participants", srv.handleSessionParticipants)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexistent/participants", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestChangelog(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/changelog", srv.handleChangelog)
+
+	req := httptest.NewRequest("GET", "/v1/changelog", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["version"] == nil {
+		t.Error("expected version field")
+	}
+	if resp["changelog"] == nil {
+		t.Error("expected changelog field")
+	}
+}
