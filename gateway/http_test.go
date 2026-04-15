@@ -2130,3 +2130,167 @@ func TestDebugRoutes(t *testing.T) {
 		t.Fatalf("expected >= 40 routes, got %d", count)
 	}
 }
+
+// -------- Env Info Test --------
+
+func TestEnvInfo(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.startedAt = time.Now().Add(-10 * time.Second)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/env", srv.handleEnvInfo)
+
+	req := httptest.NewRequest("GET", "/v1/env", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["go_version"] == nil {
+		t.Fatal("expected go_version")
+	}
+	if resp["num_cpu"] == nil {
+		t.Fatal("expected num_cpu")
+	}
+	if int(resp["uptime_seconds"].(float64)) < 10 {
+		t.Fatal("expected uptime >= 10s")
+	}
+}
+
+// -------- Session Rename Tests --------
+
+func TestRenameSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.sessions.Store("old-id", &httpSession{lastUsed: time.Now()})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/rename", srv.handleRenameSession)
+
+	body := `{"new_id":"new-id"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/old-id/rename", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// old should be gone
+	if _, ok := srv.sessions.Load("old-id"); ok {
+		t.Fatal("old session should be deleted")
+	}
+	// new should exist
+	if _, ok := srv.sessions.Load("new-id"); !ok {
+		t.Fatal("new session should exist")
+	}
+}
+
+func TestRenameSessionNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/rename", srv.handleRenameSession)
+
+	body := `{"new_id":"x"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexistent/rename", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestRenameSessionConflict(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.sessions.Store("a", &httpSession{lastUsed: time.Now()})
+	srv.sessions.Store("b", &httpSession{lastUsed: time.Now()})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/rename", srv.handleRenameSession)
+
+	body := `{"new_id":"b"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/a/rename", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("expected 409, got %d", w.Code)
+	}
+}
+
+// -------- Tool Dry-Run Tests --------
+
+func TestToolDryRunValid(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.registry.Register(&tools.ToolDef{
+		Name:        "my_tool",
+		Description: "test",
+		Parameters: []tools.ParamDef{
+			{Name: "path", Type: "string", Required: true, Description: "file path"},
+			{Name: "depth", Type: "number", Required: false},
+		},
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			return "ok", nil
+		},
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/{name}/dry-run", srv.handleToolDryRun)
+
+	body := `{"path":"/tmp/test"}`
+	req := httptest.NewRequest("POST", "/v1/tools/my_tool/dry-run", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["valid"] != true {
+		t.Fatal("expected valid=true")
+	}
+	if resp["disabled"] != false {
+		t.Fatal("expected disabled=false")
+	}
+}
+
+func TestToolDryRunMissingRequired(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.registry.Register(&tools.ToolDef{
+		Name: "req_tool",
+		Parameters: []tools.ParamDef{
+			{Name: "input", Type: "string", Required: true},
+		},
+		Fn: func(ctx context.Context, args map[string]interface{}) (string, error) {
+			return "ok", nil
+		},
+	})
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/{name}/dry-run", srv.handleToolDryRun)
+
+	body := `{}`
+	req := httptest.NewRequest("POST", "/v1/tools/req_tool/dry-run", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["valid"] != false {
+		t.Fatal("expected valid=false for missing required params")
+	}
+	missing := resp["missing_required"].([]interface{})
+	if len(missing) != 1 || missing[0] != "input" {
+		t.Fatalf("expected missing=[input], got %v", missing)
+	}
+}
+
+func TestToolDryRunNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/tools/{name}/dry-run", srv.handleToolDryRun)
+
+	req := httptest.NewRequest("POST", "/v1/tools/nonexistent/dry-run", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}

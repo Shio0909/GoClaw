@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -259,6 +260,12 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("DELETE /v1/tools/aliases/{alias}", s.handleDeleteToolAlias)
 	// Debug
 	mux.HandleFunc("GET /v1/debug/routes", s.handleDebugRoutes)
+	// Environment info
+	mux.HandleFunc("GET /v1/env", s.handleEnvInfo)
+	// Session rename
+	mux.HandleFunc("POST /v1/sessions/{session}/rename", s.handleRenameSession)
+	// Tool dry-run
+	mux.HandleFunc("POST /v1/tools/{name}/dry-run", s.handleToolDryRun)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -2312,6 +2319,127 @@ func (s *HTTPServer) handleDebugRoutes(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"routes": routes,
 		"count":  len(routes),
+	})
+}
+
+// -------- Environment Info --------
+
+// handleEnvInfo GET /v1/env — 返回运行环境信息
+func (s *HTTPServer) handleEnvInfo(w http.ResponseWriter, r *http.Request) {
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"go_version":     runtime.Version(),
+		"os":             runtime.GOOS,
+		"arch":           runtime.GOARCH,
+		"num_cpu":        runtime.NumCPU(),
+		"num_goroutine":  runtime.NumGoroutine(),
+		"alloc_mb":       float64(memStats.Alloc) / 1024 / 1024,
+		"sys_mb":         float64(memStats.Sys) / 1024 / 1024,
+		"gc_cycles":      memStats.NumGC,
+		"uptime_seconds": int(time.Since(s.startedAt).Seconds()),
+		"provider":       s.agentCfg.Provider,
+		"model":          s.agentCfg.Model,
+	})
+}
+
+// -------- Session Rename --------
+
+// handleRenameSession POST /v1/sessions/{session}/rename — 重命名会话
+func (s *HTTPServer) handleRenameSession(w http.ResponseWriter, r *http.Request) {
+	oldID := r.PathValue("session")
+	var req struct {
+		NewID string `json:"new_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.NewID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "new_id is required"})
+		return
+	}
+	val, ok := s.sessions.Load(oldID)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	if _, exists := s.sessions.Load(req.NewID); exists {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "new_id already exists"})
+		return
+	}
+	s.sessions.Store(req.NewID, val)
+	s.sessions.Delete(oldID)
+
+	// 持久化：删除旧快照
+	if s.sessionStore != nil {
+		_ = s.sessionStore.Delete(oldID)
+	}
+	if s.auditLog != nil {
+		s.auditLog.Emit(audit.EventConfigReload, oldID, "session renamed to: "+req.NewID, clientIP(r), nil)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"old_id": oldID,
+		"new_id": req.NewID,
+	})
+}
+
+// -------- Tool Dry-Run --------
+
+// handleToolDryRun POST /v1/tools/{name}/dry-run — 验证工具参数（不执行）
+func (s *HTTPServer) handleToolDryRun(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	tool, ok := s.registry.Get(name)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "tool not found: " + name})
+		return
+	}
+
+	var args map[string]interface{}
+	if err := json.NewDecoder(r.Body).Decode(&args); err != nil && err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+
+	// 检查禁用状态
+	_, disabled := s.disabledTools.Load(name)
+
+	// 验证必需参数
+	var missing []string
+	for _, p := range tool.Parameters {
+		if p.Required {
+			if _, ok := args[p.Name]; !ok {
+				missing = append(missing, p.Name)
+			}
+		}
+	}
+
+	type paramInfo struct {
+		Name        string `json:"name"`
+		Type        string `json:"type"`
+		Required    bool   `json:"required"`
+		Description string `json:"description,omitempty"`
+		Provided    bool   `json:"provided"`
+	}
+	params := make([]paramInfo, 0, len(tool.Parameters))
+	for _, p := range tool.Parameters {
+		_, provided := args[p.Name]
+		params = append(params, paramInfo{
+			Name: p.Name, Type: p.Type, Required: p.Required,
+			Description: p.Description, Provided: provided,
+		})
+	}
+
+	valid := len(missing) == 0
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tool":             name,
+		"valid":            valid,
+		"disabled":         disabled,
+		"missing_required": missing,
+		"parameters":       params,
+		"timeout_ms":       tool.Timeout.Milliseconds(),
+		"retryable":        tool.Retryable,
 	})
 }
 
