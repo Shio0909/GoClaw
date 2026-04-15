@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -58,8 +59,23 @@ type HTTPServer struct {
 	pluginMgr      *tools.PluginManager // 插件管理器（可选）
 	cronJobs       sync.Map             // jobID -> *cronJob
 	toolAliases    sync.Map             // alias -> realName
+	toolUsage      sync.Map             // toolName -> *toolUsageStats
+	promptTemplates sync.Map            // name -> *promptTemplate
 
 	server *http.Server
+}
+
+type toolUsageStats struct {
+	Calls    atomic.Int64
+	Errors   atomic.Int64
+	TotalMs  atomic.Int64 // 累计耗时毫秒
+}
+
+type promptTemplate struct {
+	Name        string `json:"name"`
+	Template    string `json:"template"`
+	Description string `json:"description,omitempty"`
+	Variables   []string `json:"variables,omitempty"`
 }
 
 type httpSession struct {
@@ -277,6 +293,13 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/sessions/{session}/stats", s.handleSessionStats)
 	// Batch tool execution
 	mux.HandleFunc("POST /v1/tools/batch", s.handleBatchTools)
+	// Tool analytics
+	mux.HandleFunc("GET /v1/tools/analytics", s.handleToolAnalytics)
+	mux.HandleFunc("DELETE /v1/tools/analytics", s.handleResetToolAnalytics)
+	// Prompt templates
+	mux.HandleFunc("GET /v1/templates", s.handleListTemplates)
+	mux.HandleFunc("POST /v1/templates", s.handleAddTemplate)
+	mux.HandleFunc("DELETE /v1/templates/{name}", s.handleDeleteTemplate)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -2715,6 +2738,135 @@ func (s *HTTPServer) handleBatchTools(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"total":   len(req.Tools),
 		"results": results,
+	})
+}
+
+// handleToolAnalytics 返回工具使用统计
+func (s *HTTPServer) handleToolAnalytics(w http.ResponseWriter, r *http.Request) {
+	type stat struct {
+		Name      string  `json:"name"`
+		Calls     int64   `json:"calls"`
+		Errors    int64   `json:"errors"`
+		AvgMs     float64 `json:"avg_ms"`
+		TotalMs   int64   `json:"total_ms"`
+		ErrorRate float64 `json:"error_rate"`
+	}
+
+	var stats []stat
+	s.toolUsage.Range(func(key, val interface{}) bool {
+		name := key.(string)
+		u := val.(*toolUsageStats)
+		calls := u.Calls.Load()
+		errs := u.Errors.Load()
+		totalMs := u.TotalMs.Load()
+		var avgMs float64
+		if calls > 0 {
+			avgMs = float64(totalMs) / float64(calls)
+		}
+		var errRate float64
+		if calls > 0 {
+			errRate = float64(errs) / float64(calls)
+		}
+		stats = append(stats, stat{
+			Name: name, Calls: calls, Errors: errs,
+			AvgMs: avgMs, TotalMs: totalMs, ErrorRate: errRate,
+		})
+		return true
+	})
+
+	// 按调用次数排序
+	sort.Slice(stats, func(i, j int) bool {
+		return stats[i].Calls > stats[j].Calls
+	})
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tools": stats,
+		"total": len(stats),
+	})
+}
+
+// handleResetToolAnalytics 重置工具使用统计
+func (s *HTTPServer) handleResetToolAnalytics(w http.ResponseWriter, r *http.Request) {
+	count := 0
+	s.toolUsage.Range(func(key, _ interface{}) bool {
+		s.toolUsage.Delete(key)
+		count++
+		return true
+	})
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "reset",
+		"detail": fmt.Sprintf("cleared %d tool stats", count),
+	})
+}
+
+// handleListTemplates 列出 prompt 模板
+func (s *HTTPServer) handleListTemplates(w http.ResponseWriter, r *http.Request) {
+	var templates []promptTemplate
+	s.promptTemplates.Range(func(key, val interface{}) bool {
+		templates = append(templates, *val.(*promptTemplate))
+		return true
+	})
+	sort.Slice(templates, func(i, j int) bool {
+		return templates[i].Name < templates[j].Name
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"templates": templates,
+		"total":     len(templates),
+	})
+}
+
+// handleAddTemplate 添加 prompt 模板
+func (s *HTTPServer) handleAddTemplate(w http.ResponseWriter, r *http.Request) {
+	var tmpl promptTemplate
+	if err := json.NewDecoder(r.Body).Decode(&tmpl); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if tmpl.Name == "" || tmpl.Template == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and template are required"})
+		return
+	}
+
+	// 自动提取变量 {{var}}
+	if len(tmpl.Variables) == 0 {
+		seen := map[string]bool{}
+		idx := 0
+		for {
+			start := strings.Index(tmpl.Template[idx:], "{{")
+			if start == -1 {
+				break
+			}
+			start += idx
+			end := strings.Index(tmpl.Template[start:], "}}")
+			if end == -1 {
+				break
+			}
+			varName := strings.TrimSpace(tmpl.Template[start+2 : start+end])
+			if varName != "" && !seen[varName] {
+				tmpl.Variables = append(tmpl.Variables, varName)
+				seen[varName] = true
+			}
+			idx = start + end + 2
+		}
+	}
+
+	s.promptTemplates.Store(tmpl.Name, &tmpl)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"status":    "created",
+		"template":  tmpl,
+	})
+}
+
+// handleDeleteTemplate 删除 prompt 模板
+func (s *HTTPServer) handleDeleteTemplate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, ok := s.promptTemplates.LoadAndDelete(name); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "template not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"status": "deleted",
+		"name":   name,
 	})
 }
 

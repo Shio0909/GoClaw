@@ -2536,3 +2536,119 @@ func TestBatchToolsTooMany(t *testing.T) {
 		t.Fatalf("expected 400 for >20 tools, got %d", w.Code)
 	}
 }
+
+func TestToolAnalytics(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/tools/analytics", srv.handleToolAnalytics)
+	mux.HandleFunc("DELETE /v1/tools/analytics", srv.handleResetToolAnalytics)
+
+	// Add some usage data
+	stats := &toolUsageStats{}
+	stats.Calls.Store(10)
+	stats.Errors.Store(2)
+	stats.TotalMs.Store(500)
+	srv.toolUsage.Store("echo", stats)
+
+	// GET analytics
+	req := httptest.NewRequest("GET", "/v1/tools/analytics", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 1 {
+		t.Fatalf("expected 1 tool, got %v", resp["total"])
+	}
+
+	// DELETE (reset)
+	req = httptest.NewRequest("DELETE", "/v1/tools/analytics", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reset: expected 200, got %d", w.Code)
+	}
+
+	// Verify empty
+	req = httptest.NewRequest("GET", "/v1/tools/analytics", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 0 {
+		t.Fatalf("expected 0 after reset, got %v", resp["total"])
+	}
+}
+
+func TestPromptTemplatesCRUD(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/templates", srv.handleListTemplates)
+	mux.HandleFunc("POST /v1/templates", srv.handleAddTemplate)
+	mux.HandleFunc("DELETE /v1/templates/{name}", srv.handleDeleteTemplate)
+
+	// List empty
+	req := httptest.NewRequest("GET", "/v1/templates", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 0 {
+		t.Fatalf("expected 0 templates")
+	}
+
+	// Add template with auto-variable extraction
+	body := `{"name":"greeting","template":"Hello {{name}}, welcome to {{place}}!"}`
+	req = httptest.NewRequest("POST", "/v1/templates", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("add: expected 200, got %d", w.Code)
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	tmpl := resp["template"].(map[string]interface{})
+	vars := tmpl["variables"].([]interface{})
+	if len(vars) != 2 {
+		t.Fatalf("expected 2 variables, got %d", len(vars))
+	}
+
+	// List → 1
+	req = httptest.NewRequest("GET", "/v1/templates", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 1 {
+		t.Fatalf("expected 1 template")
+	}
+
+	// Delete
+	req = httptest.NewRequest("DELETE", "/v1/templates/greeting", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete: expected 200, got %d", w.Code)
+	}
+
+	// Delete again → 404
+	req = httptest.NewRequest("DELETE", "/v1/templates/greeting", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("delete again: expected 404, got %d", w.Code)
+	}
+}
+
+func TestAddTemplateValidation(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/templates", srv.handleAddTemplate)
+
+	body := `{"name":"","template":""}`
+	req := httptest.NewRequest("POST", "/v1/templates", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
