@@ -548,6 +548,18 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/translate", s.handleTranslateMessage)
 	mux.HandleFunc("GET /v1/sessions/{session}/participants", s.handleSessionParticipants)
 	mux.HandleFunc("GET /v1/changelog", s.handleChangelog)
+	// ──── Batch 7: Analysis, Flow, Export, Auto-tag, etc. ────
+	mux.HandleFunc("GET /v1/sessions/{session}/quality", s.handleSessionQuality)
+	mux.HandleFunc("GET /v1/sessions/{session}/topics", s.handleSessionTopics)
+	mux.HandleFunc("GET /v1/sessions/{session}/flow", s.handleConversationFlow)
+	mux.HandleFunc("POST /v1/sessions/{session}/from-template", s.handleSessionFromTemplate)
+	mux.HandleFunc("GET /v1/sessions/{session}/token-breakdown", s.handleTokenBreakdown)
+	mux.HandleFunc("POST /v1/sessions/{session}/auto-tag", s.handleAutoTag)
+	mux.HandleFunc("GET /v1/sessions/recent", s.handleRecentSessions)
+	mux.HandleFunc("GET /v1/sessions/{session}/response-times", s.handleResponseTimes)
+	mux.HandleFunc("DELETE /v1/sessions/group/{name}", s.handleDeleteSessionGroup)
+	mux.HandleFunc("GET /v1/sessions/{session}/complexity", s.handleSessionComplexity)
+	mux.HandleFunc("POST /v1/sessions/{session}/split", s.handleSplitSession)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -7339,5 +7351,491 @@ func (s *HTTPServer) handleChangelog(w http.ResponseWriter, r *http.Request) {
 			{"version": "0.1.5", "date": "2025-07-14", "summary": "Batch 1-3: SSE events, checkpoints, session ops, CSV export, templates"},
 			{"version": "0.1.0", "date": "2025-07-12", "summary": "Initial release: Agent runtime, HTTP API, QQ/Feishu gateways"},
 		},
+	})
+}
+
+// ──── Batch 7 Handlers ────
+
+// handleSessionQuality GET /v1/sessions/{session}/quality — 会话质量评分
+func (s *HTTPServer) handleSessionQuality(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	msgs := sess.agent.GetHistory()
+	if len(msgs) == 0 {
+		writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "quality_score": 0, "details": "no messages"})
+		return
+	}
+	userCount, assistantCount, toolCount := 0, 0, 0
+	totalLen, maxLen := 0, 0
+	for _, m := range msgs {
+		switch m.Role {
+		case "user":
+			userCount++
+		case "assistant":
+			assistantCount++
+		case "tool":
+			toolCount++
+		}
+		l := len(m.Content)
+		totalLen += l
+		if l > maxLen {
+			maxLen = l
+		}
+	}
+	avgLen := 0
+	if len(msgs) > 0 {
+		avgLen = totalLen / len(msgs)
+	}
+	// Quality heuristic: diversity of roles, message count, average length
+	score := 0.0
+	if userCount > 0 {
+		score += 25
+	}
+	if assistantCount > 0 {
+		score += 25
+	}
+	if toolCount > 0 {
+		score += 15
+	}
+	if avgLen > 50 {
+		score += 20
+	}
+	if len(msgs) >= 4 {
+		score += 15
+	}
+	if score > 100 {
+		score = 100
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":         sid,
+		"quality_score":   score,
+		"total_messages":  len(msgs),
+		"user_messages":   userCount,
+		"assistant_msgs":  assistantCount,
+		"tool_messages":   toolCount,
+		"avg_message_len": avgLen,
+		"max_message_len": maxLen,
+	})
+}
+
+// handleSessionTopics GET /v1/sessions/{session}/topics — 话题提取
+func (s *HTTPServer) handleSessionTopics(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	msgs := sess.agent.GetHistory()
+	// Extract topics by collecting unique significant words from user messages
+	wordFreq := map[string]int{}
+	for _, m := range msgs {
+		if m.Role != "user" {
+			continue
+		}
+		words := strings.Fields(m.Content)
+		for _, w := range words {
+			w = strings.ToLower(strings.Trim(w, ",.!?;:\"'()[]{}"))
+			if len(w) > 3 {
+				wordFreq[w]++
+			}
+		}
+	}
+	type topic struct {
+		Word  string `json:"word"`
+		Count int    `json:"count"`
+	}
+	var topics []topic
+	for w, c := range wordFreq {
+		if c >= 2 {
+			topics = append(topics, topic{Word: w, Count: c})
+		}
+	}
+	sort.Slice(topics, func(i, j int) bool { return topics[i].Count > topics[j].Count })
+	if len(topics) > 20 {
+		topics = topics[:20]
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":     sid,
+		"topics":      topics,
+		"total_words": len(wordFreq),
+	})
+}
+
+// handleConversationFlow GET /v1/sessions/{session}/flow — 对话流分析
+func (s *HTTPServer) handleConversationFlow(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	msgs := sess.agent.GetHistory()
+	type flowStep struct {
+		Index int    `json:"index"`
+		Role  string `json:"role"`
+		Len   int    `json:"length"`
+		Has   string `json:"has_tool_calls,omitempty"`
+	}
+	var steps []flowStep
+	for i, m := range msgs {
+		step := flowStep{Index: i, Role: string(m.Role), Len: len(m.Content)}
+		if len(m.ToolCalls) > 0 {
+			step.Has = "yes"
+		}
+		steps = append(steps, step)
+	}
+	// Compute transitions
+	transitions := map[string]int{}
+	for i := 1; i < len(msgs); i++ {
+		key := string(msgs[i-1].Role) + "->" + string(msgs[i].Role)
+		transitions[key]++
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":     sid,
+		"flow":        steps,
+		"transitions": transitions,
+		"total_turns": len(msgs),
+	})
+}
+
+// handleSessionFromTemplate POST /v1/sessions/{session}/from-template — 从模板初始化会话
+func (s *HTTPServer) handleSessionFromTemplate(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	var req struct {
+		Template string `json:"template"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Template == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "template name required"})
+		return
+	}
+	val, ok := s.sessionTemplates.Load(req.Template)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "template not found"})
+		return
+	}
+	tmpl := val.(*sessionTemplate)
+	ag := s.getOrCreateSession(sid)
+	if tmpl.SystemPrompt != "" {
+		ag.SetExtraSystemPrompt(tmpl.SystemPrompt)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"template": req.Template,
+		"applied":  true,
+	})
+}
+
+// handleTokenBreakdown GET /v1/sessions/{session}/token-breakdown — token 分布
+func (s *HTTPServer) handleTokenBreakdown(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	msgs := sess.agent.GetHistory()
+	breakdown := map[string]int{"user": 0, "assistant": 0, "system": 0, "tool": 0}
+	for _, m := range msgs {
+		// Rough token estimate: 1 token ≈ 4 chars for English, 1.5 chars for CJK
+		tokens := len(m.Content) / 3
+		if tokens == 0 && len(m.Content) > 0 {
+			tokens = 1
+		}
+		breakdown[string(m.Role)] += tokens
+	}
+	total := 0
+	for _, v := range breakdown {
+		total += v
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":        sid,
+		"token_breakdown": breakdown,
+		"total_tokens":   total,
+		"message_count":  len(msgs),
+	})
+}
+
+// handleAutoTag POST /v1/sessions/{session}/auto-tag — 自动打标签
+func (s *HTTPServer) handleAutoTag(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	msgs := sess.agent.GetHistory()
+	// Auto-tag based on content analysis
+	tags := map[string]bool{}
+	hasCode := false
+	for _, m := range msgs {
+		content := strings.ToLower(m.Content)
+		if strings.Contains(content, "```") || strings.Contains(content, "func ") || strings.Contains(content, "import ") {
+			hasCode = true
+		}
+		if strings.Contains(content, "error") || strings.Contains(content, "bug") || strings.Contains(content, "fix") {
+			tags["debugging"] = true
+		}
+		if strings.Contains(content, "how to") || strings.Contains(content, "what is") || strings.Contains(content, "explain") {
+			tags["question"] = true
+		}
+		if len(m.ToolCalls) > 0 {
+			tags["tool-use"] = true
+		}
+	}
+	if hasCode {
+		tags["coding"] = true
+	}
+	if len(msgs) > 20 {
+		tags["long-conversation"] = true
+	}
+	// Apply tags
+	if sess.tags == nil {
+		sess.tags = map[string]bool{}
+	}
+	for t := range tags {
+		sess.tags[t] = true
+	}
+
+	applied := make([]string, 0, len(tags))
+	for t := range tags {
+		applied = append(applied, t)
+	}
+	sort.Strings(applied)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":      sid,
+		"auto_tags":    applied,
+		"tags_applied": len(applied),
+	})
+}
+
+// handleRecentSessions GET /v1/sessions/recent — 最近活跃会话
+func (s *HTTPServer) handleRecentSessions(w http.ResponseWriter, r *http.Request) {
+	limitStr := r.URL.Query().Get("limit")
+	limit := 20
+	if limitStr != "" {
+		if n, err := strconv.Atoi(limitStr); err == nil && n > 0 && n <= 100 {
+			limit = n
+		}
+	}
+	type recentSession struct {
+		ID       string `json:"id"`
+		LastUsed string `json:"last_used"`
+		Messages int    `json:"messages"`
+	}
+	var sessions []recentSession
+	s.sessions.Range(func(key, value interface{}) bool {
+		sess := value.(*httpSession)
+		sessions = append(sessions, recentSession{
+			ID:       key.(string),
+			LastUsed: sess.lastUsed.Format(time.RFC3339),
+			Messages: len(sess.agent.GetHistory()),
+		})
+		return true
+	})
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].LastUsed > sessions[j].LastUsed })
+	if len(sessions) > limit {
+		sessions = sessions[:limit]
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"sessions": sessions,
+		"total":    len(sessions),
+	})
+}
+
+// handleResponseTimes GET /v1/sessions/{session}/response-times — 响应时间分析
+func (s *HTTPServer) handleResponseTimes(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	msgs := sess.agent.GetHistory()
+	// Estimate response times from message pairs (user→assistant)
+	type respTime struct {
+		Turn       int `json:"turn"`
+		UserLen    int `json:"user_length"`
+		AssistLen  int `json:"assistant_length"`
+		EstimateMs int `json:"estimated_ms"`
+	}
+	var times []respTime
+	turn := 0
+	for i := 0; i+1 < len(msgs); i++ {
+		if msgs[i].Role == "user" && msgs[i+1].Role == "assistant" {
+			turn++
+			// Rough estimate based on output length
+			est := len(msgs[i+1].Content) / 4 * 10 // ~10ms per token
+			times = append(times, respTime{
+				Turn:       turn,
+				UserLen:    len(msgs[i].Content),
+				AssistLen:  len(msgs[i+1].Content),
+				EstimateMs: est,
+			})
+		}
+	}
+	avgMs := 0
+	if len(times) > 0 {
+		total := 0
+		for _, t := range times {
+			total += t.EstimateMs
+		}
+		avgMs = total / len(times)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":        sid,
+		"response_times": times,
+		"average_ms":     avgMs,
+		"total_turns":    len(times),
+	})
+}
+
+// handleDeleteSessionGroup DELETE /v1/sessions/group/{name} — 删除会话分组
+func (s *HTTPServer) handleDeleteSessionGroup(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "group name required"})
+		return
+	}
+	tagKey := "group:" + name
+	removed := 0
+	s.sessions.Range(func(key, val any) bool {
+		sess := val.(*httpSession)
+		if sess.tags != nil && sess.tags[tagKey] {
+			delete(sess.tags, tagKey)
+			removed++
+		}
+		return true
+	})
+	if removed == 0 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "group not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"deleted":          name,
+		"sessions_removed": removed,
+		"ok":               true,
+	})
+}
+
+// handleSessionComplexity GET /v1/sessions/{session}/complexity — 会话复杂度评估
+func (s *HTTPServer) handleSessionComplexity(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	msgs := sess.agent.GetHistory()
+	// Complexity metrics
+	roleChanges := 0
+	toolCalls := 0
+	totalChars := 0
+	uniqueRoles := map[string]bool{}
+	for i, m := range msgs {
+		uniqueRoles[string(m.Role)] = true
+		totalChars += len(m.Content)
+		toolCalls += len(m.ToolCalls)
+		if i > 0 && msgs[i].Role != msgs[i-1].Role {
+			roleChanges++
+		}
+	}
+	// Complexity score: based on message count, tool usage, role diversity
+	complexity := 0.0
+	if len(msgs) > 10 {
+		complexity += 30
+	} else if len(msgs) > 5 {
+		complexity += 15
+	}
+	if toolCalls > 5 {
+		complexity += 30
+	} else if toolCalls > 0 {
+		complexity += 15
+	}
+	if len(uniqueRoles) >= 3 {
+		complexity += 20
+	}
+	if totalChars > 10000 {
+		complexity += 20
+	} else if totalChars > 3000 {
+		complexity += 10
+	}
+	if complexity > 100 {
+		complexity = 100
+	}
+	level := "low"
+	if complexity >= 70 {
+		level = "high"
+	} else if complexity >= 40 {
+		level = "medium"
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":          sid,
+		"complexity_score": complexity,
+		"complexity_level": level,
+		"metrics": map[string]interface{}{
+			"message_count": len(msgs),
+			"role_changes":  roleChanges,
+			"tool_calls":    toolCalls,
+			"total_chars":   totalChars,
+			"unique_roles":  len(uniqueRoles),
+		},
+	})
+}
+
+// handleSplitSession POST /v1/sessions/{session}/split — 拆分会话
+func (s *HTTPServer) handleSplitSession(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	var req struct {
+		AtIndex int    `json:"at_index"`
+		NewID   string `json:"new_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	msgs := sess.agent.GetHistory()
+	if req.AtIndex <= 0 || req.AtIndex >= len(msgs) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "at_index out of range"})
+		return
+	}
+	if req.NewID == "" {
+		req.NewID = sid + "-split-" + strconv.Itoa(req.AtIndex)
+	}
+	// Create new session with messages after split point
+	newAg := s.getOrCreateSession(req.NewID)
+	splitMsgs := msgs[req.AtIndex:]
+	for _, m := range splitMsgs {
+		newAg.AppendToHistory(m)
+	}
+	// Truncate original session
+	sess.agent.SetHistory(msgs[:req.AtIndex])
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"original_session": sid,
+		"new_session":      req.NewID,
+		"split_at":         req.AtIndex,
+		"original_count":   req.AtIndex,
+		"new_count":        len(splitMsgs),
 	})
 }

@@ -6029,3 +6029,304 @@ func TestChangelog(t *testing.T) {
 		t.Error("expected changelog field")
 	}
 }
+
+// ──── Batch 7 Tests ────
+
+func TestSessionQuality(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/quality", srv.handleSessionQuality)
+
+	// Session not found
+	req := httptest.NewRequest("GET", "/v1/sessions/none/quality", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+
+	// Empty session
+	srv.getOrCreateSession("q1")
+	req = httptest.NewRequest("GET", "/v1/sessions/q1/quality", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+
+	// Session with messages
+	ag := srv.getOrCreateSession("q2")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "Hello world, this is a test message with enough content."})
+	ag.AppendToHistory(&schema.Message{Role: schema.Assistant, Content: "Hi! I can help you with that."})
+	req = httptest.NewRequest("GET", "/v1/sessions/q2/quality", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["quality_score"].(float64) <= 0 {
+		t.Error("expected positive quality score")
+	}
+}
+
+func TestSessionTopics(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/topics", srv.handleSessionTopics)
+
+	ag := srv.getOrCreateSession("topics1")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "tell me about golang programming"})
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "also explain golang concurrency patterns"})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/topics1/topics", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["session"] != "topics1" {
+		t.Error("unexpected session")
+	}
+}
+
+func TestConversationFlow(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/flow", srv.handleConversationFlow)
+
+	ag := srv.getOrCreateSession("flow1")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "hi"})
+	ag.AppendToHistory(&schema.Message{Role: schema.Assistant, Content: "hello"})
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "how are you"})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/flow1/flow", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total_turns"].(float64) != 3 {
+		t.Errorf("expected 3 turns, got %v", resp["total_turns"])
+	}
+	transitions := resp["transitions"].(map[string]interface{})
+	if transitions["user->assistant"] == nil {
+		t.Error("expected user->assistant transition")
+	}
+}
+
+func TestSessionFromTemplate(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/from-template", srv.handleSessionFromTemplate)
+
+	// Missing template name
+	req := httptest.NewRequest("POST", "/v1/sessions/s1/from-template", strings.NewReader(`{}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+
+	// Template not found
+	req = httptest.NewRequest("POST", "/v1/sessions/s1/from-template", strings.NewReader(`{"template":"nonexist"}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+
+	// Create template and apply
+	srv.sessionTemplates.Store("test-tmpl", &sessionTemplate{
+		Name:         "test-tmpl",
+		SystemPrompt: "You are a test bot",
+	})
+	req = httptest.NewRequest("POST", "/v1/sessions/s1/from-template", strings.NewReader(`{"template":"test-tmpl"}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestTokenBreakdown(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/token-breakdown", srv.handleTokenBreakdown)
+
+	ag := srv.getOrCreateSession("tkn1")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "Hello world"})
+	ag.AppendToHistory(&schema.Message{Role: schema.Assistant, Content: "Hi there, how can I help you today?"})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/tkn1/token-breakdown", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total_tokens"].(float64) <= 0 {
+		t.Error("expected positive token count")
+	}
+}
+
+func TestAutoTag(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/auto-tag", srv.handleAutoTag)
+
+	ag := srv.getOrCreateSession("autotag1")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "How to fix this error in my code?"})
+	ag.AppendToHistory(&schema.Message{Role: schema.Assistant, Content: "```go\nfunc main() {}\n```"})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/autotag1/auto-tag", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	tags := resp["auto_tags"].([]interface{})
+	if len(tags) == 0 {
+		t.Error("expected auto tags to be applied")
+	}
+}
+
+func TestRecentSessions(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/recent", srv.handleRecentSessions)
+
+	srv.getOrCreateSession("r1")
+	srv.getOrCreateSession("r2")
+	srv.getOrCreateSession("r3")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/recent?limit=2", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	sessions := resp["sessions"].([]interface{})
+	if len(sessions) > 2 {
+		t.Errorf("expected at most 2 sessions, got %d", len(sessions))
+	}
+}
+
+func TestResponseTimes(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/response-times", srv.handleResponseTimes)
+
+	ag := srv.getOrCreateSession("rt1")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "hello"})
+	ag.AppendToHistory(&schema.Message{Role: schema.Assistant, Content: "Hi! How can I assist you today?"})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/rt1/response-times", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total_turns"].(float64) != 1 {
+		t.Errorf("expected 1 turn, got %v", resp["total_turns"])
+	}
+}
+
+func TestDeleteSessionGroup(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("DELETE /v1/sessions/group/{name}", srv.handleDeleteSessionGroup)
+
+	// Group not found
+	req := httptest.NewRequest("DELETE", "/v1/sessions/group/nope", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+
+	// Create group via tags, then delete
+	srv.getOrCreateSession("g1")
+	if val, ok := srv.sessions.Load("g1"); ok {
+		sess := val.(*httpSession)
+		sess.tags = map[string]bool{"group:testgrp": true}
+	}
+	req = httptest.NewRequest("DELETE", "/v1/sessions/group/testgrp", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestSessionComplexity(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/complexity", srv.handleSessionComplexity)
+
+	ag := srv.getOrCreateSession("cplx1")
+	for i := 0; i < 15; i++ {
+		ag.AppendToHistory(&schema.Message{Role: schema.User, Content: fmt.Sprintf("message %d with some content", i)})
+		ag.AppendToHistory(&schema.Message{Role: schema.Assistant, Content: fmt.Sprintf("response %d here", i)})
+	}
+
+	req := httptest.NewRequest("GET", "/v1/sessions/cplx1/complexity", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["complexity_level"] == nil {
+		t.Error("expected complexity_level field")
+	}
+}
+
+func TestSplitSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/split", srv.handleSplitSession)
+
+	ag := srv.getOrCreateSession("split1")
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "msg1"})
+	ag.AppendToHistory(&schema.Message{Role: schema.Assistant, Content: "resp1"})
+	ag.AppendToHistory(&schema.Message{Role: schema.User, Content: "msg2"})
+	ag.AppendToHistory(&schema.Message{Role: schema.Assistant, Content: "resp2"})
+
+	// Invalid index
+	req := httptest.NewRequest("POST", "/v1/sessions/split1/split", strings.NewReader(`{"at_index":0}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expected 400 for invalid index, got %d", w.Code)
+	}
+
+	// Valid split
+	req = httptest.NewRequest("POST", "/v1/sessions/split1/split", strings.NewReader(`{"at_index":2,"new_id":"split1-b"}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["original_count"].(float64) != 2 {
+		t.Errorf("expected 2 messages in original, got %v", resp["original_count"])
+	}
+	if resp["new_count"].(float64) != 2 {
+		t.Errorf("expected 2 messages in new session, got %v", resp["new_count"])
+	}
+}
