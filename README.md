@@ -16,7 +16,7 @@
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
   (扩展)   ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
                │  └───────┘  └─────────┘  └──────────┘   │
-               │  37 API Endpoints · Audit · Webhooks     │
+               │  66 API Endpoints · Audit · Webhooks     │
                └──────────────────────────────────────────┘
 ```
 
@@ -60,7 +60,7 @@
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 37 个端点（原生 31 + OpenAI 兼容 3 + WebSocket 1 + 管理 2），完整 OpenAPI 3.0 规范
+- 66 个端点（原生 62 + OpenAI 兼容 2 + WebSocket 1 + 管理 1），完整 OpenAPI 3.0 规范
 - X-Request-ID 请求追踪（自动生成或透传客户端 ID）
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
@@ -73,16 +73,23 @@
 - Webhook 系统（异步投递 + HMAC-SHA256 签名 + 事件过滤）
 - 会话标签/备注系统（标签管理 + 按标签过滤 + 文本备注）
 - 批量聊天（POST 多会话并发发送，≤20 并发）
-- 会话分叉（克隆对话历史到新会话）
-- 会话导出（JSON / Markdown 格式）
-- 工具运行时管理（动态禁用/启用工具）
+- 会话分叉/重命名/比较/摘要/搜索/裁剪
+- 会话锁定（禁止新消息）+ 自定义 TTL
+- 会话级 System Prompt 覆盖
+- 会话导出（JSON / Markdown / HTML 格式）
+- 工具运行时管理（动态禁用/启用/干跑验证/批量执行）
+- 工具别名系统 + 工具使用分析（调用次数/错误率/平均耗时）
+- Prompt 模板管理（自动提取 `{{var}}` 变量）
+- Token 成本估算（支持自定义定价）
+- 定时任务系统（Cron jobs，10s-24h 周期）
+- 插件系统（YAML/JSON 定义，脚本/HTTP 两种执行方式）
 - 端点延迟追踪（per-endpoint 调用次数 / 错误率 / 平均耗时）
+- 环境信息端点 + 路由调试端点
 - Admin GC（手动清理空闲会话）
 - 深度健康检查（逐项检测存储 / 配置 / RAG 状态）
 - 运行时分析仪表盘（会话统计 + 标签分布 + 审计摘要）
 - 优雅关闭（活跃连接排水 + 30s 超时）
 - 工具执行超时（per-tool 或全局默认，context.WithTimeout）
-- 插件系统（YAML/JSON 定义，脚本/HTTP 两种执行方式）
 
 ## 项目结构
 
@@ -105,7 +112,7 @@ GoClaw/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（37 端点，REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── http.go             # HTTP API（66 端点，REST + SSE + WebSocket + OpenAI 兼容）
 │   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
@@ -204,21 +211,44 @@ docker compose up -d
 | `/v1/chat` | POST | 发送消息（`stream: true` 启用 SSE） |
 | `/v1/chat/:session` | GET | 查看会话历史 |
 | `/v1/chat/:session` | DELETE | 清空会话 |
-| `/v1/chat/:session/export` | GET | 导出会话（`?format=json\|markdown`） |
+| `/v1/chat/:session/export` | GET | 导出会话（`?format=json\|markdown\|html`） |
 | `/v1/sessions` | GET | 列出所有活跃会话（`?tag=xxx` 按标签过滤） |
 | `/v1/sessions/search` | GET | 搜索会话内容（`?q=keyword`） |
+| `/v1/sessions/compare` | POST | 比较两个会话（共享前缀/分叉点） |
 | `/v1/sessions/:session/fork` | POST | 分叉会话（克隆对话历史到新 ID） |
+| `/v1/sessions/:session/rename` | POST | 重命名会话 |
 | `/v1/sessions/:session/tags` | PUT/GET/DELETE | 会话标签管理（添加/查询/删除） |
 | `/v1/sessions/:session/annotate` | POST | 添加会话备注 |
 | `/v1/sessions/:session/annotations` | GET | 查看会话备注列表 |
+| `/v1/sessions/:session/ttl` | PUT | 设置会话自定义存活时间 |
+| `/v1/sessions/:session/lock` | POST | 锁定会话（禁止新消息） |
+| `/v1/sessions/:session/unlock` | POST | 解锁会话 |
+| `/v1/sessions/:session/stats` | GET | 会话统计（消息数/Token估算/锁状态） |
+| `/v1/sessions/:session/summary` | GET | 会话摘要（首末消息/角色分布/平均长度） |
+| `/v1/sessions/:session/search` | GET | 会话内消息搜索（`?q=xxx&role=user`） |
+| `/v1/sessions/:session/trim` | POST | 裁剪历史（保留最近N条） |
+| `/v1/sessions/:session/system-prompt` | PUT/GET | 会话级 System Prompt 覆盖 |
 | `/v1/batch/chat` | POST | 批量多会话并发聊天（≤20） |
 | `/v1/tools` | GET | 列出可用工具（含禁用状态） |
 | `/v1/tools/stats` | GET | 工具调用统计（次数、错误、平均耗时） |
 | `/v1/tools/disabled` | GET | 列出运行时禁用的工具 |
 | `/v1/tools/:name/disable` | POST | 运行时禁用工具 |
 | `/v1/tools/:name/enable` | POST | 运行时启用工具 |
+| `/v1/tools/:name/dry-run` | POST | 工具干跑验证（不执行，只检查参数） |
+| `/v1/tools/batch` | POST | 批量工具执行（≤20个） |
+| `/v1/tools/aliases` | GET/PUT/DELETE | 工具别名管理 |
+| `/v1/tools/analytics` | GET/DELETE | 工具使用分析（调用次数/错误率/平均耗时） |
+| `/v1/plugins` | GET | 列出已加载插件 |
+| `/v1/plugins/reload` | POST | 重新加载插件目录 |
+| `/v1/plugins/:name` | DELETE | 卸载指定插件 |
+| `/v1/templates` | GET/POST | Prompt 模板管理（自动提取 `{{var}}`） |
+| `/v1/templates/:name` | DELETE | 删除 Prompt 模板 |
+| `/v1/cron` | GET/POST/DELETE | 定时任务管理（10s-24h 周期） |
+| `/v1/estimate-cost` | POST | Token 成本估算（支持自定义价格） |
 | `/v1/memory/:session` | GET | 查看记忆状态 |
-| `/v1/metrics` | GET | 运行指标（`?format=prometheus` 支持 Prometheus 拉取） |
+| `/v1/env` | GET | 环境信息（Go版本/OS/CPU/内存/GC） |
+| `/v1/debug/routes` | GET | 路由列表调试端点 |
+| `/v1/metrics` | GET | 运行指标（`?format=prometheus` 拉取） |
 | `/v1/health` | GET | 健康检查（免认证，含 uptime、连接数） |
 | `/v1/health/deep` | GET | 深度健康检查（逐项检测存储/配置/RAG） |
 | `/v1/config` | GET | 运行时配置审查（API Key 脱敏） |
