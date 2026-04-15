@@ -308,6 +308,10 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	// System prompt override
 	mux.HandleFunc("PUT /v1/sessions/{session}/system-prompt", s.handleSetSystemPrompt)
 	mux.HandleFunc("GET /v1/sessions/{session}/system-prompt", s.handleGetSystemPrompt)
+	// Session comparison
+	mux.HandleFunc("POST /v1/sessions/compare", s.handleCompareSessions)
+	// Conversation summary
+	mux.HandleFunc("GET /v1/sessions/{session}/summary", s.handleSessionSummary)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -3017,6 +3021,149 @@ func (s *HTTPServer) handleGetSystemPrompt(w http.ResponseWriter, r *http.Reques
 		"session":    sid,
 		"prompt":     sess.systemPromptOverride,
 		"has_override": sess.systemPromptOverride != "",
+	})
+}
+
+// handleCompareSessions 比较两个会话
+func (s *HTTPServer) handleCompareSessions(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session1 string `json:"session1"`
+		Session2 string `json:"session2"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Session1 == "" || req.Session2 == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session1 and session2 are required"})
+		return
+	}
+
+	val1, ok1 := s.sessions.Load(req.Session1)
+	val2, ok2 := s.sessions.Load(req.Session2)
+	if !ok1 || !ok2 {
+		missing := []string{}
+		if !ok1 {
+			missing = append(missing, req.Session1)
+		}
+		if !ok2 {
+			missing = append(missing, req.Session2)
+		}
+		writeJSON(w, http.StatusNotFound, map[string]interface{}{
+			"error":   "session(s) not found",
+			"missing": missing,
+		})
+		return
+	}
+
+	sess1 := val1.(*httpSession)
+	sess2 := val2.(*httpSession)
+	hist1 := sess1.agent.GetHistory()
+	hist2 := sess2.agent.GetHistory()
+
+	// 统计共享前缀长度
+	commonPrefix := 0
+	minLen := len(hist1)
+	if len(hist2) < minLen {
+		minLen = len(hist2)
+	}
+	for i := 0; i < minLen; i++ {
+		if hist1[i].Content == hist2[i].Content && hist1[i].Role == hist2[i].Role {
+			commonPrefix++
+		} else {
+			break
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session1": map[string]interface{}{
+			"id":       req.Session1,
+			"messages": len(hist1),
+			"locked":   sess1.locked,
+		},
+		"session2": map[string]interface{}{
+			"id":       req.Session2,
+			"messages": len(hist2),
+			"locked":   sess2.locked,
+		},
+		"common_prefix_length": commonPrefix,
+		"diverged_at":          commonPrefix,
+	})
+}
+
+// handleSessionSummary 生成会话摘要统计
+func (s *HTTPServer) handleSessionSummary(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+
+	if len(hist) == 0 {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"session":  sid,
+			"summary":  "empty conversation",
+			"messages": 0,
+		})
+		return
+	}
+
+	// 统计
+	userMsgs := 0
+	assistantMsgs := 0
+	toolCalls := 0
+	totalUserChars := 0
+	totalAssistantChars := 0
+	var firstUserMsg, lastUserMsg string
+
+	for _, msg := range hist {
+		switch string(msg.Role) {
+		case "user":
+			userMsgs++
+			totalUserChars += len(msg.Content)
+			if firstUserMsg == "" {
+				firstUserMsg = msg.Content
+			}
+			lastUserMsg = msg.Content
+		case "assistant":
+			assistantMsgs++
+			totalAssistantChars += len(msg.Content)
+		case "tool":
+			toolCalls++
+		}
+	}
+
+	// 截断摘要
+	if len(firstUserMsg) > 100 {
+		firstUserMsg = firstUserMsg[:100] + "..."
+	}
+	if len(lastUserMsg) > 100 {
+		lastUserMsg = lastUserMsg[:100] + "..."
+	}
+
+	avgUserLen := 0
+	if userMsgs > 0 {
+		avgUserLen = totalUserChars / userMsgs
+	}
+	avgAssistantLen := 0
+	if assistantMsgs > 0 {
+		avgAssistantLen = totalAssistantChars / assistantMsgs
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":              sid,
+		"total_messages":       len(hist),
+		"user_messages":        userMsgs,
+		"assistant_messages":   assistantMsgs,
+		"tool_calls":           toolCalls,
+		"first_user_message":   firstUserMsg,
+		"last_user_message":    lastUserMsg,
+		"avg_user_msg_length":  avgUserLen,
+		"avg_assistant_msg_length": avgAssistantLen,
+		"total_chars":          totalUserChars + totalAssistantChars,
 	})
 }
 

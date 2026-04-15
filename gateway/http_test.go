@@ -2782,3 +2782,93 @@ func TestSystemPromptNotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
+
+func TestCompareSessions(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/compare", srv.handleCompareSessions)
+
+	ag1 := srv.getOrCreateSession("cmp1")
+	ag2 := srv.getOrCreateSession("cmp2")
+	srv.sessions.Store("cmp1", &httpSession{agent: ag1})
+	srv.sessions.Store("cmp2", &httpSession{agent: ag2})
+
+	body := `{"session1":"cmp1","session2":"cmp2"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/compare", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["common_prefix_length"].(float64) != 0 {
+		t.Fatalf("expected 0 common prefix for empty sessions")
+	}
+}
+
+func TestCompareSessionsNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/compare", srv.handleCompareSessions)
+
+	body := `{"session1":"exists","session2":"nope"}`
+	srv.sessions.Store("exists", &httpSession{agent: srv.getOrCreateSession("exists")})
+	req := httptest.NewRequest("POST", "/v1/sessions/compare", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestCompareSessionsValidation(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/compare", srv.handleCompareSessions)
+
+	body := `{"session1":"","session2":""}`
+	req := httptest.NewRequest("POST", "/v1/sessions/compare", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestSessionSummary(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/summary", srv.handleSessionSummary)
+
+	ag := srv.getOrCreateSession("sum-test")
+	srv.sessions.Store("sum-test", &httpSession{agent: ag})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/sum-test/summary", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["session"] != "sum-test" {
+		t.Fatalf("expected session=sum-test")
+	}
+	if resp["summary"] != "empty conversation" {
+		t.Fatalf("expected empty conversation summary")
+	}
+}
+
+func TestSessionSummaryNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/summary", srv.handleSessionSummary)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexistent/summary", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
