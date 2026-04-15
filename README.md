@@ -16,7 +16,7 @@
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
   (扩展)   ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
                │  └───────┘  └─────────┘  └──────────┘   │
-               │  66 API Endpoints · Audit · Webhooks     │
+               │  92 API Endpoints · Audit · Webhooks     │
                └──────────────────────────────────────────┘
 ```
 
@@ -60,7 +60,7 @@
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 66 个端点（原生 62 + OpenAI 兼容 2 + WebSocket 1 + 管理 1），完整 OpenAPI 3.0 规范
+- 92 个端点，完整 OpenAPI 3.0 规范
 - X-Request-ID 请求追踪（自动生成或透传客户端 ID）
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
@@ -90,6 +90,21 @@
 - 运行时分析仪表盘（会话统计 + 标签分布 + 审计摘要）
 - 优雅关闭（活跃连接排水 + 30s 超时）
 - 工具执行超时（per-tool 或全局默认，context.WithTimeout）
+- **SSE 实时事件流**（订阅者管理 + 事件类型过滤）
+- 会话检查点系统（命名保存/恢复 + 深拷贝）
+- 消息编辑/删除/撤销（按索引操作历史）
+- 会话克隆（深拷贝含标签和元数据）
+- 批量会话删除（≤100 个/请求）
+- **工具管道执行**（链式调用，`{{prev}}` 引用上一步输出，≤10 步）
+- 会话手动持久化触发
+- 索引分叉（从指定消息处分叉新会话）
+- 消息反应/评价（emoji 反应系统）
+- 消息书签（带标签 + 内容预览）
+- 会话归档/取消归档管理
+- 消息分页查询（offset/limit + 角色过滤）
+- Token 使用量统计（per-role + 上下文使用率）
+- 自定义会话元数据（键值对，支持删除）
+- 服务运行时间端点
 
 ## 项目结构
 
@@ -112,7 +127,7 @@ GoClaw/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（66 端点，REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── http.go             # HTTP API（92 端点，REST + SSE + WebSocket + OpenAI 兼容）
 │   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
@@ -228,6 +243,27 @@ docker compose up -d
 | `/v1/sessions/:session/search` | GET | 会话内消息搜索（`?q=xxx&role=user`） |
 | `/v1/sessions/:session/trim` | POST | 裁剪历史（保留最近N条） |
 | `/v1/sessions/:session/system-prompt` | PUT/GET | 会话级 System Prompt 覆盖 |
+| `/v1/sessions/:session/import` | POST | 批量导入消息（append/replace模式） |
+| `/v1/sessions/:session/inject` | POST | 指定位置注入消息 |
+| `/v1/sessions/:session/checkpoint` | POST/GET | 会话检查点管理（创建/列出） |
+| `/v1/sessions/:session/checkpoint/restore` | POST | 恢复到指定检查点 |
+| `/v1/sessions/:session/messages/:index` | PUT/DELETE | 消息编辑/删除（按索引） |
+| `/v1/sessions/:session/undo` | POST | 撤销最后一条消息 |
+| `/v1/sessions/:session/clone` | POST | 深拷贝会话（含标签/元数据） |
+| `/v1/sessions/:session/fork-at` | POST | 从指定索引分叉新会话 |
+| `/v1/sessions/:session/save` | POST | 手动触发会话持久化 |
+| `/v1/sessions/:session/archive` | POST | 归档会话 |
+| `/v1/sessions/:session/unarchive` | POST | 取消归档 |
+| `/v1/sessions/archived` | GET | 列出已归档会话 |
+| `/v1/sessions/bulk-delete` | POST | 批量删除会话（≤100） |
+| `/v1/sessions/:session/messages` | GET | 消息分页查询（offset/limit/角色过滤） |
+| `/v1/sessions/:session/tokens` | GET | Token使用量统计（per-role/使用率） |
+| `/v1/sessions/:session/meta` | GET/PUT | 自定义会话元数据（键值对） |
+| `/v1/sessions/:session/messages/:index/react` | POST/GET | 消息反应（emoji） |
+| `/v1/sessions/:session/messages/:index/bookmark` | POST | 消息书签 |
+| `/v1/sessions/:session/bookmarks` | GET | 书签列表（含预览） |
+| `/v1/events` | GET | SSE实时事件流（类型过滤） |
+| `/v1/uptime` | GET | 服务运行时间+统计 |
 | `/v1/batch/chat` | POST | 批量多会话并发聊天（≤20） |
 | `/v1/tools` | GET | 列出可用工具（含禁用状态） |
 | `/v1/tools/stats` | GET | 工具调用统计（次数、错误、平均耗时） |
@@ -238,6 +274,7 @@ docker compose up -d
 | `/v1/tools/batch` | POST | 批量工具执行（≤20个） |
 | `/v1/tools/aliases` | GET/PUT/DELETE | 工具别名管理 |
 | `/v1/tools/analytics` | GET/DELETE | 工具使用分析（调用次数/错误率/平均耗时） |
+| `/v1/tools/pipeline` | POST | 工具管道执行（链式调用，`{{prev}}` 引用，≤10步） |
 | `/v1/plugins` | GET | 列出已加载插件 |
 | `/v1/plugins/reload` | POST | 重新加载插件目录 |
 | `/v1/plugins/:name` | DELETE | 卸载指定插件 |
