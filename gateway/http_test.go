@@ -2652,3 +2652,133 @@ func TestAddTemplateValidation(t *testing.T) {
 		t.Fatalf("expected 400, got %d", w.Code)
 	}
 }
+
+func TestSearchMessages(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/search", srv.handleSearchMessages)
+
+	ag := srv.getOrCreateSession("search-test")
+	sess := &httpSession{agent: ag}
+	srv.sessions.Store("search-test", sess)
+
+	// Empty search param → 400
+	req := httptest.NewRequest("GET", "/v1/sessions/search-test/search", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for missing q, got %d", w.Code)
+	}
+
+	// Valid search (empty history)
+	req = httptest.NewRequest("GET", "/v1/sessions/search-test/search?q=hello", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 0 {
+		t.Fatalf("expected 0 matches in empty history")
+	}
+}
+
+func TestSearchMessagesNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/search", srv.handleSearchMessages)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexistent/search?q=test", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestTrimMessages(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/trim", srv.handleTrimMessages)
+
+	ag := srv.getOrCreateSession("trim-test")
+	sess := &httpSession{agent: ag}
+	srv.sessions.Store("trim-test", sess)
+
+	// keep_last=0 → 400
+	body := `{"keep_last":0}`
+	req := httptest.NewRequest("POST", "/v1/sessions/trim-test/trim", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for keep_last=0, got %d", w.Code)
+	}
+
+	// Valid trim (nothing to trim)
+	body = `{"keep_last":10}`
+	req = httptest.NewRequest("POST", "/v1/sessions/trim-test/trim", strings.NewReader(body))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+}
+
+func TestSystemPrompt(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/system-prompt", srv.handleSetSystemPrompt)
+	mux.HandleFunc("GET /v1/sessions/{session}/system-prompt", srv.handleGetSystemPrompt)
+
+	ag := srv.getOrCreateSession("sp-test")
+	sess := &httpSession{agent: ag}
+	srv.sessions.Store("sp-test", sess)
+
+	// GET (no override)
+	req := httptest.NewRequest("GET", "/v1/sessions/sp-test/system-prompt", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["has_override"] != false {
+		t.Fatal("expected no override initially")
+	}
+
+	// SET
+	setBody := `{"prompt":"You are a pirate."}`
+	req = httptest.NewRequest("PUT", "/v1/sessions/sp-test/system-prompt", strings.NewReader(setBody))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("set: expected 200, got %d", w.Code)
+	}
+
+	// GET again
+	req = httptest.NewRequest("GET", "/v1/sessions/sp-test/system-prompt", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["prompt"] != "You are a pirate." {
+		t.Fatalf("expected pirate prompt, got %v", resp["prompt"])
+	}
+	if resp["has_override"] != true {
+		t.Fatal("expected has_override=true")
+	}
+}
+
+func TestSystemPromptNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/system-prompt", srv.handleSetSystemPrompt)
+
+	req := httptest.NewRequest("PUT", "/v1/sessions/nonexistent/system-prompt", strings.NewReader(`{"prompt":"x"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}

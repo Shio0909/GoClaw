@@ -87,6 +87,7 @@ type httpSession struct {
 	customTTL   time.Duration   // 自定义存活时间（0 = 使用全局默认）
 	locked      bool            // 锁定状态（锁定后禁止新消息）
 	lockedBy    string          // 锁定者标识
+	systemPromptOverride string // 会话级 system prompt 覆盖
 }
 
 type sessionNote struct {
@@ -300,6 +301,13 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/templates", s.handleListTemplates)
 	mux.HandleFunc("POST /v1/templates", s.handleAddTemplate)
 	mux.HandleFunc("DELETE /v1/templates/{name}", s.handleDeleteTemplate)
+	// Session message search
+	mux.HandleFunc("GET /v1/sessions/{session}/search", s.handleSearchMessages)
+	// Session message trim
+	mux.HandleFunc("POST /v1/sessions/{session}/trim", s.handleTrimMessages)
+	// System prompt override
+	mux.HandleFunc("PUT /v1/sessions/{session}/system-prompt", s.handleSetSystemPrompt)
+	mux.HandleFunc("GET /v1/sessions/{session}/system-prompt", s.handleGetSystemPrompt)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -2727,8 +2735,18 @@ func (s *HTTPServer) handleBatchTools(w http.ResponseWriter, r *http.Request) {
 
 	results := make([]toolResult, 0, len(req.Tools))
 	for _, t := range req.Tools {
+		start := time.Now()
 		out, err := s.registry.Execute(r.Context(), t.Name, t.Args)
+		elapsed := time.Since(start).Milliseconds()
+
+		// 记录工具使用统计
+		val, _ := s.toolUsage.LoadOrStore(t.Name, &toolUsageStats{})
+		stats := val.(*toolUsageStats)
+		stats.Calls.Add(1)
+		stats.TotalMs.Add(elapsed)
+
 		if err != nil {
+			stats.Errors.Add(1)
 			results = append(results, toolResult{Name: t.Name, Success: false, Error: err.Error()})
 		} else {
 			results = append(results, toolResult{Name: t.Name, Success: true, Result: out})
@@ -2867,6 +2885,138 @@ func (s *HTTPServer) handleDeleteTemplate(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]string{
 		"status": "deleted",
 		"name":   name,
+	})
+}
+
+// handleSearchMessages 在会话历史中搜索消息
+func (s *HTTPServer) handleSearchMessages(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "query parameter q is required"})
+		return
+	}
+
+	roleFilter := r.URL.Query().Get("role")
+	queryLower := strings.ToLower(query)
+
+	type matchResult struct {
+		Index   int    `json:"index"`
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	var matches []matchResult
+	for i, msg := range sess.agent.GetHistory() {
+		if roleFilter != "" && string(msg.Role) != roleFilter {
+			continue
+		}
+		if strings.Contains(strings.ToLower(msg.Content), queryLower) {
+			excerpt := msg.Content
+			if len(excerpt) > 200 {
+				excerpt = excerpt[:200] + "..."
+			}
+			matches = append(matches, matchResult{
+				Index: i, Role: string(msg.Role), Content: excerpt,
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"query":   query,
+		"matches": matches,
+		"total":   len(matches),
+	})
+}
+
+// handleTrimMessages 裁剪会话历史（保留最近 N 条）
+func (s *HTTPServer) handleTrimMessages(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body struct {
+		KeepLast int `json:"keep_last"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil || body.KeepLast <= 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "keep_last must be a positive integer"})
+		return
+	}
+
+	hist := sess.agent.GetHistory()
+	original := len(hist)
+	if body.KeepLast >= len(hist) {
+		writeJSON(w, http.StatusOK, map[string]interface{}{
+			"session":  sid,
+			"original": original,
+			"trimmed":  0,
+			"kept":     original,
+		})
+		return
+	}
+
+	trimmed := hist[len(hist)-body.KeepLast:]
+	sess.agent.SetHistory(trimmed)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"original": original,
+		"trimmed":  original - body.KeepLast,
+		"kept":     body.KeepLast,
+	})
+}
+
+// handleSetSystemPrompt 设置会话级 system prompt 覆盖
+func (s *HTTPServer) handleSetSystemPrompt(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	var body struct {
+		Prompt string `json:"prompt"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+
+	sess.systemPromptOverride = body.Prompt
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"status":  "updated",
+		"length":  len(body.Prompt),
+	})
+}
+
+// handleGetSystemPrompt 获取会话级 system prompt
+func (s *HTTPServer) handleGetSystemPrompt(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":    sid,
+		"prompt":     sess.systemPromptOverride,
+		"has_override": sess.systemPromptOverride != "",
 	})
 }
 
