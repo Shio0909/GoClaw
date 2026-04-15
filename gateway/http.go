@@ -2,6 +2,8 @@ package gateway
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,6 +65,7 @@ type HTTPServer struct {
 	promptTemplates sync.Map            // name -> *promptTemplate
 	eventSubs      sync.Map             // subID -> chan *serverEvent (SSE 订阅者)
 	eventSubSeq    atomic.Int64         // 订阅者 ID 自增序列
+	shareTokens    sync.Map             // token -> sessionID (分享令牌映射)
 
 	server *http.Server
 }
@@ -124,6 +127,18 @@ type httpSession struct {
 	votes       map[int]int         // 消息索引 -> 投票值累加
 	timeline    []timelineEvent     // 活动时间线
 	createdAt   time.Time           // 创建时间
+	category    string              // 分类标签
+	threads     map[int][]threadReply // 消息索引 -> 回复链
+	shareToken  string              // 分享令牌（只读）
+	messageQuota int               // 消息配额（0 = 无限）
+	messageCount int               // 已发送消息数
+}
+
+// threadReply 消息回复（线程化讨论）
+type threadReply struct {
+	Author    string `json:"author"`
+	Content   string `json:"content"`
+	Timestamp string `json:"timestamp"`
 }
 
 type sessionNote struct {
@@ -423,6 +438,26 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	// Message voting
 	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/vote", s.handleMessageVote)
 	mux.HandleFunc("GET /v1/sessions/{session}/votes", s.handleGetVotes)
+	// Session categories
+	mux.HandleFunc("PUT /v1/sessions/{session}/category", s.handleSetCategory)
+	mux.HandleFunc("GET /v1/sessions/categories", s.handleListCategories)
+	// Message threading
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/reply", s.handleReplyToMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/{index}/thread", s.handleGetThread)
+	// Session sharing
+	mux.HandleFunc("POST /v1/sessions/{session}/share", s.handleCreateShareToken)
+	mux.HandleFunc("GET /v1/shared/{token}", s.handleViewSharedSession)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/share", s.handleRevokeShareToken)
+	// Usage quotas
+	mux.HandleFunc("PUT /v1/sessions/{session}/quota", s.handleSetQuota)
+	mux.HandleFunc("GET /v1/sessions/{session}/quota", s.handleGetQuota)
+	// HTML export
+	mux.HandleFunc("GET /v1/sessions/{session}/export/html", s.handleExportHTML)
+	// Conversation tree view
+	mux.HandleFunc("GET /v1/sessions/{session}/tree", s.handleConversationTree)
+	// Batch message operations
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/batch-pin", s.handleBatchPinMessages)
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/batch-vote", s.handleBatchVoteMessages)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -4924,4 +4959,529 @@ func (s *HTTPServer) handleGetVotes(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "votes": votes})
+}
+
+// ──────── Session Categories ────────
+
+func (s *HTTPServer) handleSetCategory(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	var req struct {
+		Category string `json:"category"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	sess.category = req.Category
+	sess.addTimeline("category", fmt.Sprintf("category set to: %s", req.Category))
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "category": req.Category})
+}
+
+func (s *HTTPServer) handleListCategories(w http.ResponseWriter, r *http.Request) {
+	categories := make(map[string][]string) // category -> []sessionID
+	s.sessions.Range(func(key, val any) bool {
+		sess := val.(*httpSession)
+		cat := sess.category
+		if cat == "" {
+			cat = "uncategorized"
+		}
+		categories[cat] = append(categories[cat], key.(string))
+		return true
+	})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"categories": categories,
+		"count":      len(categories),
+	})
+}
+
+// ──────── Message Threading ────────
+
+func (s *HTTPServer) handleReplyToMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	idxStr := r.PathValue("index")
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+	var req struct {
+		Author  string `json:"author"`
+		Content string `json:"content"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Content == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "content required"})
+		return
+	}
+	if req.Author == "" {
+		req.Author = "anonymous"
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+	if sess.threads == nil {
+		sess.threads = make(map[int][]threadReply)
+	}
+	reply := threadReply{
+		Author:    req.Author,
+		Content:   req.Content,
+		Timestamp: time.Now().Format(time.RFC3339),
+	}
+	sess.threads[idx] = append(sess.threads[idx], reply)
+	sess.addTimeline("reply", fmt.Sprintf("reply to message %d by %s", idx, req.Author))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":      sid,
+		"parent_index": idx,
+		"reply":        reply,
+		"thread_size":  len(sess.threads[idx]),
+	})
+}
+
+func (s *HTTPServer) handleGetThread(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	idxStr := r.PathValue("index")
+	idx, err := strconv.Atoi(idxStr)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	var replies []threadReply
+	if sess.threads != nil {
+		replies = sess.threads[idx]
+	}
+	if replies == nil {
+		replies = []threadReply{}
+	}
+
+	// 也返回原消息内容作为上下文
+	var parentContent string
+	hist := sess.agent.GetHistory()
+	if idx >= 0 && idx < len(hist) {
+		parentContent = hist[idx].Content
+		if len(parentContent) > 200 {
+			parentContent = parentContent[:200] + "..."
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":        sid,
+		"parent_index":   idx,
+		"parent_preview": parentContent,
+		"replies":        replies,
+		"count":          len(replies),
+	})
+}
+
+// ──────── Session Sharing ────────
+
+func generateToken() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+func (s *HTTPServer) handleCreateShareToken(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	if sess.shareToken != "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "share token already exists, revoke first"})
+		return
+	}
+	token := generateToken()
+	sess.shareToken = token
+	s.shareTokens.Store(token, sid)
+	sess.addTimeline("share", "share token created")
+	s.emitEvent("session.shared", sid, map[string]interface{}{"token": token})
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"token":   token,
+		"url":     fmt.Sprintf("/v1/shared/%s", token),
+	})
+}
+
+func (s *HTTPServer) handleViewSharedSession(w http.ResponseWriter, r *http.Request) {
+	token := r.PathValue("token")
+	sidVal, ok := s.shareTokens.Load(token)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "invalid or expired share token"})
+		return
+	}
+	sid := sidVal.(string)
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session no longer exists"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+	var msgs []map[string]interface{}
+	for i, m := range hist {
+		msg := map[string]interface{}{
+			"index":   i,
+			"role":    string(m.Role),
+			"content": m.Content,
+		}
+		if sess.pinned != nil && sess.pinned[i] {
+			msg["pinned"] = true
+		}
+		if sess.votes != nil {
+			if score, ok := sess.votes[i]; ok {
+				msg["score"] = score
+			}
+		}
+		msgs = append(msgs, msg)
+	}
+	if msgs == nil {
+		msgs = []map[string]interface{}{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"title":    sess.title,
+		"messages": msgs,
+		"read_only": true,
+	})
+}
+
+func (s *HTTPServer) handleRevokeShareToken(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	if sess.shareToken == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "no share token to revoke"})
+		return
+	}
+	s.shareTokens.Delete(sess.shareToken)
+	sess.shareToken = ""
+	sess.addTimeline("share", "share token revoked")
+	writeJSON(w, http.StatusOK, map[string]interface{}{"session": sid, "revoked": true})
+}
+
+// ──────── Usage Quotas ────────
+
+func (s *HTTPServer) handleSetQuota(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	var req struct {
+		MaxMessages int `json:"max_messages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.MaxMessages < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "max_messages must be >= 0"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	sess.messageQuota = req.MaxMessages
+	sess.addTimeline("quota", fmt.Sprintf("quota set to %d messages", req.MaxMessages))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":      sid,
+		"max_messages": req.MaxMessages,
+		"used":         sess.messageCount,
+		"remaining":    max(0, req.MaxMessages-sess.messageCount),
+	})
+}
+
+func (s *HTTPServer) handleGetQuota(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	remaining := -1 // unlimited
+	if sess.messageQuota > 0 {
+		remaining = max(0, sess.messageQuota-sess.messageCount)
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":      sid,
+		"max_messages": sess.messageQuota,
+		"used":         sess.messageCount,
+		"remaining":    remaining,
+		"unlimited":    sess.messageQuota == 0,
+	})
+}
+
+// ──────── HTML Export ────────
+
+func (s *HTTPServer) handleExportHTML(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+
+	title := sess.title
+	if title == "" {
+		title = sid
+	}
+
+	var sb strings.Builder
+	sb.WriteString(`<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8">`)
+	sb.WriteString(fmt.Sprintf(`<title>%s</title>`, title))
+	sb.WriteString(`<style>
+body{font-family:system-ui,-apple-system,sans-serif;max-width:800px;margin:0 auto;padding:20px;background:#f5f5f5}
+.msg{margin:12px 0;padding:12px 16px;border-radius:12px;line-height:1.6}
+.user{background:#dcf8c6;margin-left:60px}
+.assistant{background:#fff;margin-right:60px;box-shadow:0 1px 2px rgba(0,0,0,.1)}
+.system{background:#fff3cd;font-style:italic;text-align:center;font-size:.9em}
+.tool{background:#e8daef;font-family:monospace;font-size:.9em}
+.role{font-weight:700;font-size:.85em;margin-bottom:4px;opacity:.7}
+.meta{font-size:.8em;color:#888;margin-top:4px}
+h1{text-align:center;color:#333}
+.info{text-align:center;color:#666;font-size:.9em;margin-bottom:20px}
+.pinned::before{content:"📌 ";font-size:.8em}
+</style></head><body>`)
+	sb.WriteString(fmt.Sprintf(`<h1>%s</h1>`, title))
+	sb.WriteString(fmt.Sprintf(`<p class="info">%d messages · Exported %s</p>`, len(hist), time.Now().Format("2006-01-02 15:04")))
+
+	for i, m := range hist {
+		roleClass := "assistant"
+		roleLabel := "🤖 Assistant"
+		switch m.Role {
+		case schema.User:
+			roleClass = "user"
+			roleLabel = "👤 User"
+		case schema.System:
+			roleClass = "system"
+			roleLabel = "⚙️ System"
+		case schema.Tool:
+			roleClass = "tool"
+			roleLabel = "🔧 Tool"
+		}
+		pinnedClass := ""
+		if sess.pinned != nil && sess.pinned[i] {
+			pinnedClass = " pinned"
+		}
+		sb.WriteString(fmt.Sprintf(`<div class="msg %s%s">`, roleClass, pinnedClass))
+		sb.WriteString(fmt.Sprintf(`<div class="role">%s (#%d)</div>`, roleLabel, i))
+		// Escape HTML in content
+		content := strings.ReplaceAll(m.Content, "&", "&amp;")
+		content = strings.ReplaceAll(content, "<", "&lt;")
+		content = strings.ReplaceAll(content, ">", "&gt;")
+		content = strings.ReplaceAll(content, "\n", "<br>")
+		sb.WriteString(content)
+
+		var meta []string
+		if sess.bookmarks != nil {
+			if label, ok := sess.bookmarks[i]; ok {
+				meta = append(meta, "🔖 "+label)
+			}
+		}
+		if sess.reactions != nil {
+			if emojis, ok := sess.reactions[i]; ok && len(emojis) > 0 {
+				meta = append(meta, strings.Join(emojis, " "))
+			}
+		}
+		if sess.votes != nil {
+			if score, ok := sess.votes[i]; ok && score != 0 {
+				meta = append(meta, fmt.Sprintf("👍 %d", score))
+			}
+		}
+		if len(meta) > 0 {
+			sb.WriteString(fmt.Sprintf(`<div class="meta">%s</div>`, strings.Join(meta, " · ")))
+		}
+		sb.WriteString("</div>")
+	}
+	sb.WriteString("</body></html>")
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.html"`, sid))
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(sb.String()))
+}
+
+// ──────── Conversation Tree ────────
+
+func (s *HTTPServer) handleConversationTree(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+
+	type treeNode struct {
+		Index    int         `json:"index"`
+		Role     string      `json:"role"`
+		Preview  string      `json:"preview"`
+		Pinned   bool        `json:"pinned,omitempty"`
+		Score    int         `json:"score,omitempty"`
+		Branches []string    `json:"branches,omitempty"`
+		Replies  int         `json:"replies,omitempty"`
+	}
+
+	var nodes []treeNode
+	for i, m := range hist {
+		content := m.Content
+		if len(content) > 100 {
+			content = content[:100] + "..."
+		}
+		node := treeNode{
+			Index:   i,
+			Role:    string(m.Role),
+			Preview: content,
+		}
+		if sess.pinned != nil && sess.pinned[i] {
+			node.Pinned = true
+		}
+		if sess.votes != nil {
+			node.Score = sess.votes[i]
+		}
+		if sess.threads != nil {
+			node.Replies = len(sess.threads[i])
+		}
+		nodes = append(nodes, node)
+	}
+	if nodes == nil {
+		nodes = []treeNode{}
+	}
+
+	branchInfo := make(map[string]string)
+	if sess.branches != nil {
+		for name, bsid := range sess.branches {
+			branchInfo[name] = bsid
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"nodes":    nodes,
+		"branches": branchInfo,
+		"total":    len(nodes),
+	})
+}
+
+// ──────── Batch Message Operations ────────
+
+func (s *HTTPServer) handleBatchPinMessages(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	var req struct {
+		Indices []int `json:"indices"`
+		Pin     bool  `json:"pin"` // true = pin, false = unpin
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if len(req.Indices) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "indices required"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+	if sess.pinned == nil {
+		sess.pinned = make(map[int]bool)
+	}
+
+	var applied []int
+	for _, idx := range req.Indices {
+		if idx >= 0 && idx < len(hist) {
+			if req.Pin {
+				sess.pinned[idx] = true
+			} else {
+				delete(sess.pinned, idx)
+			}
+			applied = append(applied, idx)
+		}
+	}
+	action := "pinned"
+	if !req.Pin {
+		action = "unpinned"
+	}
+	sess.addTimeline("batch-pin", fmt.Sprintf("batch %s %d messages", action, len(applied)))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"action":  action,
+		"applied": applied,
+		"count":   len(applied),
+	})
+}
+
+func (s *HTTPServer) handleBatchVoteMessages(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	var req struct {
+		Votes []struct {
+			Index int `json:"index"`
+			Value int `json:"value"`
+		} `json:"votes"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if len(req.Votes) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "votes required"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+	if sess.votes == nil {
+		sess.votes = make(map[int]int)
+	}
+
+	var applied int
+	for _, v := range req.Votes {
+		if v.Index >= 0 && v.Index < len(hist) && (v.Value == 1 || v.Value == -1) {
+			sess.votes[v.Index] += v.Value
+			applied++
+		}
+	}
+	sess.addTimeline("batch-vote", fmt.Sprintf("batch voted %d messages", applied))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"applied": applied,
+	})
 }

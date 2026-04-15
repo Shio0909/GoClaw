@@ -16,7 +16,7 @@
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
   (扩展)   ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
                │  └───────┘  └─────────┘  └──────────┘   │
-               │  108 API Endpoints · Audit · Webhooks    │
+               │  121 API Endpoints · Audit · Webhooks    │
                └──────────────────────────────────────────┘
 ```
 
@@ -28,7 +28,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~18,000 行 Go（含 467 个测试） | — |
+| **代码量** | ~18,000 行 Go（含 376 个测试） | — |
 
 ## 核心特性
 
@@ -60,7 +60,7 @@
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 92 个端点，完整 OpenAPI 3.0 规范
+- 121 个端点，完整 OpenAPI 3.0 规范
 - X-Request-ID 请求追踪（自动生成或透传客户端 ID）
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
@@ -115,6 +115,14 @@
 - 会话合并（多会话合并到新会话）
 - 自动生成会话标题
 - 会话活动时间线（分页查看操作记录）
+- 会话分类管理（分类标签 + 按分类筛选）
+- 消息线程/回复链（消息下挂子回复）
+- 会话分享（生成分享令牌 + 只读访问 + 撤销）
+- 消息配额管理（设置/查询会话消息上限）
+- HTML 格式导出（带样式的 HTML 文档）
+- 对话树视图（树状结构 + 分支信息）
+- 批量消息固定/取消固定
+- 批量消息投票
 
 ## 项目结构
 
@@ -137,7 +145,7 @@ GoClaw/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（108 端点，REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── http.go             # HTTP API（121 端点，REST + SSE + WebSocket + OpenAI 兼容）
 │   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）

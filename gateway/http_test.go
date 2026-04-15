@@ -4384,3 +4384,446 @@ func TestMessageVoteNotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
+
+// ──────── Category Tests ────────
+
+func TestSetCategory(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/category", srv.handleSetCategory)
+	mux.HandleFunc("GET /v1/sessions/categories", srv.handleListCategories)
+
+	srv.getOrCreateSession("cat-test")
+
+	// Set category
+	req := httptest.NewRequest("PUT", "/v1/sessions/cat-test/category", strings.NewReader(`{"category":"coding"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("set category: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["category"] != "coding" {
+		t.Errorf("expected category=coding")
+	}
+
+	// List categories
+	req = httptest.NewRequest("GET", "/v1/sessions/categories", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("list categories: expected 200, got %d", w.Code)
+	}
+}
+
+func TestSetCategoryNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/category", srv.handleSetCategory)
+
+	req := httptest.NewRequest("PUT", "/v1/sessions/nonexist/category", strings.NewReader(`{"category":"x"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Threading Tests ────────
+
+func TestReplyToMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/reply", srv.handleReplyToMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/{index}/thread", srv.handleGetThread)
+
+	ag := srv.getOrCreateSession("thread-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "original question"},
+		{Role: "assistant", Content: "original answer"},
+	})
+
+	// Add reply
+	body := `{"author":"reviewer","content":"great answer!"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/thread-test/messages/1/reply", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reply: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["thread_size"].(float64) != 1 {
+		t.Errorf("expected thread_size=1")
+	}
+
+	// Get thread
+	req = httptest.NewRequest("GET", "/v1/sessions/thread-test/messages/1/thread", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get thread: expected 200, got %d", w.Code)
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 1 {
+		t.Errorf("expected 1 reply")
+	}
+	if resp["parent_preview"] == "" {
+		t.Errorf("expected parent preview")
+	}
+}
+
+func TestReplyEmptyContent(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/reply", srv.handleReplyToMessage)
+
+	ag := srv.getOrCreateSession("reply-empty")
+	ag.SetHistory([]*schema.Message{{Role: "user", Content: "test"}})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/reply-empty/messages/0/reply", strings.NewReader(`{"content":""}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestReplyNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/reply", srv.handleReplyToMessage)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/messages/0/reply", strings.NewReader(`{"content":"hi"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Sharing Tests ────────
+
+func TestShareSession(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/share", srv.handleCreateShareToken)
+	mux.HandleFunc("GET /v1/shared/{token}", srv.handleViewSharedSession)
+	mux.HandleFunc("DELETE /v1/sessions/{session}/share", srv.handleRevokeShareToken)
+
+	ag := srv.getOrCreateSession("share-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "world"},
+	})
+
+	// Create share token
+	req := httptest.NewRequest("POST", "/v1/sessions/share-test/share", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create share: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	token := resp["token"].(string)
+	if token == "" {
+		t.Fatal("expected non-empty token")
+	}
+
+	// View shared session
+	req = httptest.NewRequest("GET", "/v1/shared/"+token, nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("view shared: expected 200, got %d", w.Code)
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["read_only"] != true {
+		t.Errorf("expected read_only=true")
+	}
+	msgs := resp["messages"].([]interface{})
+	if len(msgs) != 2 {
+		t.Errorf("expected 2 messages, got %d", len(msgs))
+	}
+
+	// Duplicate token should fail
+	req = httptest.NewRequest("POST", "/v1/sessions/share-test/share", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("duplicate share: expected 409, got %d", w.Code)
+	}
+
+	// Revoke
+	req = httptest.NewRequest("DELETE", "/v1/sessions/share-test/share", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("revoke: expected 200, got %d", w.Code)
+	}
+
+	// Token should no longer work
+	req = httptest.NewRequest("GET", "/v1/shared/"+token, nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("revoked token: expected 404, got %d", w.Code)
+	}
+}
+
+func TestShareNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/share", srv.handleCreateShareToken)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/share", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestViewInvalidToken(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/shared/{token}", srv.handleViewSharedSession)
+
+	req := httptest.NewRequest("GET", "/v1/shared/invalidtoken", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Quota Tests ────────
+
+func TestSessionQuota(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/quota", srv.handleSetQuota)
+	mux.HandleFunc("GET /v1/sessions/{session}/quota", srv.handleGetQuota)
+
+	srv.getOrCreateSession("quota-test")
+
+	// Set quota
+	req := httptest.NewRequest("PUT", "/v1/sessions/quota-test/quota", strings.NewReader(`{"max_messages":100}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("set quota: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["max_messages"].(float64) != 100 {
+		t.Errorf("expected max_messages=100")
+	}
+	if resp["remaining"].(float64) != 100 {
+		t.Errorf("expected remaining=100")
+	}
+
+	// Get quota
+	req = httptest.NewRequest("GET", "/v1/sessions/quota-test/quota", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get quota: expected 200, got %d", w.Code)
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["unlimited"] != false {
+		t.Errorf("expected unlimited=false")
+	}
+}
+
+func TestQuotaNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/quota", srv.handleSetQuota)
+
+	req := httptest.NewRequest("PUT", "/v1/sessions/nonexist/quota", strings.NewReader(`{"max_messages":10}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── HTML Export Tests ────────
+
+func TestExportHTML(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export/html", srv.handleExportHTML)
+
+	ag := srv.getOrCreateSession("html-export")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "What is <b>Go</b>?"},
+		{Role: "assistant", Content: "Go is great & fast."},
+	})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/html-export/export/html", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "<!DOCTYPE html>") {
+		t.Error("expected HTML doctype")
+	}
+	if !strings.Contains(body, "&lt;b&gt;Go&lt;/b&gt;") {
+		t.Error("expected HTML-escaped content")
+	}
+	if !strings.Contains(body, "&amp; fast") {
+		t.Error("expected ampersand escaped")
+	}
+	if w.Header().Get("Content-Type") != "text/html; charset=utf-8" {
+		t.Errorf("expected html content type, got %s", w.Header().Get("Content-Type"))
+	}
+}
+
+func TestExportHTMLNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export/html", srv.handleExportHTML)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexist/export/html", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Conversation Tree Tests ────────
+
+func TestConversationTree(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/tree", srv.handleConversationTree)
+
+	ag := srv.getOrCreateSession("tree-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "hi there"},
+		{Role: "user", Content: "how are you"},
+	})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/tree-test/tree", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) != 3 {
+		t.Errorf("expected 3 nodes, got %v", resp["total"])
+	}
+	nodes := resp["nodes"].([]interface{})
+	first := nodes[0].(map[string]interface{})
+	if first["role"] != "user" {
+		t.Errorf("expected first node role=user")
+	}
+}
+
+func TestConversationTreeNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/tree", srv.handleConversationTree)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexist/tree", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+// ──────── Batch Pin/Vote Tests ────────
+
+func TestBatchPinMessages(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/batch-pin", srv.handleBatchPinMessages)
+	mux.HandleFunc("GET /v1/sessions/{session}/pins", srv.handleGetPinnedMessages)
+
+	ag := srv.getOrCreateSession("batch-pin")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "a"},
+		{Role: "assistant", Content: "b"},
+		{Role: "user", Content: "c"},
+	})
+
+	// Batch pin
+	body := `{"indices":[0,2],"pin":true}`
+	req := httptest.NewRequest("POST", "/v1/sessions/batch-pin/messages/batch-pin", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch pin: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 2 {
+		t.Errorf("expected 2 pinned, got %v", resp["count"])
+	}
+	if resp["action"] != "pinned" {
+		t.Errorf("expected action=pinned")
+	}
+}
+
+func TestBatchPinNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/batch-pin", srv.handleBatchPinMessages)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/messages/batch-pin", strings.NewReader(`{"indices":[0],"pin":true}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestBatchVoteMessages(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/batch-vote", srv.handleBatchVoteMessages)
+
+	ag := srv.getOrCreateSession("batch-vote")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+	})
+
+	body := `{"votes":[{"index":0,"value":1},{"index":1,"value":-1},{"index":2,"value":1}]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/batch-vote/messages/batch-vote", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("batch vote: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["applied"].(float64) != 3 {
+		t.Errorf("expected 3 applied, got %v", resp["applied"])
+	}
+}
+
+func TestBatchVoteNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/batch-vote", srv.handleBatchVoteMessages)
+
+	req := httptest.NewRequest("POST", "/v1/sessions/nonexist/messages/batch-vote", strings.NewReader(`{"votes":[{"index":0,"value":1}]}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
