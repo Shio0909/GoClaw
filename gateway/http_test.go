@@ -6330,3 +6330,225 @@ func TestSplitSession(t *testing.T) {
 		t.Errorf("expected 2 messages in new session, got %v", resp["new_count"])
 	}
 }
+
+// ──── Batch 8 Tests: ADK Checkpoint/Resume ────
+
+func TestADKInfo(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/adk/info", srv.handleADKInfo)
+	req := httptest.NewRequest("GET", "/v1/adk/info", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["adk_version"] != "eino v0.8.4" {
+		t.Errorf("expected adk_version='eino v0.8.4', got %v", resp["adk_version"])
+	}
+	features := resp["features"].(map[string]interface{})
+	if features["interrupt_resume"] != true {
+		t.Error("expected interrupt_resume=true")
+	}
+	if features["checkpoint_store"] != true {
+		t.Error("expected checkpoint_store=true")
+	}
+}
+
+func TestADKListCheckpoints_Empty(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	store, _ := agent.NewFileCheckPointStore(t.TempDir())
+	srv.adkCheckpointStore = store
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/adk/checkpoints", srv.handleListADKCheckpoints)
+	req := httptest.NewRequest("GET", "/v1/adk/checkpoints", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 0 {
+		t.Errorf("expected 0 checkpoints, got %v", resp["count"])
+	}
+}
+
+func TestADKSaveAndGetCheckpoint(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	store, _ := agent.NewFileCheckPointStore(t.TempDir())
+	srv.adkCheckpointStore = store
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/adk/checkpoints", srv.handleSaveADKCheckpoint)
+	mux.HandleFunc("GET /v1/adk/checkpoints/{key}", srv.handleGetADKCheckpoint)
+
+	// Save
+	body := `{"key":"cp-test-1","data":"hello checkpoint"}`
+	req := httptest.NewRequest("POST", "/v1/adk/checkpoints", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 201 {
+		t.Fatalf("save: expected 201, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Get
+	req = httptest.NewRequest("GET", "/v1/adk/checkpoints/cp-test-1", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("get: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["data"] != "hello checkpoint" {
+		t.Errorf("expected data='hello checkpoint', got %v", resp["data"])
+	}
+	if resp["size"].(float64) != 16 {
+		t.Errorf("expected size=16, got %v", resp["size"])
+	}
+}
+
+func TestADKDeleteCheckpoint(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	store, _ := agent.NewFileCheckPointStore(t.TempDir())
+	srv.adkCheckpointStore = store
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/adk/checkpoints", srv.handleSaveADKCheckpoint)
+	mux.HandleFunc("DELETE /v1/adk/checkpoints/{key}", srv.handleDeleteADKCheckpoint)
+	mux.HandleFunc("GET /v1/adk/checkpoints/{key}", srv.handleGetADKCheckpoint)
+
+	// Save first
+	body := `{"key":"cp-del","data":"to-delete"}`
+	req := httptest.NewRequest("POST", "/v1/adk/checkpoints", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// Delete
+	req = httptest.NewRequest("DELETE", "/v1/adk/checkpoints/cp-del", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("delete: expected 200, got %d", w.Code)
+	}
+
+	// Verify deleted
+	req = httptest.NewRequest("GET", "/v1/adk/checkpoints/cp-del", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404 after delete, got %d", w.Code)
+	}
+}
+
+func TestADKSaveCheckpoint_MissingKey(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	store, _ := agent.NewFileCheckPointStore(t.TempDir())
+	srv.adkCheckpointStore = store
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/adk/checkpoints", srv.handleSaveADKCheckpoint)
+	body := `{"data":"no key"}`
+	req := httptest.NewRequest("POST", "/v1/adk/checkpoints", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestADKGetCheckpoint_NotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	store, _ := agent.NewFileCheckPointStore(t.TempDir())
+	srv.adkCheckpointStore = store
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/adk/checkpoints/{key}", srv.handleGetADKCheckpoint)
+	req := httptest.NewRequest("GET", "/v1/adk/checkpoints/nonexistent", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 404 {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestADKListCheckpoints_AfterSave(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	store, _ := agent.NewFileCheckPointStore(t.TempDir())
+	srv.adkCheckpointStore = store
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/adk/checkpoints", srv.handleSaveADKCheckpoint)
+	mux.HandleFunc("GET /v1/adk/checkpoints", srv.handleListADKCheckpoints)
+
+	// Save two checkpoints
+	for _, key := range []string{"cp-1", "cp-2"} {
+		body := fmt.Sprintf(`{"key":"%s","data":"data-%s"}`, key, key)
+		req := httptest.NewRequest("POST", "/v1/adk/checkpoints", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != 201 {
+			t.Fatalf("save %s: expected 201, got %d", key, w.Code)
+		}
+	}
+
+	// List
+	req := httptest.NewRequest("GET", "/v1/adk/checkpoints", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 200 {
+		t.Fatalf("list: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 2 {
+		t.Errorf("expected 2 checkpoints, got %v", resp["count"])
+	}
+}
+
+func TestADKSaveCheckpoint_InvalidJSON(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	store, _ := agent.NewFileCheckPointStore(t.TempDir())
+	srv.adkCheckpointStore = store
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/adk/checkpoints", srv.handleSaveADKCheckpoint)
+	req := httptest.NewRequest("POST", "/v1/adk/checkpoints", strings.NewReader("not json"))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != 400 {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestADKCheckpointStore_Disabled(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	srv.adkCheckpointStore = nil // disable store
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/adk/checkpoints", srv.handleListADKCheckpoints)
+	mux.HandleFunc("POST /v1/adk/checkpoints", srv.handleSaveADKCheckpoint)
+	mux.HandleFunc("GET /v1/adk/checkpoints/{key}", srv.handleGetADKCheckpoint)
+	mux.HandleFunc("DELETE /v1/adk/checkpoints/{key}", srv.handleDeleteADKCheckpoint)
+
+	endpoints := []struct {
+		method string
+		path   string
+	}{
+		{"GET", "/v1/adk/checkpoints"},
+		{"POST", "/v1/adk/checkpoints"},
+		{"GET", "/v1/adk/checkpoints/test"},
+		{"DELETE", "/v1/adk/checkpoints/test"},
+	}
+	for _, ep := range endpoints {
+		var body *strings.Reader
+		if ep.method == "POST" {
+			body = strings.NewReader(`{"key":"x","data":"y"}`)
+		} else {
+			body = strings.NewReader("")
+		}
+		req := httptest.NewRequest(ep.method, ep.path, body)
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+		if w.Code != 503 {
+			t.Errorf("%s %s: expected 503, got %d", ep.method, ep.path, w.Code)
+		}
+	}
+}

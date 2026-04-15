@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"path/filepath"
 	"runtime"
 	"sort"
 	"strconv"
@@ -69,6 +70,7 @@ type HTTPServer struct {
 	eventSubSeq    atomic.Int64         // 订阅者 ID 自增序列
 	shareTokens    sync.Map             // token -> sessionID (分享令牌映射)
 	sessionTemplates sync.Map           // name -> *sessionTemplate
+	adkCheckpointStore *agent.FileCheckPointStore // ADK 检查点存储
 
 	server *http.Server
 }
@@ -251,6 +253,19 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 	// 从磁盘恢复会话
 	if store != nil {
 		srv.restoreSessions()
+	}
+
+	// ADK 检查点存储初始化
+	adkDir := filepath.Join("memory_data", "adk_checkpoints")
+	if cfg.SessionDir != "" {
+		adkDir = filepath.Join(cfg.SessionDir, "adk_checkpoints")
+	}
+	adkStore, err := agent.NewFileCheckPointStore(adkDir)
+	if err != nil {
+		log.Printf("[HTTP] ADK 检查点存储初始化失败: %v", err)
+	} else {
+		srv.adkCheckpointStore = adkStore
+		log.Printf("[HTTP] ADK 检查点存储: %s", adkDir)
 	}
 
 	// 速率限制
@@ -560,6 +575,12 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("DELETE /v1/sessions/group/{name}", s.handleDeleteSessionGroup)
 	mux.HandleFunc("GET /v1/sessions/{session}/complexity", s.handleSessionComplexity)
 	mux.HandleFunc("POST /v1/sessions/{session}/split", s.handleSplitSession)
+	// ──── Batch 8: ADK Checkpoint/Resume (Eino v0.8.4 adk integration) ────
+	mux.HandleFunc("GET /v1/adk/checkpoints", s.handleListADKCheckpoints)
+	mux.HandleFunc("POST /v1/adk/checkpoints", s.handleSaveADKCheckpoint)
+	mux.HandleFunc("GET /v1/adk/checkpoints/{key}", s.handleGetADKCheckpoint)
+	mux.HandleFunc("DELETE /v1/adk/checkpoints/{key}", s.handleDeleteADKCheckpoint)
+	mux.HandleFunc("GET /v1/adk/info", s.handleADKInfo)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -7837,5 +7858,126 @@ func (s *HTTPServer) handleSplitSession(w http.ResponseWriter, r *http.Request) 
 		"split_at":         req.AtIndex,
 		"original_count":   req.AtIndex,
 		"new_count":        len(splitMsgs),
+	})
+}
+
+// ──── Batch 8 Handlers: ADK Checkpoint/Resume (Eino v0.8.4) ────
+
+// handleListADKCheckpoints GET /v1/adk/checkpoints — 列出所有 ADK 检查点
+func (s *HTTPServer) handleListADKCheckpoints(w http.ResponseWriter, r *http.Request) {
+	if s.adkCheckpointStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ADK checkpoint store not initialized"})
+		return
+	}
+	metas, err := s.adkCheckpointStore.List()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if metas == nil {
+		metas = []agent.CheckpointMetaInfo{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"checkpoints": metas,
+		"count":       len(metas),
+	})
+}
+
+// handleSaveADKCheckpoint POST /v1/adk/checkpoints — 手动保存 ADK 检查点
+func (s *HTTPServer) handleSaveADKCheckpoint(w http.ResponseWriter, r *http.Request) {
+	if s.adkCheckpointStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ADK checkpoint store not initialized"})
+		return
+	}
+	var req struct {
+		Key  string `json:"key"`
+		Data string `json:"data"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if req.Key == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "key is required"})
+		return
+	}
+	if err := s.adkCheckpointStore.Set(r.Context(), req.Key, []byte(req.Data)); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]string{
+		"key":    req.Key,
+		"status": "saved",
+	})
+}
+
+// handleGetADKCheckpoint GET /v1/adk/checkpoints/{key} — 获取指定 ADK 检查点
+func (s *HTTPServer) handleGetADKCheckpoint(w http.ResponseWriter, r *http.Request) {
+	if s.adkCheckpointStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ADK checkpoint store not initialized"})
+		return
+	}
+	key := r.PathValue("key")
+	data, ok, err := s.adkCheckpointStore.Get(r.Context(), key)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "checkpoint not found"})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"key":  key,
+		"size": len(data),
+		"data": string(data),
+	})
+}
+
+// handleDeleteADKCheckpoint DELETE /v1/adk/checkpoints/{key} — 删除 ADK 检查点
+func (s *HTTPServer) handleDeleteADKCheckpoint(w http.ResponseWriter, r *http.Request) {
+	if s.adkCheckpointStore == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "ADK checkpoint store not initialized"})
+		return
+	}
+	key := r.PathValue("key")
+	if err := s.adkCheckpointStore.Delete(key); err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{
+		"key":    key,
+		"status": "deleted",
+	})
+}
+
+// handleADKInfo GET /v1/adk/info — 返回 ADK 集成信息
+func (s *HTTPServer) handleADKInfo(w http.ResponseWriter, r *http.Request) {
+	storeStatus := "disabled"
+	checkpointCount := 0
+	if s.adkCheckpointStore != nil {
+		storeStatus = "enabled"
+		if metas, err := s.adkCheckpointStore.List(); err == nil {
+			checkpointCount = len(metas)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"adk_version":      "eino v0.8.4",
+		"store_status":     storeStatus,
+		"checkpoint_count": checkpointCount,
+		"features": map[string]bool{
+			"checkpoint_store":   s.adkCheckpointStore != nil,
+			"interrupt_resume":   true,
+			"stateful_interrupt": true,
+			"composite_interrupt": true,
+			"streaming":          true,
+		},
+		"checkpoint_store_type": "file",
+		"interfaces": []string{
+			"adk.CheckPointStore",
+			"adk.Agent",
+			"adk.ResumableAgent",
+			"adk.Runner",
+		},
 	})
 }
