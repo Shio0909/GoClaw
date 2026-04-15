@@ -5473,3 +5473,342 @@ func TestPromptPreviewUnreplaced(t *testing.T) {
 		t.Errorf("expected unreplaced ['role'], got %v", unreplaced)
 	}
 }
+
+// ──────── Batch 5: Tool Usage, System Info, YAML Export, etc. ────────
+
+func TestToolUsage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/tool-usage", srv.handleToolUsage)
+
+	srv.getOrCreateSession("tool-usage-test")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/tool-usage-test/tool-usage", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["session"].(string) != "tool-usage-test" {
+		t.Errorf("expected session 'tool-usage-test'")
+	}
+}
+
+func TestToolUsageNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/tool-usage", srv.handleToolUsage)
+
+	req := httptest.NewRequest("GET", "/v1/sessions/nonexist/tool-usage", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestSystemInfo(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/system/info", srv.handleSystemInfo)
+
+	req := httptest.NewRequest("GET", "/v1/system/info", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["go_version"] == nil {
+		t.Error("expected go_version")
+	}
+	if resp["goroutines"].(float64) < 1 {
+		t.Error("expected at least 1 goroutine")
+	}
+}
+
+func TestRenameSessionPut(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/rename", srv.handleRenameSessionPut)
+
+	srv.getOrCreateSession("rename-test")
+	if val, ok := srv.sessions.Load("rename-test"); ok {
+		val.(*httpSession).title = "Old Title"
+	}
+
+	req := httptest.NewRequest("PUT", "/v1/sessions/rename-test/rename", strings.NewReader(`{"title":"New Title"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["new_title"] != "New Title" {
+		t.Errorf("expected 'New Title', got %v", resp["new_title"])
+	}
+	if resp["old_title"] != "Old Title" {
+		t.Errorf("expected 'Old Title', got %v", resp["old_title"])
+	}
+}
+
+func TestExportYAML(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export/yaml", srv.handleExportYAML)
+
+	ag := srv.getOrCreateSession("yaml-test")
+	ag.AppendAssistantMessage(context.Background(), "hello yaml world")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/yaml-test/export/yaml", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "session_id: yaml-test") {
+		t.Error("expected session_id in YAML")
+	}
+	if !strings.Contains(body, "hello yaml world") {
+		t.Error("expected message content in YAML")
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/yaml") {
+		t.Errorf("expected yaml content type, got %s", ct)
+	}
+}
+
+func TestSearchSessionMessages(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/search", srv.handleSearchSessionMessages)
+
+	ag := srv.getOrCreateSession("search-msg-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "how to use golang channels"},
+		{Role: "assistant", Content: "channels in Go are a way to communicate between goroutines"},
+		{Role: "user", Content: "show me an example of mutex"},
+	})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/search-msg-test/messages/search?q=channels", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) < 1 {
+		t.Error("expected at least 1 match for 'channels'")
+	}
+}
+
+func TestSearchSessionMessagesNoQuery(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/search", srv.handleSearchSessionMessages)
+
+	srv.getOrCreateSession("search-nq")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/search-nq/messages/search", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestBatchSessionStatus(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/status", srv.handleBatchSessionStatus)
+
+	srv.getOrCreateSession("stat-a")
+	srv.getOrCreateSession("stat-b")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/status?ids=stat-a,stat-b,nonexist", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	sessions := resp["sessions"].([]interface{})
+	if len(sessions) != 3 {
+		t.Errorf("expected 3 results, got %d", len(sessions))
+	}
+}
+
+func TestCapabilities(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/capabilities", srv.handleCapabilities)
+
+	req := httptest.NewRequest("GET", "/v1/capabilities", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	features := resp["features"].(map[string]interface{})
+	if features["streaming"] != true {
+		t.Error("expected streaming=true")
+	}
+}
+
+func TestContextWindow(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/context-window", srv.handleContextWindow)
+
+	ag := srv.getOrCreateSession("ctx-win")
+	ag.AppendAssistantMessage(context.Background(), strings.Repeat("hello ", 100))
+
+	req := httptest.NewRequest("GET", "/v1/sessions/ctx-win/context-window", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["estimated_tokens"].(float64) < 1 {
+		t.Error("expected non-zero token count")
+	}
+	if resp["context_length"].(float64) < 1 {
+		t.Error("expected positive context length")
+	}
+}
+
+func TestSessionSummarize(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/summarize", srv.handleSessionSummarize)
+
+	ag := srv.getOrCreateSession("sum-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "how to learn golang programming"},
+		{Role: "assistant", Content: "start with the official tour of Go"},
+		{Role: "user", Content: "what about testing in golang"},
+	})
+
+	req := httptest.NewRequest("POST", "/v1/sessions/sum-test/summarize", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total_messages"].(float64) != 3 {
+		t.Errorf("expected 3 messages, got %v", resp["total_messages"])
+	}
+	if resp["user_messages"].(float64) != 2 {
+		t.Errorf("expected 2 user messages, got %v", resp["user_messages"])
+	}
+}
+
+func TestExportOpenAI(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export/openai", srv.handleExportOpenAI)
+
+	ag := srv.getOrCreateSession("openai-export")
+	ag.SetHistory([]*schema.Message{
+		{Role: "system", Content: "You are helpful"},
+		{Role: "user", Content: "hello"},
+		{Role: "assistant", Content: "Hi there!"},
+	})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/openai-export/export/openai", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	messages := resp["messages"].([]interface{})
+	if len(messages) != 3 {
+		t.Errorf("expected 3 messages, got %d", len(messages))
+	}
+}
+
+func TestBulkRename(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/bulk-rename", srv.handleBulkRename)
+
+	srv.getOrCreateSession("br-1")
+	srv.getOrCreateSession("br-2")
+
+	body := `{"renames":[{"session":"br-1","title":"First"},{"session":"br-2","title":"Second"},{"session":"nonexist","title":"Gone"}]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/bulk-rename", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	results := resp["results"].([]interface{})
+	if len(results) != 3 {
+		t.Errorf("expected 3 results, got %d", len(results))
+	}
+	first := results[0].(map[string]interface{})
+	if first["success"] != true {
+		t.Error("expected first rename to succeed")
+	}
+}
+
+func TestSessionCost(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/cost", srv.handleSessionCost)
+
+	ag := srv.getOrCreateSession("cost-test")
+	ag.SetHistory([]*schema.Message{
+		{Role: "user", Content: "hello world"},
+		{Role: "assistant", Content: "Hi! How can I help you today?"},
+	})
+
+	req := httptest.NewRequest("GET", "/v1/sessions/cost-test/cost", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total_cost_usd"].(float64) < 0 {
+		t.Error("expected non-negative cost")
+	}
+	if resp["estimated_input_tokens"].(float64) < 1 {
+		t.Error("expected positive input tokens")
+	}
+}
+
+func TestToolCatalog(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/tool-catalog", srv.handleToolCatalog)
+
+	req := httptest.NewRequest("GET", "/v1/tool-catalog", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["total"].(float64) < 0 {
+		t.Error("expected non-negative tool count")
+	}
+}

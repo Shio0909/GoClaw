@@ -526,6 +526,20 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/sessions/{session}/message-counts", s.handleMessageCounts)
 	// Prompt preview
 	mux.HandleFunc("POST /v1/prompt-preview", s.handlePromptPreview)
+	// ──── Batch 5: Tool analytics, system info, session rename, YAML export, etc. ────
+	mux.HandleFunc("GET /v1/sessions/{session}/tool-usage", s.handleToolUsage)
+	mux.HandleFunc("GET /v1/system/info", s.handleSystemInfo)
+	mux.HandleFunc("PUT /v1/sessions/{session}/rename", s.handleRenameSessionPut)
+	mux.HandleFunc("GET /v1/sessions/{session}/export/yaml", s.handleExportYAML)
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/search", s.handleSearchSessionMessages)
+	mux.HandleFunc("GET /v1/sessions/status", s.handleBatchSessionStatus)
+	mux.HandleFunc("GET /v1/capabilities", s.handleCapabilities)
+	mux.HandleFunc("GET /v1/sessions/{session}/context-window", s.handleContextWindow)
+	mux.HandleFunc("POST /v1/sessions/{session}/summarize", s.handleSessionSummarize)
+	mux.HandleFunc("GET /v1/sessions/{session}/export/openai", s.handleExportOpenAI)
+	mux.HandleFunc("POST /v1/sessions/bulk-rename", s.handleBulkRename)
+	mux.HandleFunc("GET /v1/sessions/{session}/cost", s.handleSessionCost)
+	mux.HandleFunc("GET /v1/tool-catalog", s.handleToolCatalog)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -6498,5 +6512,582 @@ func (s *HTTPServer) handlePromptPreview(w http.ResponseWriter, r *http.Request)
 		"rendered":   result,
 		"unreplaced": unreplaced,
 		"char_count": len(result),
+	})
+}
+
+// ──────── Batch 5: Tool Usage / System Info / Session Rename / YAML Export / etc. ────────
+
+func (s *HTTPServer) handleToolUsage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	tracker := sess.agent.GetTracker()
+
+	summary := tracker.Summary()
+	turns := tracker.GetTurns()
+
+	// 按工具维度统计
+	type toolDetail struct {
+		Name       string  `json:"name"`
+		CallCount  int     `json:"call_count"`
+		ErrorCount int     `json:"error_count"`
+		ErrorRate  float64 `json:"error_rate"`
+		AvgDurMs   float64 `json:"avg_duration_ms"`
+	}
+
+	toolStats := map[string]*struct {
+		calls, errors int
+		totalDur      time.Duration
+	}{}
+	for _, turn := range turns {
+		for _, tc := range turn.ToolCalls {
+			st, exists := toolStats[tc.ToolName]
+			if !exists {
+				st = &struct {
+					calls, errors int
+					totalDur      time.Duration
+				}{}
+				toolStats[tc.ToolName] = st
+			}
+			st.calls++
+			if !tc.Success {
+				st.errors++
+			}
+			st.totalDur += tc.Duration
+		}
+	}
+
+	details := make([]toolDetail, 0, len(toolStats))
+	for name, st := range toolStats {
+		errRate := 0.0
+		if st.calls > 0 {
+			errRate = float64(st.errors) / float64(st.calls) * 100
+		}
+		avgDur := 0.0
+		if st.calls > 0 {
+			avgDur = float64(st.totalDur.Milliseconds()) / float64(st.calls)
+		}
+		details = append(details, toolDetail{
+			Name:       name,
+			CallCount:  st.calls,
+			ErrorCount: st.errors,
+			ErrorRate:  errRate,
+			AvgDurMs:   avgDur,
+		})
+	}
+	sort.Slice(details, func(i, j int) bool { return details[i].CallCount > details[j].CallCount })
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":       sid,
+		"summary":       summary,
+		"tool_details":  details,
+		"unique_tools":  len(details),
+	})
+}
+
+func (s *HTTPServer) handleSystemInfo(w http.ResponseWriter, r *http.Request) {
+	var m runtime.MemStats
+	runtime.ReadMemStats(&m)
+
+	sessionCount := 0
+	s.sessions.Range(func(_, _ any) bool { sessionCount++; return true })
+
+	toolCount := 0
+	if s.registry != nil {
+		toolCount = len(s.registry.Names())
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"version":        "0.2.0",
+		"go_version":     runtime.Version(),
+		"os":             runtime.GOOS,
+		"arch":           runtime.GOARCH,
+		"cpus":           runtime.NumCPU(),
+		"goroutines":     runtime.NumGoroutine(),
+		"memory_alloc":   m.Alloc,
+		"memory_sys":     m.Sys,
+		"memory_gc":      m.NumGC,
+		"sessions":       sessionCount,
+		"tools":          toolCount,
+		"model":          s.agentCfg.Model,
+		"provider":       s.agentCfg.Provider,
+		"context_length": s.contextLength,
+	})
+}
+
+func (s *HTTPServer) handleRenameSessionPut(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	var req struct {
+		Title string `json:"title"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Title == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "title required"})
+		return
+	}
+	sess := val.(*httpSession)
+	old := sess.title
+	sess.title = req.Title
+	sess.addTimeline("rename", fmt.Sprintf("renamed from '%s' to '%s'", old, req.Title))
+
+	if s.auditLog != nil {
+		s.auditLog.Emit("session.rename", sid, fmt.Sprintf("'%s' → '%s'", old, req.Title), "", nil)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":   sid,
+		"old_title": old,
+		"new_title": req.Title,
+	})
+}
+
+func (s *HTTPServer) handleExportYAML(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	w.Header().Set("Content-Type", "text/yaml; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s.yaml", sid))
+
+	var buf bytes.Buffer
+	buf.WriteString("# GoClaw Session Export\n")
+	buf.WriteString(fmt.Sprintf("session_id: %s\n", sid))
+	buf.WriteString(fmt.Sprintf("title: %q\n", sess.title))
+	buf.WriteString(fmt.Sprintf("created_at: %s\n", sess.createdAt.Format(time.RFC3339)))
+	buf.WriteString(fmt.Sprintf("archived: %v\n", sess.archived))
+	buf.WriteString(fmt.Sprintf("priority: %d\n", sess.priority))
+	buf.WriteString("messages:\n")
+	for _, msg := range sess.agent.GetHistory() {
+		buf.WriteString(fmt.Sprintf("  - role: %s\n", string(msg.Role)))
+		content := strings.ReplaceAll(msg.Content, "\n", "\n    ")
+		buf.WriteString(fmt.Sprintf("    content: |\n      %s\n", content))
+	}
+	w.Write(buf.Bytes())
+}
+
+func (s *HTTPServer) handleSearchSessionMessages(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	query := r.URL.Query().Get("q")
+	if query == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "q parameter required"})
+		return
+	}
+
+	roleFilter := r.URL.Query().Get("role")
+	sess := val.(*httpSession)
+	queryLower := strings.ToLower(query)
+
+	type matchResult struct {
+		Index   int    `json:"index"`
+		Role    string `json:"role"`
+		Content string `json:"content"`
+		Match   string `json:"match_context"`
+	}
+
+	var matches []matchResult
+	for i, msg := range sess.agent.GetHistory() {
+		if roleFilter != "" && string(msg.Role) != roleFilter {
+			continue
+		}
+		if strings.Contains(strings.ToLower(msg.Content), queryLower) {
+			// 提取匹配上下文 (前后 50 字符)
+			idx := strings.Index(strings.ToLower(msg.Content), queryLower)
+			start := idx - 50
+			if start < 0 {
+				start = 0
+			}
+			end := idx + len(query) + 50
+			if end > len(msg.Content) {
+				end = len(msg.Content)
+			}
+			matches = append(matches, matchResult{
+				Index:   i,
+				Role:    string(msg.Role),
+				Content: truncateStr(msg.Content, 200),
+				Match:   msg.Content[start:end],
+			})
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session": sid,
+		"query":   query,
+		"matches": matches,
+		"count":   len(matches),
+	})
+}
+
+func (s *HTTPServer) handleBatchSessionStatus(w http.ResponseWriter, r *http.Request) {
+	idsParam := r.URL.Query().Get("ids")
+	if idsParam == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ids parameter required (comma-separated)"})
+		return
+	}
+	ids := strings.Split(idsParam, ",")
+
+	type sessionStatus struct {
+		ID           string `json:"id"`
+		Exists       bool   `json:"exists"`
+		Title        string `json:"title,omitempty"`
+		MessageCount int    `json:"message_count,omitempty"`
+		Archived     bool   `json:"archived,omitempty"`
+		LastActive   string `json:"last_active,omitempty"`
+	}
+
+	results := make([]sessionStatus, 0, len(ids))
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		val, ok := s.sessions.Load(id)
+		if !ok {
+			results = append(results, sessionStatus{ID: id, Exists: false})
+			continue
+		}
+		sess := val.(*httpSession)
+		results = append(results, sessionStatus{
+			ID:           id,
+			Exists:       true,
+			Title:        sess.title,
+			MessageCount: len(sess.agent.GetHistory()),
+			Archived:     sess.archived,
+			LastActive:   sess.lastUsed.Format(time.RFC3339),
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"sessions": results,
+		"count":    len(results),
+	})
+}
+
+func (s *HTTPServer) handleCapabilities(w http.ResponseWriter, r *http.Request) {
+	toolNames := []string{}
+	if s.registry != nil {
+		toolNames = s.registry.Names()
+	}
+
+	hasRAG := s.ragMgr != nil
+	hasFallback := false
+	if s.fallbackCfg != nil {
+		hasFallback = true
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"version":  "0.2.0",
+		"model":    s.agentCfg.Model,
+		"provider": s.agentCfg.Provider,
+		"features": map[string]bool{
+			"streaming":           true,
+			"sse_events":          true,
+			"websocket":           true,
+			"openai_compatible":   true,
+			"rag":                 hasRAG,
+			"fallback":            hasFallback,
+			"turn_tracking":       true,
+			"otel_tracing":        true,
+			"session_persistence": true,
+			"audit_log":           true,
+			"webhooks":            true,
+			"rate_limiting":       s.rateLimiter != nil,
+			"templates":           true,
+			"checkpoints":         true,
+			"branching":           true,
+		},
+		"tools":       toolNames,
+		"tool_count":  len(toolNames),
+		"api_version": "v1",
+	})
+}
+
+func (s *HTTPServer) handleContextWindow(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	history := sess.agent.GetHistory()
+	totalChars := 0
+	totalTokensEst := 0
+	for _, msg := range history {
+		totalChars += len(msg.Content)
+	}
+	// 粗略估算：英文 1 token ≈ 4 chars，中文 1 token ≈ 2 chars
+	totalTokensEst = totalChars / 3
+
+	ctxLen := s.contextLength
+	if ctxLen <= 0 {
+		ctxLen = 128000
+	}
+
+	usage := 0.0
+	if ctxLen > 0 {
+		usage = float64(totalTokensEst) / float64(ctxLen) * 100
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":             sid,
+		"context_length":      ctxLen,
+		"estimated_tokens":    totalTokensEst,
+		"total_chars":         totalChars,
+		"message_count":       len(history),
+		"usage_percent":       usage,
+		"remaining_tokens":    ctxLen - totalTokensEst,
+		"compression_needed":  usage > 80,
+	})
+}
+
+func (s *HTTPServer) handleSessionSummarize(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	history := sess.agent.GetHistory()
+
+	// 生成本地统计摘要（无需 LLM 调用）
+	topics := map[string]int{}
+	userMsgs := 0
+	assistantMsgs := 0
+	avgMsgLen := 0
+	for _, msg := range history {
+		avgMsgLen += len(msg.Content)
+		switch msg.Role {
+		case schema.User:
+			userMsgs++
+		case schema.Assistant:
+			assistantMsgs++
+		}
+		// 提取 topic 关键词
+		words := strings.Fields(msg.Content)
+		for _, w := range words {
+			w = strings.ToLower(strings.Trim(w, ".,!?;:\"'()[]{}"))
+			if len(w) >= 4 {
+				topics[w]++
+			}
+		}
+	}
+	if len(history) > 0 {
+		avgMsgLen /= len(history)
+	}
+
+	// top topics
+	type topicEntry struct {
+		Word  string `json:"word"`
+		Count int    `json:"count"`
+	}
+	topicList := make([]topicEntry, 0, len(topics))
+	for w, c := range topics {
+		if c >= 2 {
+			topicList = append(topicList, topicEntry{w, c})
+		}
+	}
+	sort.Slice(topicList, func(i, j int) bool { return topicList[i].Count > topicList[j].Count })
+	if len(topicList) > 10 {
+		topicList = topicList[:10]
+	}
+
+	duration := time.Duration(0)
+	if len(history) > 0 {
+		duration = sess.lastUsed.Sub(sess.createdAt)
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":        sid,
+		"title":          sess.title,
+		"total_messages": len(history),
+		"user_messages":  userMsgs,
+		"assistant_msgs": assistantMsgs,
+		"avg_msg_length": avgMsgLen,
+		"duration":       duration.String(),
+		"top_topics":     topicList,
+		"created_at":     sess.createdAt.Format(time.RFC3339),
+		"last_active":    sess.lastUsed.Format(time.RFC3339),
+	})
+}
+
+func (s *HTTPServer) handleExportOpenAI(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	// OpenAI fine-tuning JSONL format
+	type openAIMsg struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	}
+
+	messages := make([]openAIMsg, 0, len(sess.agent.GetHistory()))
+	for _, msg := range sess.agent.GetHistory() {
+		role := string(msg.Role)
+		if role == "system" || role == "user" || role == "assistant" {
+			messages = append(messages, openAIMsg{Role: role, Content: msg.Content})
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=%s-openai.json", sid))
+	enc := json.NewEncoder(w)
+	enc.SetIndent("", "  ")
+	enc.Encode(map[string]interface{}{
+		"messages": messages,
+	})
+}
+
+func (s *HTTPServer) handleBulkRename(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Renames []struct {
+			Session string `json:"session"`
+			Title   string `json:"title"`
+		} `json:"renames"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	if len(req.Renames) == 0 || len(req.Renames) > 50 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "1-50 renames allowed"})
+		return
+	}
+
+	type renameResult struct {
+		Session  string `json:"session"`
+		OldTitle string `json:"old_title"`
+		NewTitle string `json:"new_title"`
+		Success  bool   `json:"success"`
+	}
+	results := make([]renameResult, 0, len(req.Renames))
+	for _, ren := range req.Renames {
+		val, ok := s.sessions.Load(ren.Session)
+		if !ok {
+			results = append(results, renameResult{Session: ren.Session, Success: false})
+			continue
+		}
+		sess := val.(*httpSession)
+		old := sess.title
+		sess.title = ren.Title
+		results = append(results, renameResult{
+			Session:  ren.Session,
+			OldTitle: old,
+			NewTitle: ren.Title,
+			Success:  true,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"results": results,
+		"total":   len(results),
+	})
+}
+
+func (s *HTTPServer) handleSessionCost(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+
+	history := sess.agent.GetHistory()
+	inputChars := 0
+	outputChars := 0
+	for _, msg := range history {
+		switch msg.Role {
+		case schema.User, schema.System:
+			inputChars += len(msg.Content)
+		case schema.Assistant:
+			outputChars += len(msg.Content)
+		}
+	}
+
+	inputTokens := inputChars / 3
+	outputTokens := outputChars / 3
+
+	// 通用定价 ($ per 1M tokens)
+	type pricing struct {
+		InputPer1M  float64 `json:"input_per_1m"`
+		OutputPer1M float64 `json:"output_per_1m"`
+	}
+	prices := map[string]pricing{
+		"minimax":     {1.0, 5.0},
+		"claude":      {3.0, 15.0},
+		"openai":      {2.5, 10.0},
+		"siliconflow": {0.5, 2.0},
+		"mimo":        {1.0, 4.0},
+	}
+
+	provider := s.agentCfg.Provider
+	p, ok := prices[provider]
+	if !ok {
+		p = pricing{2.0, 8.0}
+	}
+
+	inputCost := float64(inputTokens) / 1_000_000 * p.InputPer1M
+	outputCost := float64(outputTokens) / 1_000_000 * p.OutputPer1M
+	totalCost := inputCost + outputCost
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":           sid,
+		"provider":          provider,
+		"estimated_input_tokens":  inputTokens,
+		"estimated_output_tokens": outputTokens,
+		"input_cost_usd":   inputCost,
+		"output_cost_usd":  outputCost,
+		"total_cost_usd":   totalCost,
+		"pricing":          p,
+		"note":             "estimates based on char/3 token approximation",
+	})
+}
+
+func (s *HTTPServer) handleToolCatalog(w http.ResponseWriter, r *http.Request) {
+	type toolInfo struct {
+		Name        string `json:"name"`
+		Description string `json:"description"`
+	}
+
+	var catalog []toolInfo
+	if s.registry != nil {
+		for _, name := range s.registry.Names() {
+			td, ok := s.registry.Get(name)
+			if !ok {
+				continue
+			}
+			catalog = append(catalog, toolInfo{
+				Name:        td.Name,
+				Description: td.Description,
+			})
+		}
+	}
+
+	sort.Slice(catalog, func(i, j int) bool { return catalog[i].Name < catalog[j].Name })
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"tools":      catalog,
+		"total":      len(catalog),
+		"categories": []string{"file", "shell", "web", "search", "mcp", "utility"},
 	})
 }

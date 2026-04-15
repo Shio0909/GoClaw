@@ -85,6 +85,21 @@ func main() {
 	// 初始化结构化日志
 	initLogging(cfg.Server.LogLevel, cfg.Server.LogJSON)
 
+	// 初始化 OpenTelemetry 分布式追踪
+	if cfg.Tracing.Enabled {
+		shutdown, err := agent.InitTracing(context.Background(), agent.OTelConfig{
+			Enabled:  true,
+			Exporter: cfg.Tracing.Exporter,
+			Endpoint: cfg.Tracing.Endpoint,
+		})
+		if err != nil {
+			log.Printf("⚠️ OpenTelemetry 初始化失败: %v", err)
+		} else {
+			defer shutdown(context.Background())
+			log.Printf("📡 OpenTelemetry 追踪已启用 (exporter=%s)", cfg.Tracing.Exporter)
+		}
+	}
+
 	// 共享基础设施
 	infra := setupInfra(cfg)
 	defer infra.cleanup()

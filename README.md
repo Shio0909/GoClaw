@@ -16,7 +16,7 @@
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
   飞书Bot  ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
   (扩展)   ──→ │  └───────┘  └─────────┘  └──────────┘   │
-               │  146 API Endpoints · Audit · Webhooks    │
+               │  159 API Endpoints · Audit · Webhooks    │
                └──────────────────────────────────────────┘
 ```
 
@@ -28,7 +28,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~22,000 行 Go（含 420 个测试） | — |
+| **代码量** | ~24,000 行 Go（含 435 个测试） | — |
 
 ## 核心特性
 
@@ -60,7 +60,7 @@
 - 沙箱安全 + 技能安装安全扫描
 
 **HTTP API**
-- 146 个端点，完整 OpenAPI 3.0 规范
+- 159 个端点，完整 OpenAPI 3.0 规范
 - X-Request-ID 请求追踪（自动生成或透传客户端 ID）
 - OpenAI 兼容接口（`/v1/chat/completions`），可作为 OpenAI 代理
 - CORS 跨域支持（可配置允许域名）
@@ -141,6 +141,19 @@
 - **批量标签操作**（一次为多个会话添加/移除标签）
 - **多会话统计对比**（消息数/标签/创建时间横向对比）
 - **追踪配置查询**（查看当前 OTel 追踪状态）
+- **工具使用详情**（按工具维度统计调用次数/错误率/平均耗时）
+- **系统信息端点**（Go 版本/OS/内存/协程/会话数/工具数）
+- **会话重命名**（PUT 方法 + 审计日志）
+- **YAML 格式导出**（带注释的 YAML 文档下载）
+- **会话内搜索**（按关键词搜索消息，支持角色过滤）
+- **批量会话状态查询**（多会话存在性/状态批量检查）
+- **Agent 能力清单**（功能矩阵 + 工具列表 + API 版本）
+- **上下文窗口分析**（Token 估算/使用率/压缩建议）
+- **会话统计摘要**（本地生成：消息数/主题/时长）
+- **OpenAI 微调格式导出**（标准 OpenAI messages JSON）
+- **批量重命名**（一次重命名多个会话）
+- **会话成本估算**（基于 Token 和提供商定价）
+- **工具目录**（完整工具列表 + 描述 + 分类）
 
 ## 项目结构
 
@@ -165,7 +178,7 @@ GoClaw/
 │   └── config.go           # YAML 配置 + 环境变量回退 + 类型安全默认值
 ├── gateway/
 │   ├── gateway.go          # Gateway 接口定义
-│   ├── http.go             # HTTP API（146 端点，REST + SSE + WebSocket + OpenAI 兼容）
+│   ├── http.go             # HTTP API（159 端点，REST + SSE + WebSocket + OpenAI 兼容）
 │   ├── openapi.go          # OpenAPI 3.0.3 规范生成
 │   ├── session_store.go    # 会话持久化（JSON 快照 + 恢复）
 │   ├── rate_limiter.go     # 令牌桶速率限制（per-IP）
@@ -373,6 +386,19 @@ docker compose up -d
 | `/v1/sessions/:session/export/jsonl` | GET | JSONL 格式导出 |
 | `/v1/sessions/:session/message-counts` | GET | 消息计数统计（按角色） |
 | `/v1/prompt-preview` | POST | Prompt 模板预览 |
+| `/v1/sessions/:session/tool-usage` | GET | 工具使用详情（按工具维度统计） |
+| `/v1/system/info` | GET | 系统信息（Go/OS/内存/协程/会话） |
+| `/v1/sessions/:session/rename` | PUT | 会话重命名（含审计日志） |
+| `/v1/sessions/:session/export/yaml` | GET | YAML 格式导出 |
+| `/v1/sessions/:session/messages/search` | GET | 会话内消息搜索 |
+| `/v1/sessions/status` | GET | 批量会话状态查询 |
+| `/v1/capabilities` | GET | Agent 能力清单 |
+| `/v1/sessions/:session/context-window` | GET | 上下文窗口分析 |
+| `/v1/sessions/:session/summarize` | POST | 会话统计摘要 |
+| `/v1/sessions/:session/export/openai` | GET | OpenAI 格式导出 |
+| `/v1/sessions/bulk-rename` | POST | 批量重命名 |
+| `/v1/sessions/:session/cost` | GET | 会话成本估算 |
+| `/v1/tool-catalog` | GET | 工具目录 |
 
 ### OpenAI 兼容 API
 
