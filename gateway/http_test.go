@@ -4827,3 +4827,336 @@ func TestBatchVoteNotFound(t *testing.T) {
 		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
+
+// -------- Batch 3 Tests --------
+
+func TestSetGetPriority(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/priority", srv.handleSetPriority)
+	mux.HandleFunc("GET /v1/sessions/{session}/priority", srv.handleGetPriority)
+
+	srv.getOrCreateSession("prio-sess")
+
+	// Set priority to urgent
+	req := httptest.NewRequest("PUT", "/v1/sessions/prio-sess/priority", strings.NewReader(`{"priority":3}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("set priority: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["label"] != "urgent" {
+		t.Errorf("expected urgent, got %v", resp["label"])
+	}
+
+	// Get priority
+	req = httptest.NewRequest("GET", "/v1/sessions/prio-sess/priority", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get priority: expected 200, got %d", w.Code)
+	}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["priority"].(float64) != 3 {
+		t.Errorf("expected priority 3, got %v", resp["priority"])
+	}
+}
+
+func TestSetPriorityInvalid(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /v1/sessions/{session}/priority", srv.handleSetPriority)
+
+	srv.getOrCreateSession("prio-sess")
+
+	req := httptest.NewRequest("PUT", "/v1/sessions/prio-sess/priority", strings.NewReader(`{"priority":5}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestExportCSV(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/{session}/export/csv", srv.handleExportCSV)
+
+	ag := srv.getOrCreateSession("csv-sess")
+	ag.AppendAssistantMessage(context.Background(), "hello from AI")
+
+	req := httptest.NewRequest("GET", "/v1/sessions/csv-sess/export/csv", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	if ct := w.Header().Get("Content-Type"); !strings.Contains(ct, "text/csv") {
+		t.Errorf("expected text/csv content type, got %s", ct)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, "index,role,content") {
+		t.Error("CSV should contain header")
+	}
+}
+
+func TestBulkArchive(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/bulk-archive", srv.handleBulkArchive)
+
+	srv.getOrCreateSession("a1")
+	srv.getOrCreateSession("a2")
+	srv.getOrCreateSession("a3")
+
+	body := `{"sessions":["a1","a2","a3","nonexist"]}`
+	req := httptest.NewRequest("POST", "/v1/sessions/bulk-archive", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 3 {
+		t.Errorf("expected 3 archived, got %v", resp["count"])
+	}
+}
+
+func TestBulkUnarchive(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/bulk-archive", srv.handleBulkArchive)
+	mux.HandleFunc("POST /v1/sessions/bulk-unarchive", srv.handleBulkUnarchive)
+
+	srv.getOrCreateSession("u1")
+	srv.getOrCreateSession("u2")
+
+	// Archive first
+	req := httptest.NewRequest("POST", "/v1/sessions/bulk-archive", strings.NewReader(`{"sessions":["u1","u2"]}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// Unarchive
+	req = httptest.NewRequest("POST", "/v1/sessions/bulk-unarchive", strings.NewReader(`{"sessions":["u1","u2"]}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 2 {
+		t.Errorf("expected 2 unarchived, got %v", resp["count"])
+	}
+}
+
+func TestAnnotateMessage(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/annotate", srv.handleAnnotateMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/{index}/annotations", srv.handleGetMessageAnnotations)
+
+	ag := srv.getOrCreateSession("anno-sess")
+	ag.AppendAssistantMessage(context.Background(), "test message")
+
+	// Add annotation
+	body := `{"text":"this is important","type":"highlight","author":"tester"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/anno-sess/messages/0/annotate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("annotate: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Get annotations
+	req = httptest.NewRequest("GET", "/v1/sessions/anno-sess/messages/0/annotations", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("get annotations: expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	annos := resp["annotations"].([]interface{})
+	if len(annos) != 1 {
+		t.Errorf("expected 1 annotation, got %d", len(annos))
+	}
+}
+
+func TestAnnotateMessageInvalidType(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/annotate", srv.handleAnnotateMessage)
+
+	ag := srv.getOrCreateSession("anno2")
+	ag.AppendAssistantMessage(context.Background(), "msg")
+
+	body := `{"text":"test","type":"invalid_type"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/anno2/messages/0/annotate", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400, got %d", w.Code)
+	}
+}
+
+func TestSessionTemplateCRUD(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/session-templates", srv.handleCreateSessionTemplate)
+	mux.HandleFunc("GET /v1/session-templates", srv.handleListSessionTemplates)
+	mux.HandleFunc("DELETE /v1/session-templates/{name}", srv.handleDeleteSessionTemplate)
+
+	// Create
+	body := `{"name":"coding","description":"coding assistant","system_prompt":"You are a coder.","tags":["code"],"category":"dev"}`
+	req := httptest.NewRequest("POST", "/v1/session-templates", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("create template: expected 200, got %d", w.Code)
+	}
+
+	// List
+	req = httptest.NewRequest("GET", "/v1/session-templates", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) != 1 {
+		t.Errorf("expected 1 template, got %v", resp["count"])
+	}
+
+	// Delete
+	req = httptest.NewRequest("DELETE", "/v1/session-templates/coding", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("delete template: expected 200, got %d", w.Code)
+	}
+}
+
+func TestApplySessionTemplate(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/session-templates", srv.handleCreateSessionTemplate)
+	mux.HandleFunc("POST /v1/session-templates/{name}/apply", srv.handleApplySessionTemplate)
+	mux.HandleFunc("GET /v1/sessions/{session}/priority", srv.handleGetPriority)
+
+	// Create template
+	body := `{"name":"urgent-task","priority":3,"category":"urgent","message_quota":50}`
+	req := httptest.NewRequest("POST", "/v1/session-templates", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	// Apply to session
+	req = httptest.NewRequest("POST", "/v1/session-templates/urgent-task/apply", strings.NewReader(`{"session":"tpl-sess"}`))
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("apply: expected 200, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// Verify priority was applied
+	req = httptest.NewRequest("GET", "/v1/sessions/tpl-sess/priority", nil)
+	w = httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["priority"].(float64) != 3 {
+		t.Errorf("expected priority 3 from template, got %v", resp["priority"])
+	}
+}
+
+func TestDetectDuplicates(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /v1/sessions/duplicates", srv.handleDetectDuplicates)
+
+	// 创建两个标题相同的会话
+	srv.getOrCreateSession("dup1")
+	srv.getOrCreateSession("dup2")
+	if val, ok := srv.sessions.Load("dup1"); ok {
+		val.(*httpSession).title = "Same Title"
+	}
+	if val, ok := srv.sessions.Load("dup2"); ok {
+		val.(*httpSession).title = "Same Title"
+	}
+
+	req := httptest.NewRequest("GET", "/v1/sessions/duplicates", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["count"].(float64) < 1 {
+		t.Error("expected at least 1 duplicate pair")
+	}
+}
+
+func TestSessionDiff(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/diff", srv.handleSessionDiff)
+
+	ag1 := srv.getOrCreateSession("diff1")
+	ag1.AppendAssistantMessage(context.Background(), "hello")
+	ag1.AppendAssistantMessage(context.Background(), "world")
+
+	ag2 := srv.getOrCreateSession("diff2")
+	ag2.AppendAssistantMessage(context.Background(), "hello")
+	ag2.AppendAssistantMessage(context.Background(), "different")
+
+	body := `{"session1":"diff1","session2":"diff2"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/diff", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200, got %d", w.Code)
+	}
+	var resp map[string]interface{}
+	json.NewDecoder(w.Body).Decode(&resp)
+	if resp["diff_count"].(float64) < 1 {
+		t.Error("expected at least 1 diff")
+	}
+}
+
+func TestSessionDiffNotFound(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/sessions/diff", srv.handleSessionDiff)
+
+	body := `{"session1":"nonexist1","session2":"nonexist2"}`
+	req := httptest.NewRequest("POST", "/v1/sessions/diff", strings.NewReader(body))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("expected 404, got %d", w.Code)
+	}
+}
+
+func TestQuotaEnforcement(t *testing.T) {
+	srv := newTestHTTPServer(t)
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v1/chat", srv.handleChat)
+
+	// 创建会话并设置配额已满
+	srv.getOrCreateSession("quota-test")
+	if val, ok := srv.sessions.Load("quota-test"); ok {
+		sess := val.(*httpSession)
+		sess.messageQuota = 2
+		sess.messageCount = 2
+	}
+
+	// 发送消息应该被拒绝（429）
+	req := httptest.NewRequest("POST", "/v1/chat", strings.NewReader(`{"session":"quota-test","message":"hi"}`))
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+	if w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 quota exceeded, got %d: %s", w.Code, w.Body.String())
+	}
+}

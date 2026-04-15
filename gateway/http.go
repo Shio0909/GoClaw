@@ -1,8 +1,10 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/csv"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -66,6 +68,7 @@ type HTTPServer struct {
 	eventSubs      sync.Map             // subID -> chan *serverEvent (SSE 订阅者)
 	eventSubSeq    atomic.Int64         // 订阅者 ID 自增序列
 	shareTokens    sync.Map             // token -> sessionID (分享令牌映射)
+	sessionTemplates sync.Map           // name -> *sessionTemplate
 
 	server *http.Server
 }
@@ -96,6 +99,19 @@ type promptTemplate struct {
 	Template    string `json:"template"`
 	Description string `json:"description,omitempty"`
 	Variables   []string `json:"variables,omitempty"`
+}
+
+// sessionTemplate 会话模板（预配置的会话设置）
+type sessionTemplate struct {
+	Name         string            `json:"name"`
+	Description  string            `json:"description,omitempty"`
+	SystemPrompt string            `json:"system_prompt,omitempty"`
+	Tags         []string          `json:"tags,omitempty"`
+	Category     string            `json:"category,omitempty"`
+	Metadata     map[string]string `json:"metadata,omitempty"`
+	Priority     int               `json:"priority,omitempty"`
+	MessageQuota int               `json:"message_quota,omitempty"`
+	CreatedAt    string            `json:"created_at"`
 }
 
 // timelineEvent 会话活动时间线事件
@@ -132,6 +148,8 @@ type httpSession struct {
 	shareToken  string              // 分享令牌（只读）
 	messageQuota int               // 消息配额（0 = 无限）
 	messageCount int               // 已发送消息数
+	priority     int               // 优先级 (0=normal, 1=low, 2=high, 3=urgent)
+	msgAnnotations map[int][]messageAnnotation // 消息索引 -> 注释
 }
 
 // threadReply 消息回复（线程化讨论）
@@ -139,6 +157,14 @@ type threadReply struct {
 	Author    string `json:"author"`
 	Content   string `json:"content"`
 	Timestamp string `json:"timestamp"`
+}
+
+// messageAnnotation 消息级注释
+type messageAnnotation struct {
+	Author    string `json:"author"`
+	Text      string `json:"text"`
+	Type      string `json:"type"` // "note", "correction", "highlight", "question"
+	CreatedAt string `json:"created_at"`
 }
 
 type sessionNote struct {
@@ -458,6 +484,26 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	// Batch message operations
 	mux.HandleFunc("POST /v1/sessions/{session}/messages/batch-pin", s.handleBatchPinMessages)
 	mux.HandleFunc("POST /v1/sessions/{session}/messages/batch-vote", s.handleBatchVoteMessages)
+	// Session priority
+	mux.HandleFunc("PUT /v1/sessions/{session}/priority", s.handleSetPriority)
+	mux.HandleFunc("GET /v1/sessions/{session}/priority", s.handleGetPriority)
+	// CSV export
+	mux.HandleFunc("GET /v1/sessions/{session}/export/csv", s.handleExportCSV)
+	// Bulk archive / unarchive
+	mux.HandleFunc("POST /v1/sessions/bulk-archive", s.handleBulkArchive)
+	mux.HandleFunc("POST /v1/sessions/bulk-unarchive", s.handleBulkUnarchive)
+	// Message annotations
+	mux.HandleFunc("POST /v1/sessions/{session}/messages/{index}/annotate", s.handleAnnotateMessage)
+	mux.HandleFunc("GET /v1/sessions/{session}/messages/{index}/annotations", s.handleGetMessageAnnotations)
+	// Session templates
+	mux.HandleFunc("GET /v1/session-templates", s.handleListSessionTemplates)
+	mux.HandleFunc("POST /v1/session-templates", s.handleCreateSessionTemplate)
+	mux.HandleFunc("DELETE /v1/session-templates/{name}", s.handleDeleteSessionTemplate)
+	mux.HandleFunc("POST /v1/session-templates/{name}/apply", s.handleApplySessionTemplate)
+	// Duplicate detection
+	mux.HandleFunc("GET /v1/sessions/duplicates", s.handleDetectDuplicates)
+	// Message diff
+	mux.HandleFunc("POST /v1/sessions/diff", s.handleSessionDiff)
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)
@@ -644,6 +690,16 @@ func (s *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {
 				})
 				return
 			}
+			// 检查消息配额
+			if sess.messageQuota > 0 && sess.messageCount >= sess.messageQuota {
+				writeJSON(w, http.StatusTooManyRequests, map[string]interface{}{
+					"error": "message quota exceeded",
+					"quota": sess.messageQuota,
+					"used":  sess.messageCount,
+				})
+				return
+			}
+			sess.messageCount++
 			// 应用会话级 system prompt 覆盖
 			if sess.systemPromptOverride != "" {
 				ag.SetExtraSystemPrompt(sess.systemPromptOverride)
@@ -5484,4 +5540,498 @@ func (s *HTTPServer) handleBatchVoteMessages(w http.ResponseWriter, r *http.Requ
 		"session": sid,
 		"applied": applied,
 	})
+}
+
+// -------- Batch 3: Priority / CSV / Bulk Archive / Annotations / Templates / Dedup / Diff --------
+
+func (s *HTTPServer) handleSetPriority(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	var req struct {
+		Priority int `json:"priority"` // 0=normal, 1=low, 2=high, 3=urgent
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Priority < 0 || req.Priority > 3 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "priority must be 0-3"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	sess.priority = req.Priority
+	labels := []string{"normal", "low", "high", "urgent"}
+	sess.addTimeline("priority", fmt.Sprintf("set to %s", labels[req.Priority]))
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"priority": req.Priority,
+		"label":    labels[req.Priority],
+	})
+}
+
+func (s *HTTPServer) handleGetPriority(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	labels := []string{"normal", "low", "high", "urgent"}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  sid,
+		"priority": sess.priority,
+		"label":    labels[sess.priority],
+	})
+}
+
+func (s *HTTPServer) handleExportCSV(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+
+	var buf bytes.Buffer
+	cw := csv.NewWriter(&buf)
+	cw.Write([]string{"index", "role", "content", "timestamp"})
+	for i, msg := range hist {
+		role := string(msg.Role)
+		content := ""
+		if msg.Content != "" {
+			content = msg.Content
+		} else if len(msg.MultiContent) > 0 {
+			var parts []string
+			for _, mc := range msg.MultiContent {
+				if mc.Type == schema.ChatMessagePartTypeText {
+					parts = append(parts, mc.Text)
+				}
+			}
+			content = strings.Join(parts, " ")
+		}
+		cw.Write([]string{strconv.Itoa(i), role, content, ""})
+	}
+	cw.Flush()
+
+	title := sess.title
+	if title == "" {
+		title = sid
+	}
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.csv"`, title))
+	w.Write(buf.Bytes())
+}
+
+func (s *HTTPServer) handleBulkArchive(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sessions []string `json:"sessions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	var archived []string
+	for _, sid := range req.Sessions {
+		if val, ok := s.sessions.Load(sid); ok {
+			sess := val.(*httpSession)
+			if !sess.archived {
+				sess.archived = true
+				sess.addTimeline("archive", "bulk archived")
+				archived = append(archived, sid)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"archived": archived,
+		"count":    len(archived),
+	})
+}
+
+func (s *HTTPServer) handleBulkUnarchive(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Sessions []string `json:"sessions"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	var unarchived []string
+	for _, sid := range req.Sessions {
+		if val, ok := s.sessions.Load(sid); ok {
+			sess := val.(*httpSession)
+			if sess.archived {
+				sess.archived = false
+				sess.addTimeline("unarchive", "bulk unarchived")
+				unarchived = append(unarchived, sid)
+			}
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"unarchived": unarchived,
+		"count":      len(unarchived),
+	})
+}
+
+func (s *HTTPServer) handleAnnotateMessage(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+	var req struct {
+		Text   string `json:"text"`
+		Type   string `json:"type"`   // "note", "correction", "highlight", "question"
+		Author string `json:"author"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Text == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "text is required"})
+		return
+	}
+	validTypes := map[string]bool{"note": true, "correction": true, "highlight": true, "question": true}
+	if req.Type == "" {
+		req.Type = "note"
+	}
+	if !validTypes[req.Type] {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "type must be note/correction/highlight/question"})
+		return
+	}
+
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	hist := sess.agent.GetHistory()
+	if idx < 0 || idx >= len(hist) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "index out of range"})
+		return
+	}
+	if sess.msgAnnotations == nil {
+		sess.msgAnnotations = make(map[int][]messageAnnotation)
+	}
+	anno := messageAnnotation{
+		Author:    req.Author,
+		Text:      req.Text,
+		Type:      req.Type,
+		CreatedAt: time.Now().Format(time.RFC3339),
+	}
+	sess.msgAnnotations[idx] = append(sess.msgAnnotations[idx], anno)
+	sess.addTimeline("annotate", fmt.Sprintf("%s annotation on message %d", req.Type, idx))
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":    sid,
+		"index":      idx,
+		"annotation": anno,
+		"total":      len(sess.msgAnnotations[idx]),
+	})
+}
+
+func (s *HTTPServer) handleGetMessageAnnotations(w http.ResponseWriter, r *http.Request) {
+	sid := r.PathValue("session")
+	idx, err := strconv.Atoi(r.PathValue("index"))
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid index"})
+		return
+	}
+	val, ok := s.sessions.Load(sid)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "session not found"})
+		return
+	}
+	sess := val.(*httpSession)
+	annos := sess.msgAnnotations[idx]
+	if annos == nil {
+		annos = []messageAnnotation{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":     sid,
+		"index":       idx,
+		"annotations": annos,
+	})
+}
+
+func (s *HTTPServer) handleListSessionTemplates(w http.ResponseWriter, r *http.Request) {
+	var templates []sessionTemplate
+	s.sessionTemplates.Range(func(key, val any) bool {
+		templates = append(templates, *val.(*sessionTemplate))
+		return true
+	})
+	if templates == nil {
+		templates = []sessionTemplate{}
+	}
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"templates": templates,
+		"count":     len(templates),
+	})
+}
+
+func (s *HTTPServer) handleCreateSessionTemplate(w http.ResponseWriter, r *http.Request) {
+	var tmpl sessionTemplate
+	if err := json.NewDecoder(r.Body).Decode(&tmpl); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if tmpl.Name == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name is required"})
+		return
+	}
+	tmpl.CreatedAt = time.Now().Format(time.RFC3339)
+	s.sessionTemplates.Store(tmpl.Name, &tmpl)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"template": tmpl,
+	})
+}
+
+func (s *HTTPServer) handleDeleteSessionTemplate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	if _, ok := s.sessionTemplates.Load(name); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "template not found"})
+		return
+	}
+	s.sessionTemplates.Delete(name)
+	writeJSON(w, http.StatusOK, map[string]string{"deleted": name})
+}
+
+func (s *HTTPServer) handleApplySessionTemplate(w http.ResponseWriter, r *http.Request) {
+	name := r.PathValue("name")
+	val, ok := s.sessionTemplates.Load(name)
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "template not found"})
+		return
+	}
+	tmpl := val.(*sessionTemplate)
+
+	var req struct {
+		Session string `json:"session"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Session == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session is required"})
+		return
+	}
+
+	// 创建或获取会话
+	s.getOrCreateSession(req.Session)
+	sessVal, _ := s.sessions.Load(req.Session)
+	sess := sessVal.(*httpSession)
+
+	// 应用模板
+	if tmpl.SystemPrompt != "" {
+		sess.systemPromptOverride = tmpl.SystemPrompt
+	}
+	if tmpl.Category != "" {
+		sess.category = tmpl.Category
+	}
+	if tmpl.Priority > 0 {
+		sess.priority = tmpl.Priority
+	}
+	if tmpl.MessageQuota > 0 {
+		sess.messageQuota = tmpl.MessageQuota
+	}
+	if len(tmpl.Tags) > 0 {
+		if sess.tags == nil {
+			sess.tags = make(map[string]bool)
+		}
+		for _, t := range tmpl.Tags {
+			sess.tags[t] = true
+		}
+	}
+	if len(tmpl.Metadata) > 0 {
+		if sess.metadata == nil {
+			sess.metadata = make(map[string]string)
+		}
+		for k, v := range tmpl.Metadata {
+			sess.metadata[k] = v
+		}
+	}
+	sess.addTimeline("template", fmt.Sprintf("applied template '%s'", name))
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session":  req.Session,
+		"template": name,
+		"applied":  true,
+	})
+}
+
+func (s *HTTPServer) handleDetectDuplicates(w http.ResponseWriter, r *http.Request) {
+	// 检测消息内容相似的会话
+	threshold, _ := strconv.ParseFloat(r.URL.Query().Get("threshold"), 64)
+	if threshold <= 0 || threshold > 1 {
+		threshold = 0.8 // 默认 80% 相似度
+	}
+
+	type sessionSummary struct {
+		ID       string `json:"id"`
+		Title    string `json:"title"`
+		MsgCount int    `json:"message_count"`
+		FirstMsg string `json:"first_message"`
+	}
+
+	var summaries []sessionSummary
+	s.sessions.Range(func(key, val any) bool {
+		sid := key.(string)
+		sess := val.(*httpSession)
+		hist := sess.agent.GetHistory()
+		firstMsg := ""
+		for _, m := range hist {
+			if m.Role == schema.User {
+				firstMsg = m.Content
+				if len(firstMsg) > 100 {
+					firstMsg = firstMsg[:100]
+				}
+				break
+			}
+		}
+		summaries = append(summaries, sessionSummary{
+			ID:       sid,
+			Title:    sess.title,
+			MsgCount: len(hist),
+			FirstMsg: firstMsg,
+		})
+		return true
+	})
+
+	// 简单的基于首条消息相似度的重复检测
+	type dupPair struct {
+		Session1 string  `json:"session1"`
+		Session2 string  `json:"session2"`
+		Score    float64 `json:"similarity"`
+		Match    string  `json:"match_reason"`
+	}
+	var duplicates []dupPair
+	for i := 0; i < len(summaries); i++ {
+		for j := i + 1; j < len(summaries); j++ {
+			a, b := summaries[i], summaries[j]
+			// 标题完全相同
+			if a.Title != "" && a.Title == b.Title {
+				duplicates = append(duplicates, dupPair{a.ID, b.ID, 1.0, "identical title"})
+				continue
+			}
+			// 首条消息相同
+			if a.FirstMsg != "" && a.FirstMsg == b.FirstMsg {
+				duplicates = append(duplicates, dupPair{a.ID, b.ID, 0.95, "identical first message"})
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"duplicates": duplicates,
+		"count":      len(duplicates),
+		"sessions":   len(summaries),
+	})
+}
+
+func (s *HTTPServer) handleSessionDiff(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Session1 string `json:"session1"`
+		Session2 string `json:"session2"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	if req.Session1 == "" || req.Session2 == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "session1 and session2 are required"})
+		return
+	}
+
+	val1, ok1 := s.sessions.Load(req.Session1)
+	val2, ok2 := s.sessions.Load(req.Session2)
+	if !ok1 || !ok2 {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "one or both sessions not found"})
+		return
+	}
+
+	hist1 := val1.(*httpSession).agent.GetHistory()
+	hist2 := val2.(*httpSession).agent.GetHistory()
+
+	type msgDiff struct {
+		Index   int    `json:"index"`
+		Side    string `json:"side"` // "left_only", "right_only", "both", "different"
+		Role1   string `json:"role1,omitempty"`
+		Role2   string `json:"role2,omitempty"`
+		Text1   string `json:"text1,omitempty"`
+		Text2   string `json:"text2,omitempty"`
+	}
+
+	maxLen := len(hist1)
+	if len(hist2) > maxLen {
+		maxLen = len(hist2)
+	}
+
+	var diffs []msgDiff
+	commonCount := 0
+	for i := 0; i < maxLen; i++ {
+		if i >= len(hist1) {
+			content2 := ""
+			if hist2[i].Content != "" {
+				content2 = hist2[i].Content
+			}
+			diffs = append(diffs, msgDiff{
+				Index: i,
+				Side:  "right_only",
+				Role2: string(hist2[i].Role),
+				Text2: truncateStr(content2, 200),
+			})
+		} else if i >= len(hist2) {
+			content1 := ""
+			if hist1[i].Content != "" {
+				content1 = hist1[i].Content
+			}
+			diffs = append(diffs, msgDiff{
+				Index: i,
+				Side:  "left_only",
+				Role1: string(hist1[i].Role),
+				Text1: truncateStr(content1, 200),
+			})
+		} else {
+			c1 := hist1[i].Content
+			c2 := hist2[i].Content
+			if c1 == c2 && hist1[i].Role == hist2[i].Role {
+				commonCount++
+			} else {
+				diffs = append(diffs, msgDiff{
+					Index: i,
+					Side:  "different",
+					Role1: string(hist1[i].Role),
+					Role2: string(hist2[i].Role),
+					Text1: truncateStr(c1, 200),
+					Text2: truncateStr(c2, 200),
+				})
+			}
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"session1":     req.Session1,
+		"session2":     req.Session2,
+		"messages1":    len(hist1),
+		"messages2":    len(hist2),
+		"common":       commonCount,
+		"differences":  diffs,
+		"diff_count":   len(diffs),
+	})
+}
+
+func truncateStr(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
 }

@@ -16,7 +16,7 @@
   QQ Bot   ──→ │  │+Retry │  │+Plugin  │  │+RAG      │   │
   飞书Bot  ──→ │  │+Route │  │+Stats   │  │+Persist  │   │
   (扩展)   ──→ │  └───────┘  └─────────┘  └──────────┘   │
-               │  121 API Endpoints · Audit · Webhooks    │
+               │  134 API Endpoints · Audit · Webhooks    │
                └──────────────────────────────────────────┘
 ```
 
@@ -28,7 +28,7 @@
 | **内存** | ~20-30MB | 150MB+ |
 | **启动** | <100ms | 数秒 |
 | **交叉编译** | 一行命令 → Linux/macOS/Windows/ARM | 需要目标环境 |
-| **代码量** | ~19,000 行 Go（含 383 个测试） | — |
+| **代码量** | ~20,000 行 Go（含 396 个测试） | — |
 
 ## 核心特性
 
@@ -123,6 +123,13 @@
 - 对话树视图（树状结构 + 分支信息）
 - 批量消息固定/取消固定
 - 批量消息投票
+- **会话优先级管理**（0=普通/1=低/2=高/3=紧急）
+- **CSV 格式导出**（标准 CSV 下载）
+- **批量归档/取消归档**（一次操作多个会话）
+- **消息注释系统**（note/correction/highlight/question 四种类型）
+- **会话模板**（CRUD + 应用模板到会话，含 system_prompt/tags/priority/quota）
+- **重复会话检测**（基于标题和首条消息的相似度匹配）
+- **会话内容差异对比**（逐条消息对比，报告差异/缺失/相同）
 
 ## 项目结构
 
@@ -331,6 +338,16 @@ docker compose up -d
 | `/v1/analytics` | GET | 运行时分析仪表盘（会话/工具/审计汇总） |
 | `/v1/admin/gc` | POST | 手动清理空闲会话 |
 | `/v1/ws` | GET | WebSocket 实时聊天 |
+| `/v1/sessions/:session/priority` | GET/PUT | 会话优先级管理（0-3 四级） |
+| `/v1/sessions/:session/export/csv` | GET | CSV 格式导出 |
+| `/v1/sessions/bulk/archive` | POST | 批量归档会话 |
+| `/v1/sessions/bulk/unarchive` | POST | 批量取消归档 |
+| `/v1/sessions/:session/messages/:index/annotations` | GET/POST | 消息注释（四种类型） |
+| `/v1/session-templates` | GET/POST | 会话模板管理 |
+| `/v1/session-templates/:name` | GET/PUT/DELETE | 会话模板 CRUD |
+| `/v1/sessions/:session/apply-template` | POST | 应用模板到会话 |
+| `/v1/sessions/detect-duplicates` | GET | 重复会话检测 |
+| `/v1/sessions/diff` | POST | 会话内容差异对比 |
 
 ### OpenAI 兼容 API
 
