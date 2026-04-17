@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "E:/tools_test"],
+      "env": {}
+    },
+    "eino-rag": {
+      "endpoint": "http://localhost:19094/sse",
+      "transport": "sse",
+      "api_key": "",
+      "tool_names": []
+    }
+  }
+}

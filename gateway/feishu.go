@@ -2,8 +2,10 @@ package gateway
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -216,8 +218,15 @@ func (f *FeishuBot) handleMessage(ctx context.Context, event *larkim.P2MessageRe
 
 	// 提取消息内容
 	content := f.extractTextContent(msg)
-	if content == "" {
+	imageKeys := f.extractImageKeys(msg)
+
+	// 没有文本也没有图片则忽略
+	if content == "" && len(imageKeys) == 0 {
 		return nil
+	}
+	// 纯图片消息补充默认 prompt
+	if content == "" && len(imageKeys) > 0 {
+		content = "请描述这张图片"
 	}
 
 	// 获取用户 ID
@@ -244,8 +253,11 @@ func (f *FeishuBot) handleMessage(ctx context.Context, event *larkim.P2MessageRe
 	// 群聊中需要 @机器人 才回复（提取 @bot 后的文本）
 	if isGroup {
 		content = f.extractMentionContent(content)
-		if content == "" {
+		if content == "" && len(imageKeys) == 0 {
 			return nil
+		}
+		if content == "" {
+			content = "请描述这张图片"
 		}
 	}
 
@@ -259,21 +271,32 @@ func (f *FeishuBot) handleMessage(ctx context.Context, event *larkim.P2MessageRe
 	sessionKey := f.sessionKey(openID, msg)
 
 	// 异步处理消息
-	go f.processMessage(context.Background(), sessionKey, openID, content, msgID, isGroup)
+	go f.processMessage(context.Background(), sessionKey, openID, content, msgID, isGroup, imageKeys)
 
 	return nil
 }
 
 // processMessage 异步处理消息并回复
-func (f *FeishuBot) processMessage(ctx context.Context, sessionKey, openID, content, msgID string, isGroup bool) {
+func (f *FeishuBot) processMessage(ctx context.Context, sessionKey, openID, content, msgID string, isGroup bool, imageKeys []string) {
 	sess := f.getOrCreateSession(sessionKey, isGroup)
 	sess.lastUsed = time.Now()
 
 	// 注入推送器，支持工具异步回复用户
 	pushCtx := tools.WithPusher(ctx, &feishuPusher{bot: f, openID: openID})
 
-	// 调用 Agent
-	resp, err := sess.agent.Run(pushCtx, content)
+	// 调用 Agent（有图片时使用多模态接口）
+	var resp string
+	var err error
+	if len(imageKeys) > 0 {
+		images := f.downloadFeishuImages(ctx, msgID, imageKeys)
+		if len(images) > 0 {
+			resp, err = sess.agent.RunWithImages(pushCtx, content, images)
+		} else {
+			resp, err = sess.agent.Run(pushCtx, content)
+		}
+	} else {
+		resp, err = sess.agent.Run(pushCtx, content)
+	}
 	if err != nil {
 		log.Printf("[Feishu] Agent 错误 [%s]: %v", sessionKey, err)
 		f.replyText(ctx, msgID, fmt.Sprintf("出错了：%v", err))
@@ -343,7 +366,59 @@ func (f *FeishuBot) extractTextContent(msg *larkim.EventMessage) string {
 	return ""
 }
 
-// extractPostText 从富文本消息中提取纯文本
+// extractImageKeys 从飞书消息中提取图片 key 列表
+func (f *FeishuBot) extractImageKeys(msg *larkim.EventMessage) []string {
+	if msg.Content == nil || msg.MessageType == nil {
+		return nil
+	}
+	if *msg.MessageType != "image" {
+		return nil
+	}
+	var imgMsg struct {
+		ImageKey string `json:"image_key"`
+	}
+	if err := json.Unmarshal([]byte(*msg.Content), &imgMsg); err == nil && imgMsg.ImageKey != "" {
+		return []string{imgMsg.ImageKey}
+	}
+	return nil
+}
+
+// downloadFeishuImages 批量下载飞书图片，返回 agent.ImageInput 列表
+func (f *FeishuBot) downloadFeishuImages(ctx context.Context, msgID string, imageKeys []string) []agent.ImageInput {
+	var images []agent.ImageInput
+	for _, key := range imageKeys {
+		b64, mimeType, err := f.downloadFeishuImage(ctx, msgID, key)
+		if err != nil {
+			log.Printf("[Feishu] 下载图片失败 key=%s: %v", key, err)
+			continue
+		}
+		images = append(images, agent.ImageInput{Base64Data: b64, MIMEType: mimeType})
+	}
+	return images
+}
+
+// downloadFeishuImage 下载单张飞书图片并返回 base64 编码和 MIME 类型
+func (f *FeishuBot) downloadFeishuImage(ctx context.Context, msgID, imageKey string) (string, string, error) {
+	req := larkim.NewGetMessageResourceReqBuilder().
+		MessageId(msgID).
+		FileKey(imageKey).
+		Type("image").
+		Build()
+	resp, err := f.client.Im.MessageResource.Get(ctx, req)
+	if err != nil {
+		return "", "", fmt.Errorf("feishu image API: %w", err)
+	}
+	if !resp.Success() {
+		return "", "", fmt.Errorf("feishu image error: code=%d msg=%s", resp.Code, resp.Msg)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.File, 5<<20)) // max 5MB
+	if err != nil {
+		return "", "", fmt.Errorf("read image data: %w", err)
+	}
+	return base64.StdEncoding.EncodeToString(data), "image/jpeg", nil
+}
+
+
 func (f *FeishuBot) extractPostText(content string) string {
 	var post struct {
 		ZhCN *struct {

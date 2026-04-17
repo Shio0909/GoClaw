@@ -1,0 +1,15 @@
+{
+  "id": "test-tools",
+  "history": [
+    {
+      "role": "user",
+      "content": "请读取当前目录下的README.md文件的前5行"
+    },
+    {
+      "role": "assistant",
+      "content": "README.md 前5行：\n\n```markdown\n# GoClaw\n\n**轻量级 Go AI Agent Runtime** — 单二进制、\u003c30MB 内存、即插即用的 AI Agent 引擎。\n\n[![CI](https://github.com/Shio0909/GoClaw/actions/workflows/ci.yml/badge.svg)](https://github.com/Shio0909/GoClaw/actions/workflows/ci.yml)\n```"
+    }
+  ],
+  "saved_at": "2026-04-15T10:50:36.1416408+08:00",
+  "last_used": "2026-04-15T10:48:24.0272608+08:00"
+}
