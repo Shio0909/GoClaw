@@ -22,12 +22,10 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/goclaw/goclaw/agent"
-	"github.com/goclaw/goclaw/audit"
 	"github.com/goclaw/goclaw/config"
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/rag"
 	"github.com/goclaw/goclaw/tools"
-	"github.com/goclaw/goclaw/webhook"
 )
 
 var requestCounter atomic.Int64
@@ -55,8 +53,6 @@ type HTTPServer struct {
 	activeConns    atomic.Int64  // 当前活跃请求数
 	shutdownCh     chan struct{} // 触发优雅关闭
 	configPath     string        // 配置文件路径（用于热重载）
-	auditLog       *audit.Log   // 审计日志
-	webhookMgr     *webhook.Manager // Webhook 管理器
 	disabledTools  sync.Map         // toolName -> bool，运行时禁用的工具
 	endpointStats  sync.Map         // endpoint -> *endpointStat，端点延迟统计
 	pluginMgr      *tools.PluginManager // 插件管理器（可选）
@@ -151,8 +147,6 @@ type HTTPServerConfig struct {
 	RateLimit      int      // 每分钟请求限制（0 = 不限制）
 	FallbackCfg    *agent.FallbackConfig // 模型回退配置（可选）
 	ConfigPath     string                // 配置文件路径（用于热重载）
-	AuditLog       *audit.Log            // 审计日志（可选）
-	WebhookMgr     *webhook.Manager      // Webhook 管理器（可选）
 	PluginDir      string                // 插件目录（可选）
 }
 
@@ -200,8 +194,6 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		sessionStore:   store,
 		shutdownCh:     make(chan struct{}),
 		configPath:     cfg.ConfigPath,
-		auditLog:       cfg.AuditLog,
-		webhookMgr:     cfg.WebhookMgr,
 	}
 
 	// 从磁盘恢复会话
@@ -290,10 +282,6 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("GET /v1/openapi.json", s.handleOpenAPISpec)
 	mux.HandleFunc("POST /v1/config/reload", s.handleConfigReload)
 	mux.HandleFunc("GET /v1/sessions/search", s.handleSessionSearch)
-	mux.HandleFunc("GET /v1/audit", s.handleAuditQuery)
-	mux.HandleFunc("GET /v1/webhooks", s.handleListWebhooks)
-	mux.HandleFunc("POST /v1/webhooks", s.handleAddWebhook)
-	mux.HandleFunc("DELETE /v1/webhooks", s.handleRemoveWebhook)
 	mux.HandleFunc("PUT /v1/sessions/{session}/tags", s.handleSetTags)
 	mux.HandleFunc("GET /v1/sessions/{session}/tags", s.handleGetTags)
 	mux.HandleFunc("POST /v1/batch/chat", s.handleBatchChat)
@@ -627,10 +615,6 @@ func (s *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {
 
 	s.chatCount.Add(1)
 
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventChatStart, req.Session, "", clientIP(r), nil)
-	}
-
 	if req.Stream {
 		s.handleStreamChat(w, r, ag, req)
 		return
@@ -639,14 +623,8 @@ func (s *HTTPServer) handleChat(w http.ResponseWriter, r *http.Request) {
 	// 非流式
 	resp, err := ag.Run(r.Context(), req.Message)
 	if err != nil {
-		if s.auditLog != nil {
-			s.auditLog.Emit(audit.EventError, req.Session, err.Error(), clientIP(r), nil)
-		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
-	}
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventChatEnd, req.Session, "", clientIP(r), nil)
 	}
 	writeJSON(w, http.StatusOK, chatResponse{Session: req.Session, Content: resp})
 }
@@ -732,9 +710,6 @@ func (s *HTTPServer) handleDeleteSession(w http.ResponseWriter, r *http.Request)
 	s.sessions.Delete(sessionID)
 	if s.sessionStore != nil {
 		_ = s.sessionStore.Delete(sessionID)
-	}
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventSessionDelete, sessionID, "", clientIP(r), nil)
 	}
 	s.emitEvent("session.deleted", sessionID, nil)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "session deleted"})
@@ -944,10 +919,6 @@ func (s *HTTPServer) handleForkSession(w http.ResponseWriter, r *http.Request) {
 	copy(copied, history)
 	newAgent.SetHistory(copied)
 
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventSessionFork, sourceID, req.NewSession, clientIP(r), nil)
-	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"source":        sourceID,
 		"new_session":   req.NewSession,
@@ -985,8 +956,6 @@ func (s *HTTPServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 		"rate_limit":  s.rateLimiter != nil,
 		"rag":         s.ragMgr != nil,
 		"persistence": s.sessionStore != nil,
-		"audit_log":   s.auditLog != nil,
-		"webhooks":    s.webhookMgr != nil,
 	}
 	if s.fallbackCfg != nil && s.fallbackCfg.Model != "" {
 		features["fallback"] = true
@@ -1046,11 +1015,6 @@ func (s *HTTPServer) handleConfigReload(w http.ResponseWriter, r *http.Request) 
 	if newCfg.Agent.SystemPrompt != s.agentCfg.SystemPrompt {
 		changes["system_prompt"] = "updated"
 		s.agentCfg.SystemPrompt = newCfg.Agent.SystemPrompt
-	}
-
-	// 审计日志
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventConfigReload, "", fmt.Sprintf("%d changes", len(changes)), clientIP(r), nil)
 	}
 
 	log.Printf("[HTTP] 配置热重载: %d 项变更", len(changes))
@@ -1150,104 +1114,6 @@ func (s *HTTPServer) handleSessionSearch(w http.ResponseWriter, r *http.Request)
 		"count":   len(results),
 		"results": results,
 	})
-}
-
-// handleAuditQuery GET /v1/audit?type=chat_end&limit=50&since_id=0
-func (s *HTTPServer) handleAuditQuery(w http.ResponseWriter, r *http.Request) {
-	if s.auditLog == nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"enabled": false,
-			"events":  []interface{}{},
-		})
-		return
-	}
-
-	typ := audit.EventType(r.URL.Query().Get("type"))
-	limit := 50
-	if l := r.URL.Query().Get("limit"); l != "" {
-		if v, err := strconv.Atoi(l); err == nil && v > 0 {
-			limit = v
-		}
-	}
-	var sinceID int64
-	if s := r.URL.Query().Get("since_id"); s != "" {
-		if v, err := strconv.ParseInt(s, 10, 64); err == nil {
-			sinceID = v
-		}
-	}
-
-	events := s.auditLog.Query(typ, limit, sinceID)
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"enabled": true,
-		"total":   s.auditLog.Count(),
-		"count":   len(events),
-		"events":  events,
-	})
-}
-
-// handleListWebhooks GET /v1/webhooks — 列出所有 webhook 及发送统计
-func (s *HTTPServer) handleListWebhooks(w http.ResponseWriter, r *http.Request) {
-	if s.webhookMgr == nil {
-		writeJSON(w, http.StatusOK, map[string]interface{}{
-			"enabled": false,
-			"hooks":   []interface{}{},
-		})
-		return
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"enabled": true,
-		"hooks":   s.webhookMgr.ListHooks(),
-		"stats":   s.webhookMgr.Stats(),
-	})
-}
-
-// handleAddWebhook POST /v1/webhooks — 动态添加 webhook
-func (s *HTTPServer) handleAddWebhook(w http.ResponseWriter, r *http.Request) {
-	if s.webhookMgr == nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "webhooks not enabled"})
-		return
-	}
-
-	var hook webhook.Hook
-	if err := json.NewDecoder(r.Body).Decode(&hook); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json: " + err.Error()})
-		return
-	}
-	if hook.URL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url is required"})
-		return
-	}
-
-	s.webhookMgr.AddHook(hook)
-
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventConfigReload, "", "webhook added: "+hook.URL, clientIP(r), nil)
-	}
-
-	writeJSON(w, http.StatusCreated, map[string]string{"message": "webhook added", "url": hook.URL})
-}
-
-// handleRemoveWebhook DELETE /v1/webhooks — 按 URL 移除 webhook
-func (s *HTTPServer) handleRemoveWebhook(w http.ResponseWriter, r *http.Request) {
-	if s.webhookMgr == nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "webhooks not enabled"})
-		return
-	}
-
-	var req struct {
-		URL string `json:"url"`
-	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.URL == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url is required"})
-		return
-	}
-
-	if s.webhookMgr.RemoveHook(req.URL) {
-		writeJSON(w, http.StatusOK, map[string]string{"message": "webhook removed", "url": req.URL})
-	} else {
-		writeJSON(w, http.StatusNotFound, map[string]string{"error": "webhook not found"})
-	}
 }
 
 func (s *HTTPServer) handleExportSession(w http.ResponseWriter, r *http.Request) {
@@ -1935,10 +1801,6 @@ func (s *HTTPServer) handleAdminGC(w http.ResponseWriter, r *http.Request) {
 		return true
 	})
 
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventAdminGC, "", fmt.Sprintf("gc: cleaned %d sessions (threshold=%v)", len(cleaned), threshold), clientIP(r), nil)
-	}
-
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"cleaned":          len(cleaned),
 		"cleaned_sessions": cleaned,
@@ -1999,10 +1861,6 @@ func (s *HTTPServer) handleAnalytics(w http.ResponseWriter, r *http.Request) {
 
 	if len(tagCounts) > 0 {
 		resp["tag_distribution"] = tagCounts
-	}
-
-	if s.auditLog != nil {
-		resp["audit"] = s.auditLog.Counts()
 	}
 
 	writeJSON(w, http.StatusOK, resp)
@@ -2087,9 +1945,6 @@ func (s *HTTPServer) handleDisableTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.disabledTools.Store(name, true)
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventConfigReload, "", "tool disabled: "+name, clientIP(r), nil)
-	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "tool disabled", "tool": name})
 }
 
@@ -2101,9 +1956,6 @@ func (s *HTTPServer) handleEnableTool(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.disabledTools.Delete(name)
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventConfigReload, "", "tool enabled: "+name, clientIP(r), nil)
-	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "tool enabled", "tool": name})
 }
 
@@ -2157,9 +2009,6 @@ func (s *HTTPServer) handleReloadPlugins(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	registered := s.pluginMgr.RegisterAll(s.registry)
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventConfigReload, "", fmt.Sprintf("plugins reloaded: %d loaded, %d registered", n, registered), clientIP(r), nil)
-	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"loaded": n, "registered": registered})
 }
 
@@ -2175,9 +2024,6 @@ func (s *HTTPServer) handleUnloadPlugin(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	s.registry.Unregister(name)
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventConfigReload, "", "plugin unloaded: "+name, clientIP(r), nil)
-	}
 	writeJSON(w, http.StatusOK, map[string]string{"message": "plugin unloaded", "name": name})
 }
 
@@ -2234,9 +2080,6 @@ func (s *HTTPServer) handleRenameSession(w http.ResponseWriter, r *http.Request)
 	// 持久化：删除旧快照
 	if s.sessionStore != nil {
 		_ = s.sessionStore.Delete(oldID)
-	}
-	if s.auditLog != nil {
-		s.auditLog.Emit(audit.EventConfigReload, oldID, "session renamed to: "+req.NewID, clientIP(r), nil)
 	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"old_id": oldID,

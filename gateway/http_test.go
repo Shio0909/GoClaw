@@ -15,10 +15,8 @@ import (
 	"github.com/gorilla/websocket"
 
 	"github.com/goclaw/goclaw/agent"
-	"github.com/goclaw/goclaw/audit"
 	"github.com/goclaw/goclaw/memory"
 	"github.com/goclaw/goclaw/tools"
-	"github.com/goclaw/goclaw/webhook"
 )
 
 func newTestHTTPServer(t *testing.T) *HTTPServer {
@@ -955,104 +953,6 @@ func TestSessionSearchWithLimit(t *testing.T) {
 	}
 }
 
-// ====== Audit Endpoint Tests ======
-
-func TestAuditEndpointDisabled(t *testing.T) {
-	srv := newTestHTTPServer(t) // auditLog is nil
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/audit", srv.handleAuditQuery)
-
-	req := httptest.NewRequest("GET", "/v1/audit", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["enabled"] != false {
-		t.Fatal("expected enabled=false when auditLog is nil")
-	}
-}
-
-func TestAuditEndpointWithEvents(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.auditLog = audit.NewLog(100)
-
-	srv.auditLog.Emit(audit.EventChatStart, "s1", "start", "127.0.0.1", nil)
-	srv.auditLog.Emit(audit.EventToolCall, "s1", "shell", "127.0.0.1", nil)
-	srv.auditLog.Emit(audit.EventChatEnd, "s1", "end", "127.0.0.1", nil)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/audit", srv.handleAuditQuery)
-
-	req := httptest.NewRequest("GET", "/v1/audit", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["enabled"] != true {
-		t.Fatal("expected enabled=true")
-	}
-	if int(resp["total"].(float64)) != 3 {
-		t.Fatalf("expected total=3, got %v", resp["total"])
-	}
-	events := resp["events"].([]interface{})
-	if len(events) != 3 {
-		t.Fatalf("expected 3 events, got %d", len(events))
-	}
-}
-
-func TestAuditEndpointFilterByType(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.auditLog = audit.NewLog(100)
-
-	srv.auditLog.Emit(audit.EventChatStart, "s1", "", "", nil)
-	srv.auditLog.Emit(audit.EventToolCall, "s1", "shell", "", nil)
-	srv.auditLog.Emit(audit.EventToolCall, "s1", "file_read", "", nil)
-	srv.auditLog.Emit(audit.EventChatEnd, "s1", "", "", nil)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/audit", srv.handleAuditQuery)
-
-	req := httptest.NewRequest("GET", "/v1/audit?type=tool_call", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	events := resp["events"].([]interface{})
-	if len(events) != 2 {
-		t.Fatalf("expected 2 tool_call events, got %d", len(events))
-	}
-}
-
-func TestAuditEndpointSinceID(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.auditLog = audit.NewLog(100)
-
-	srv.auditLog.Emit(audit.EventChatStart, "s1", "", "", nil)
-	srv.auditLog.Emit(audit.EventChatEnd, "s1", "", "", nil)
-	srv.auditLog.Emit(audit.EventError, "s1", "err", "", nil)
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/audit", srv.handleAuditQuery)
-
-	req := httptest.NewRequest("GET", "/v1/audit?since_id=1", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	events := resp["events"].([]interface{})
-	if len(events) != 2 {
-		t.Fatalf("expected 2 events after id=1, got %d", len(events))
-	}
-}
-
 func TestClientIP(t *testing.T) {
 	// Standard request
 	req := httptest.NewRequest("GET", "/", nil)
@@ -1067,137 +967,6 @@ func TestClientIP(t *testing.T) {
 	req2.Header.Set("X-Forwarded-For", "10.0.0.1, 10.0.0.2")
 	if ip := clientIP(req2); ip != "10.0.0.1" {
 		t.Fatalf("expected 10.0.0.1, got %s", ip)
-	}
-}
-
-// ====== Webhook Endpoint Tests ======
-
-func TestListWebhooksDisabled(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/webhooks", srv.handleListWebhooks)
-
-	req := httptest.NewRequest("GET", "/v1/webhooks", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["enabled"] != false {
-		t.Fatal("expected enabled=false")
-	}
-}
-
-func TestListWebhooksEnabled(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.webhookMgr = webhook.NewManager([]webhook.Hook{
-		{URL: "http://example.com/hook"},
-	})
-	defer srv.webhookMgr.Close()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/webhooks", srv.handleListWebhooks)
-
-	req := httptest.NewRequest("GET", "/v1/webhooks", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["enabled"] != true {
-		t.Fatal("expected enabled=true")
-	}
-	hooks := resp["hooks"].([]interface{})
-	if len(hooks) != 1 {
-		t.Fatalf("expected 1 hook, got %d", len(hooks))
-	}
-}
-
-func TestAddWebhook(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.webhookMgr = webhook.NewManager(nil)
-	defer srv.webhookMgr.Close()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/webhooks", srv.handleAddWebhook)
-
-	body := `{"url":"http://new-hook.com/callback","events":["chat.complete"]}`
-	req := httptest.NewRequest("POST", "/v1/webhooks", strings.NewReader(body))
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusCreated {
-		t.Fatalf("expected 201, got %d: %s", w.Code, w.Body.String())
-	}
-
-	hooks := srv.webhookMgr.ListHooks()
-	if len(hooks) != 1 {
-		t.Fatalf("expected 1 hook, got %d", len(hooks))
-	}
-}
-
-func TestAddWebhookNoURL(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.webhookMgr = webhook.NewManager(nil)
-	defer srv.webhookMgr.Close()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("POST /v1/webhooks", srv.handleAddWebhook)
-
-	body := `{"events":["chat.complete"]}`
-	req := httptest.NewRequest("POST", "/v1/webhooks", strings.NewReader(body))
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusBadRequest {
-		t.Fatalf("expected 400, got %d", w.Code)
-	}
-}
-
-func TestRemoveWebhook(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.webhookMgr = webhook.NewManager([]webhook.Hook{
-		{URL: "http://remove-me.com"},
-	})
-	defer srv.webhookMgr.Close()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("DELETE /v1/webhooks", srv.handleRemoveWebhook)
-
-	body := `{"url":"http://remove-me.com"}`
-	req := httptest.NewRequest("DELETE", "/v1/webhooks", strings.NewReader(body))
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Fatalf("expected 200, got %d", w.Code)
-	}
-
-	hooks := srv.webhookMgr.ListHooks()
-	if len(hooks) != 0 {
-		t.Fatalf("expected 0 hooks after removal, got %d", len(hooks))
-	}
-}
-
-func TestRemoveWebhookNotFound(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.webhookMgr = webhook.NewManager(nil)
-	defer srv.webhookMgr.Close()
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("DELETE /v1/webhooks", srv.handleRemoveWebhook)
-
-	body := `{"url":"http://nonexistent.com"}`
-	req := httptest.NewRequest("DELETE", "/v1/webhooks", strings.NewReader(body))
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	if w.Code != http.StatusNotFound {
-		t.Fatalf("expected 404, got %d", w.Code)
 	}
 }
 
@@ -1528,23 +1297,6 @@ func TestAnalyticsEndpoint(t *testing.T) {
 	server := resp["server"].(map[string]interface{})
 	if server["uptime_seconds"] == nil {
 		t.Fatal("expected uptime_seconds in server")
-	}
-}
-
-func TestAnalyticsWithAudit(t *testing.T) {
-	srv := newTestHTTPServer(t)
-	srv.auditLog = audit.NewLog(100)
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET /v1/analytics", srv.handleAnalytics)
-
-	req := httptest.NewRequest("GET", "/v1/analytics", nil)
-	w := httptest.NewRecorder()
-	mux.ServeHTTP(w, req)
-
-	var resp map[string]interface{}
-	json.Unmarshal(w.Body.Bytes(), &resp)
-	if resp["audit"] == nil {
-		t.Fatal("expected audit counts in analytics")
 	}
 }
 
