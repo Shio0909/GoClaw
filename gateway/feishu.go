@@ -269,8 +269,11 @@ func (f *FeishuBot) processMessage(ctx context.Context, sessionKey, openID, cont
 	sess := f.getOrCreateSession(sessionKey, isGroup)
 	sess.lastUsed = time.Now()
 
+	// 注入推送器，支持工具异步回复用户
+	pushCtx := tools.WithPusher(ctx, &feishuPusher{bot: f, openID: openID})
+
 	// 调用 Agent
-	resp, err := sess.agent.Run(ctx, content)
+	resp, err := sess.agent.Run(pushCtx, content)
 	if err != nil {
 		log.Printf("[Feishu] Agent 错误 [%s]: %v", sessionKey, err)
 		f.replyText(ctx, msgID, fmt.Sprintf("出错了：%v", err))
@@ -596,6 +599,21 @@ func (f *FeishuBot) sessionCleaner(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// -------- 主动推送 --------
+
+// feishuPusher implements tools.Pusher for the Feishu gateway.
+// It captures the originating user's openID so that async tools can deliver
+// messages back to the correct chat after the main agent call has finished.
+type feishuPusher struct {
+	bot    *FeishuBot
+	openID string
+}
+
+func (p *feishuPusher) Push(ctx context.Context, msg string) error {
+	p.bot.sendTextToChat(ctx, p.openID, msg)
+	return nil
 }
 
 // compile-time check

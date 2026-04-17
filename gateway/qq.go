@@ -631,6 +631,7 @@ func (b *QQBot) handleMessage(ctx context.Context, event *onebotEvent) {
 	start := time.Now()
 	var reply string
 	var err error
+	pushCtx := tools.WithPusher(ctx, &qqPusher{bot: b, event: event})
 	if len(images) > 0 {
 		downloaded := downloadImages(ctx, images)
 		if len(downloaded) > 0 {
@@ -638,13 +639,13 @@ func (b *QQBot) handleMessage(ctx context.Context, event *onebotEvent) {
 			for i, d := range downloaded {
 				agentImages[i] = agent.ImageInput{Base64Data: d.Base64Data, MIMEType: d.MIMEType}
 			}
-			reply, err = ag.RunWithImages(ctx, text, agentImages)
+			reply, err = ag.RunWithImages(pushCtx, text, agentImages)
 		} else {
 			// 所有图片下载失败，只处理文本
-			reply, err = ag.Run(ctx, text)
+			reply, err = ag.Run(pushCtx, text)
 		}
 	} else {
-		reply, err = ag.Run(ctx, text)
+		reply, err = ag.Run(pushCtx, text)
 	}
 	elapsed := time.Since(start)
 	if err != nil {
@@ -762,4 +763,29 @@ func contains(list []string, item string) bool {
 		}
 	}
 	return false
+}
+
+// -------- 主动推送 --------
+
+// qqPusher implements tools.Pusher for the QQ gateway.
+// It captures the originating event so that async tools can reply to the
+// correct user or group after the main agent call has finished.
+type qqPusher struct {
+	bot   *QQBot
+	event *onebotEvent
+}
+
+func (p *qqPusher) Push(ctx context.Context, msg string) error {
+	if p.event.MessageType == "group" {
+		p.bot.sendAction("send_group_msg", map[string]any{
+			"group_id": p.event.GroupID,
+			"message":  msg,
+		})
+	} else {
+		p.bot.sendAction("send_private_msg", map[string]any{
+			"user_id": p.event.UserID,
+			"message": msg,
+		})
+	}
+	return nil
 }

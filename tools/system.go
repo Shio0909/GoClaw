@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"runtime"
@@ -63,9 +64,19 @@ func cronTool() *ToolDef {
 				return "", fmt.Errorf("delay must be between 1 and 3600 seconds")
 			}
 
+			// Capture pusher before spawning goroutine (ctx may be cancelled later).
+			pusher, hasPusher := GetPusher(ctx)
+
 			go func() {
 				time.Sleep(time.Duration(delay) * time.Second)
-				fmt.Printf("\n⏰ 提醒: %s\n", message)
+				text := "⏰ 提醒: " + message
+				if hasPusher {
+					if err := pusher.Push(context.Background(), text); err != nil {
+						log.Printf("[reminder] push failed: %v", err)
+					}
+				} else {
+					fmt.Println(text)
+				}
 			}()
 
 			return fmt.Sprintf("已设置提醒：%s（%d秒后）", message, int(delay)), nil
