@@ -211,86 +211,9 @@ func (s *HTTPServer) Run(ctx context.Context) error {
 	mux.HandleFunc("POST /v1/config/reload", s.handleConfigReload)
 	mux.HandleFunc("POST /v1/tools/{name}/disable", s.handleDisableTool)
 	mux.HandleFunc("POST /v1/tools/{name}/enable", s.handleEnableTool)
-	// Plugin management
-	// Cron / scheduled tasks
-	// Session TTL
-	// Tool aliases
-	// Debug
-	// Environment info
-	// Session rename
 	mux.HandleFunc("POST /v1/sessions/{session}/rename", s.handleRenameSession)
-	// Tool dry-run
-	// Session lock/unlock
-	// Cost estimation
-	// Session stats
-	// Batch tool execution
-	// Tool analytics
-	// Prompt templates
-	// Session message search
-	// Session message trim
-	// System prompt override
 	mux.HandleFunc("PUT /v1/sessions/{session}/system-prompt", s.handleSetSystemPrompt)
 	mux.HandleFunc("GET /v1/sessions/{session}/system-prompt", s.handleGetSystemPrompt)
-	// Session comparison
-	// Conversation summary
-	// Session import
-	// Message injection
-	// Event SSE stream
-	// Session checkpoints
-	// Message edit / delete / undo
-	// Session clone
-	// Bulk session delete
-	// Tool pipeline
-	// Session persist (manual save)
-	// Fork at index
-	// Message reactions
-	// Session archive
-	// Session history pagination
-	// Token count
-	// Uptime
-	// Session metadata
-	// Message bookmark
-	// Session starring
-	// Message pinning
-	// Markdown export
-	// Batch export
-	// Conversation branching
-	// Global message search
-	// Session merge
-	// Auto-title
-	// Session timeline
-	// Message voting
-	// Session categories
-	// Message threading
-	// Session sharing
-	// Usage quotas
-	// HTML export
-	// Conversation tree view
-	// Batch message operations
-	// Session priority
-	// CSV export
-	// Bulk archive / unarchive
-	// Message annotations
-	// Session templates
-
-	// Duplicate detection
-	// Message diff
-	// Agent turn tracking
-	// Session comparison
-	// Message word frequency
-	// Session health score
-	// Bulk tag operations
-	// Message sentiment (simple)
-	// System tracing config
-	// Session export JSONL
-	// Message count by role
-	// Prompt preview
-	// ──── Batch 5: Tool analytics, system info, session rename, YAML export, etc. ────
-
-	// ──── Batch 6: Session Groups, Webhook API, Rate Limit Info, etc. ────
-	// ──── Batch 7: Analysis, Flow, Export, Auto-tag, etc. ────
-
-	// ──── Batch 8: ADK Checkpoint/Resume (Eino v0.8.4 adk integration) ────
 	// OpenAI-compatible endpoints
 	mux.HandleFunc("POST /v1/chat/completions", s.handleChatCompletions)
 	mux.HandleFunc("GET /v1/models", s.handleModels)

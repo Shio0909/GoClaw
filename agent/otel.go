@@ -96,32 +96,7 @@ func SpanAgentRun(ctx context.Context, userInput string) (context.Context, trace
 	return ctx, span
 }
 
-// SpanToolCall 创建工具调用的 span
-func SpanToolCall(ctx context.Context, toolName string) (context.Context, trace.Span) {
-	ctx, span := Tracer().Start(ctx, "tool.call."+toolName,
-		trace.WithAttributes(
-			attribute.String("tool.name", toolName),
-		),
-	)
-	return ctx, span
-}
-
-// SpanRAGQuery 创建 RAG 查询的 span
-func SpanRAGQuery(ctx context.Context, query string) (context.Context, trace.Span) {
-	ctx, span := Tracer().Start(ctx, "rag.query",
-		trace.WithAttributes(
-			attribute.String("rag.query", otelTruncate(query, 200)),
-		),
-	)
-	return ctx, span
-}
-
-// SpanMemoryBuild 创建记忆构建的 span
-func SpanMemoryBuild(ctx context.Context) (context.Context, trace.Span) {
-	return Tracer().Start(ctx, "memory.build_context")
-}
-
-// SetSpanError 标记 span 错误
+// SetSpanError标记 span 错误
 func SetSpanError(span trace.Span, err error) {
 	if err != nil {
 		span.SetAttributes(attribute.String("error.message", err.Error()))
