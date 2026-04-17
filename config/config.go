@@ -58,9 +58,10 @@ type AgentConfig struct {
 }
 
 type GatewayConfig struct {
-	QQ     *QQConfig     `yaml:"qq"`
-	HTTP   *HTTPConfig   `yaml:"http"`
-	Feishu *FeishuConfig `yaml:"feishu"`
+	QQ         *QQConfig         `yaml:"qq"`
+	QQOfficial *QQOfficialConfig `yaml:"qq_official"`
+	HTTP       *HTTPConfig       `yaml:"http"`
+	Feishu     *FeishuConfig     `yaml:"feishu"`
 }
 
 // HTTPConfig HTTP API 网关配置
@@ -74,12 +75,19 @@ type HTTPConfig struct {
 }
 
 type QQConfig struct {
-	Enabled     bool     `yaml:"enabled"`
-	WebSocket   string   `yaml:"websocket"`
-	SelfID      string   `yaml:"self_id"`
-	Admins      []string `yaml:"admins"`
-	StickersDir string   `yaml:"stickers_dir"`
+	Enabled     bool      `yaml:"enabled"`
+	WebSocket   string    `yaml:"websocket"`
+	SelfID      string    `yaml:"self_id"`
+	Admins      []string  `yaml:"admins"`
+	StickersDir string    `yaml:"stickers_dir"`
 	STT         STTConfig `yaml:"stt"`
+}
+
+// QQOfficialConfig 官方 QQ Bot API 配置（q.qq.com，不需要 NapCat）
+type QQOfficialConfig struct {
+	Enabled   bool   `yaml:"enabled"`
+	AppID     string `yaml:"app_id"`
+	AppSecret string `yaml:"app_secret"`
 }
 
 // FeishuConfig 飞书机器人网关配置

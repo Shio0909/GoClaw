@@ -63,6 +63,11 @@ gateways:
     verification_token: ${FEISHU_VERIFY_TOKEN}
     # encrypt_key: ${FEISHU_ENCRYPT_KEY}  # 可选，推荐启用
     webhook_port: ":9090"                  # Webhook 回调监听端口
+  # qq_official: 官方 QQ Bot API（q.qq.com），无需 NapCat/OneBot 中间件
+  # qq_official:
+  #   enabled: false
+  #   app_id: ${QQ_APP_ID}
+  #   app_secret: ${QQ_APP_SECRET}
 
 tools:
   # sandbox: /path/to/sandbox    # 文件写入沙箱（可选）

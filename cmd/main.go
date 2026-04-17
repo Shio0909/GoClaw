@@ -334,6 +334,20 @@ func runServe(cfg *config.Config, inf *infra) {
 		gateways = append(gateways, feishuBot)
 	}
 
+	// QQOfficial Gateway（官方 API，无需 NapCat）
+	if cfg.Gateway.QQOfficial != nil && cfg.Gateway.QQOfficial.Enabled {
+		qqOfficialBot := gateway.NewQQOfficialBot(gateway.QQOfficialBotConfig{
+			AppID:         cfg.Gateway.QQOfficial.AppID,
+			AppSecret:     cfg.Gateway.QQOfficial.AppSecret,
+			AgentCfg:      inf.agentCfg,
+			Registry:      inf.registry,
+			MemStore:      inf.memStore,
+			ContextLength: cfg.Agent.ContextLength,
+			RetryConfig:   inf.retryCfg,
+		})
+		gateways = append(gateways, qqOfficialBot)
+	}
+
 	if len(gateways) == 0 {
 		log.Fatal("serve 模式需要至少一个 gateway 或 HTTP API 监听地址")
 	}
