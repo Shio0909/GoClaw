@@ -7,6 +7,7 @@ import (
 	"log"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
@@ -50,6 +51,7 @@ type Config struct {
 	MaxTokens       int      // 最大输出 token（0 = 使用默认值）
 	ReasoningEffort string   // 推理力度: low, medium, high（仅推理模型）
 	SystemPrompt    string   // 用户自定义 system prompt（追加到默认 prompt 后）
+	LLMTimeout      int      // LLM 单次请求超时秒数（0 = 无限制，建议 120）
 }
 
 // Agent 核心 Agent，基于 Eino react agent
@@ -115,6 +117,10 @@ func (a *Agent) SetRouter(r *ModelRouter) {
 
 // createModel 根据 provider 配置创建 Eino 模型
 func (a *Agent) createModel(ctx context.Context) (model.ToolCallingChatModel, error) {
+	httpClient := &http.Client{Transport: &loggingTransport{base: http.DefaultTransport}}
+	if a.cfg.LLMTimeout > 0 {
+		httpClient.Timeout = time.Duration(a.cfg.LLMTimeout) * time.Second
+	}
 	switch a.cfg.Provider {
 	case "claude":
 		baseURL := a.cfg.BaseURL
@@ -131,7 +137,7 @@ func (a *Agent) createModel(ctx context.Context) (model.ToolCallingChatModel, er
 			APIKey:     a.cfg.APIKey,
 			Model:      a.cfg.Model,
 			MaxTokens:  maxTokens,
-			HTTPClient: &http.Client{Transport: &loggingTransport{base: http.DefaultTransport}},
+			HTTPClient: httpClient,
 		})
 	default: // openai 兼容
 		cfg := &openaimodel.ChatModelConfig{
@@ -139,7 +145,7 @@ func (a *Agent) createModel(ctx context.Context) (model.ToolCallingChatModel, er
 			BaseURL:     a.cfg.BaseURL,
 			Model:       a.cfg.Model,
 			Temperature: a.cfg.Temperature,
-			HTTPClient:  &http.Client{Transport: &loggingTransport{base: http.DefaultTransport}},
+			HTTPClient:  httpClient,
 		}
 		if a.cfg.MaxTokens > 0 {
 			cfg.MaxCompletionTokens = &a.cfg.MaxTokens

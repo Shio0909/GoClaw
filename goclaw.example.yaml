@@ -15,6 +15,7 @@ agent:
   context_length: 128000
   max_step: 25               # Agent 最大工具调用步数（默认 25）
   tool_max_bytes: 30720      # 工具结果最大字节数（默认 30KB）
+  llm_timeout: 120           # LLM 单次请求超时秒数（0=无限制，建议 120）
   # system_prompt: |          # 自定义 system prompt（追加到默认 prompt 后）
   #   你是一个专业的 Python 开发助手。
   #   请用中文回答所有问题。

@@ -55,6 +55,7 @@ type AgentConfig struct {
 	MaxTokens     int      `yaml:"max_tokens"`      // 最大输出 token 数（0 = 使用模型默认值）
 	ReasoningEffort string `yaml:"reasoning_effort"` // 推理力度: low, medium, high（仅 o1/o3 等推理模型）
 	ToolTimeout     int    `yaml:"tool_timeout"`     // 工具执行默认超时秒数（0 = 无限制）
+	LLMTimeout      int    `yaml:"llm_timeout"`      // LLM 单次请求超时秒数（0 = 无限制，建议 120）
 }
 
 type GatewayConfig struct {

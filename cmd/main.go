@@ -194,6 +194,7 @@ func setupInfra(cfg *config.Config) *infra {
 		MaxTokens:       cfg.Agent.MaxTokens,
 		ReasoningEffort: cfg.Agent.ReasoningEffort,
 		SystemPrompt:    cfg.Agent.SystemPrompt,
+		LLMTimeout:      cfg.Agent.LLMTimeout,
 	}
 
 	// 应用工具结果截断大小
