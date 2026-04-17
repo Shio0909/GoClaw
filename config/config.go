@@ -34,6 +34,7 @@ type ServerConfig struct {
 }
 
 type AgentConfig struct {
+	Name          string   `yaml:"name"`            // Agent 名字（用于 system prompt，如 "小爪"）
 	Provider      string   `yaml:"provider"`
 	APIKey        string   `yaml:"api_key"`
 	BaseURL       string   `yaml:"base_url"`

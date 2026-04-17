@@ -161,8 +161,9 @@ func setupInfra(cfg *config.Config) *infra {
 		registry.SetDefaultTimeout(time.Duration(cfg.Agent.ToolTimeout) * time.Second)
 	}
 
-	// 设置技能目录
+	// 设置技能目录和 agent 名字
 	agent.SkillsDir = cfg.Tools.SkillsDir
+	agent.AgentName = cfg.Agent.Name
 
 	// 注册搜索工具
 	if cfg.Tools.TavilyKey != "" {

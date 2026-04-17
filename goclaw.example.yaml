@@ -7,6 +7,7 @@ server:
   # log_json: true  # JSON 格式日志（适合生产环境 + ELK）
 
 agent:
+  # name: 小爪                # Agent 名字（出现在 system prompt 里，留空则无名字）
   provider: minimax         # claude / openai / minimax / mimo / siliconflow
   api_key: ${MINIMAX_API_KEY}
   # base_url: https://api.minimax.chat/v1  # 自动根据 provider 设置
@@ -80,14 +81,6 @@ tools:
 #     args: ["-y", "@modelcontextprotocol/server-github"]
 #     env:
 #       GITHUB_PERSONAL_ACCESS_TOKEN: ${GITHUB_TOKEN}
-
-# RAG 检索增强配置（连接外部知识库）
-# rag:
-#   providers:
-#     - name: "My Knowledge Base"
-#       type: http
-#       base_url: http://localhost:8000/api/search
-#       api_key: ${RAG_API_KEY}
 
 # OpenTelemetry 分布式追踪
 # tracing:
