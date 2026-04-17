@@ -18,7 +18,6 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 
 	"github.com/goclaw/goclaw/memory"
-	"github.com/goclaw/goclaw/rag"
 	"github.com/goclaw/goclaw/tools"
 )
 
@@ -58,7 +57,6 @@ type Agent struct {
 	cfg               Config
 	registry          *tools.Registry
 	memMgr            *memory.Manager
-	ragMgr            *rag.Manager   // RAG 检索增强（可选）
 	history           []*schema.Message
 	extraSystemPrompt string       // 额外的 system prompt（如 QQ 聊天模式指令）
 	compressor        *Compressor  // 上下文压缩器（可选）
@@ -113,11 +111,6 @@ func (a *Agent) SetRetryConfig(cfg *RetryConfig) {
 // SetRouter 设置智能模型路由器
 func (a *Agent) SetRouter(r *ModelRouter) {
 	a.router = r
-}
-
-// SetRAGManager 设置 RAG 检索增强管理器
-func (a *Agent) SetRAGManager(m *rag.Manager) {
-	a.ragMgr = m
 }
 
 // createModel 根据 provider 配置创建 Eino 模型
@@ -214,12 +207,6 @@ func (a *Agent) buildFullSystemPrompt(ctx context.Context, userInput string) (st
 	}
 	if a.cfg.SystemPrompt != "" {
 		systemPrompt += "\n\n=== 用户自定义指令 ===\n" + a.cfg.SystemPrompt
-	}
-	if a.ragMgr != nil && a.ragMgr.HasProviders() {
-		ragCtx := a.ragMgr.BuildContext(ctx, userInput)
-		if ragCtx != "" {
-			systemPrompt += "\n" + ragCtx
-		}
 	}
 	return systemPrompt, nil
 }

@@ -24,7 +24,6 @@ import (
 	"github.com/goclaw/goclaw/agent"
 	"github.com/goclaw/goclaw/config"
 	"github.com/goclaw/goclaw/memory"
-	"github.com/goclaw/goclaw/rag"
 	"github.com/goclaw/goclaw/tools"
 )
 
@@ -39,7 +38,6 @@ type HTTPServer struct {
 
 	sessions       sync.Map // sessionID -> *httpSession
 	retryConfig    *agent.RetryConfig
-	ragMgr         *rag.Manager
 	contextLength  int
 	apiToken       string   // 可选的 Bearer Token 认证
 	corsOrigins    []string // CORS 允许的域名
@@ -137,7 +135,6 @@ type HTTPServerConfig struct {
 	Registry       *tools.Registry
 	MemStore       *memory.Store
 	RetryConfig    *agent.RetryConfig
-	RAGManager     *rag.Manager
 	ContextLength  int
 	APIToken       string   // 可选，设置后需 Bearer Token 认证
 	CORSOrigins    []string // CORS 允许的域名，["*"] 为全部
@@ -185,7 +182,6 @@ func NewHTTPServer(cfg HTTPServerConfig) *HTTPServer {
 		registry:       cfg.Registry,
 		memStore:       cfg.MemStore,
 		retryConfig:    cfg.RetryConfig,
-		ragMgr:         cfg.RAGManager,
 		contextLength:  ctxLen,
 		apiToken:       cfg.APIToken,
 		corsOrigins:    cfg.CORSOrigins,
@@ -774,9 +770,6 @@ func (s *HTTPServer) handleHealth(w http.ResponseWriter, r *http.Request) {
 	if s.rateLimiter != nil {
 		resp["rate_limit_enabled"] = true
 	}
-	if s.ragMgr != nil {
-		resp["rag_enabled"] = true
-	}
 	writeJSON(w, http.StatusOK, resp)
 }
 
@@ -954,7 +947,6 @@ func (s *HTTPServer) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 
 	features := map[string]bool{
 		"rate_limit":  s.rateLimiter != nil,
-		"rag":         s.ragMgr != nil,
 		"persistence": s.sessionStore != nil,
 	}
 	if s.fallbackCfg != nil && s.fallbackCfg.Model != "" {
@@ -1546,9 +1538,6 @@ func (s *HTTPServer) getOrCreateSession(id string) *agent.Agent {
 	if s.retryConfig != nil {
 		ag.SetRetryConfig(s.retryConfig)
 	}
-	if s.ragMgr != nil {
-		ag.SetRAGManager(s.ragMgr)
-	}
 	if s.fallbackCfg != nil {
 		ag.SetFallbackConfig(s.fallbackCfg)
 	}
@@ -1914,10 +1903,7 @@ func (s *HTTPServer) handleDeepHealth(w http.ResponseWriter, r *http.Request) {
 		Error:  modelErr,
 	})
 
-	// 5. RAG
-	if s.ragMgr != nil {
-		checks = append(checks, checkResult{Name: "rag", Status: "ok"})
-	}
+	// 5. (RAG removed)
 
 	// 整体状态
 	overall := "ok"
@@ -3404,7 +3390,6 @@ func (s *HTTPServer) handleCapabilities(w http.ResponseWriter, r *http.Request) 
 		toolNames = s.registry.Names()
 	}
 
-	hasRAG := s.ragMgr != nil
 	hasFallback := false
 	if s.fallbackCfg != nil {
 		hasFallback = true
@@ -3419,13 +3404,9 @@ func (s *HTTPServer) handleCapabilities(w http.ResponseWriter, r *http.Request) 
 			"sse_events":          true,
 			"websocket":           true,
 			"openai_compatible":   true,
-			"rag":                 hasRAG,
 			"fallback":            hasFallback,
 			"turn_tracking":       true,
-			"otel_tracing":        true,
 			"session_persistence": true,
-			"audit_log":           true,
-			"webhooks":            true,
 			"rate_limiting":       s.rateLimiter != nil,
 			"templates":           true,
 			"checkpoints":         true,

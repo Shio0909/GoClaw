@@ -20,7 +20,6 @@ import (
 	"github.com/goclaw/goclaw/gateway"
 	"github.com/goclaw/goclaw/logger"
 	"github.com/goclaw/goclaw/memory"
-	"github.com/goclaw/goclaw/rag"
 	"github.com/goclaw/goclaw/tools"
 )
 
@@ -141,7 +140,6 @@ type infra struct {
 	memDir    string
 	retryCfg  *agent.RetryConfig
 	mcpBridge *tools.MCPBridge
-	ragMgr    *rag.Manager
 }
 
 func (inf *infra) cleanup() {
@@ -216,30 +214,6 @@ func setupInfra(cfg *config.Config) *infra {
 		retryCfg.Pool = pool
 	}
 
-	// RAG 检索增强
-	var ragMgr *rag.Manager
-	if len(cfg.RAG.Providers) > 0 {
-		ragMgr = rag.NewManager(rag.ManagerConfig{})
-		for _, p := range cfg.RAG.Providers {
-			switch p.Type {
-			case "http":
-				hp, err := rag.NewHTTPProvider(rag.HTTPProviderConfig{
-					Name:    p.Name,
-					BaseURL: p.BaseURL,
-					APIKey:  p.APIKey,
-				})
-				if err != nil {
-					log.Printf("⚠️ RAG provider %q 初始化失败: %v", p.Name, err)
-					continue
-				}
-				ragMgr.AddProvider(hp)
-				log.Printf("📚 RAG provider 已注册: %s → %s", p.Name, p.BaseURL)
-			default:
-				log.Printf("⚠️ 未知 RAG provider 类型: %s", p.Type)
-			}
-		}
-	}
-
 	return &infra{
 		agentCfg:  agentCfg,
 		registry:  registry,
@@ -247,7 +221,6 @@ func setupInfra(cfg *config.Config) *infra {
 		memDir:    memDir,
 		retryCfg:  retryCfg,
 		mcpBridge: mcpBridge,
-		ragMgr:    ragMgr,
 	}
 }
 
@@ -272,7 +245,6 @@ func runServe(cfg *config.Config, inf *infra) {
 			Registry:      inf.registry,
 			MemStore:      inf.memStore,
 			RetryConfig:   inf.retryCfg,
-			RAGManager:    inf.ragMgr,
 			ContextLength: cfg.Agent.ContextLength,
 		}
 		if cfg.Gateway.HTTP != nil {
@@ -390,9 +362,6 @@ func runCLI(cfg *config.Config, inf *infra) {
 	memMgr := memory.NewManager(inf.memStore, 10)
 	ag := agent.NewAgent(inf.agentCfg, inf.registry, memMgr)
 	ag.SetRetryConfig(inf.retryCfg)
-	if inf.ragMgr != nil {
-		ag.SetRAGManager(inf.ragMgr)
-	}
 
 	// 模型回退
 	if cfg.Agent.FallbackModel != "" {
