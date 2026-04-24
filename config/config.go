@@ -12,12 +12,12 @@ import (
 
 // Config 全局配置结构
 type Config struct {
-	Server  ServerConfig            `yaml:"server"`
-	Agent   AgentConfig             `yaml:"agent"`
-	Gateway GatewayConfig           `yaml:"gateways"`
-	Tools   ToolsConfig             `yaml:"tools"`
-	MCP     map[string]MCPServer    `yaml:"mcp_servers"`
-	Tracing TracingConfig           `yaml:"tracing"`
+	Server  ServerConfig         `yaml:"server"`
+	Agent   AgentConfig          `yaml:"agent"`
+	Gateway GatewayConfig        `yaml:"gateways"`
+	Tools   ToolsConfig          `yaml:"tools"`
+	MCP     map[string]MCPServer `yaml:"mcp_servers"`
+	Tracing TracingConfig        `yaml:"tracing"`
 }
 
 // TracingConfig OpenTelemetry 分布式追踪配置
@@ -34,28 +34,28 @@ type ServerConfig struct {
 }
 
 type AgentConfig struct {
-	Name          string   `yaml:"name"`            // Agent 名字（用于 system prompt，如 "小爪"）
-	Provider      string   `yaml:"provider"`
-	APIKey        string   `yaml:"api_key"`
-	BaseURL       string   `yaml:"base_url"`
-	Model         string   `yaml:"model"`
-	ContextLength int      `yaml:"context_length"`
-	APIKeys       []string `yaml:"api_keys"` // 多 Key 轮换
-	SimpleModel   string   `yaml:"simple_model"`
-	SimpleProvider string  `yaml:"simple_provider"`
-	SimpleBaseURL string   `yaml:"simple_base_url"`
-	FallbackModel    string `yaml:"fallback_model"`    // 主模型失败时的备用模型
-	FallbackProvider string `yaml:"fallback_provider"` // 备用模型 provider
-	FallbackBaseURL  string `yaml:"fallback_base_url"` // 备用模型 base URL
-	FallbackAPIKey   string `yaml:"fallback_api_key"`  // 备用模型 API Key（留空则复用主 Key）
-	MaxStep       int      `yaml:"max_step"`        // Agent 最大工具调用步数（默认 25）
-	ToolMaxBytes  int      `yaml:"tool_max_bytes"`  // 工具结果最大字节数（默认 30KB）
-	SystemPrompt  string   `yaml:"system_prompt"`   // 自定义 system prompt（追加到默认 prompt）
-	Temperature   *float32 `yaml:"temperature"`     // 采样温度（nil = 使用模型默认值）
-	MaxTokens     int      `yaml:"max_tokens"`      // 最大输出 token 数（0 = 使用模型默认值）
-	ReasoningEffort string `yaml:"reasoning_effort"` // 推理力度: low, medium, high（仅 o1/o3 等推理模型）
-	ToolTimeout     int    `yaml:"tool_timeout"`     // 工具执行默认超时秒数（0 = 无限制）
-	LLMTimeout      int    `yaml:"llm_timeout"`      // LLM 单次请求超时秒数（0 = 无限制，建议 120）
+	Name             string   `yaml:"name"` // Agent 名字（用于 system prompt，如 "小爪"）
+	Provider         string   `yaml:"provider"`
+	APIKey           string   `yaml:"api_key"`
+	BaseURL          string   `yaml:"base_url"`
+	Model            string   `yaml:"model"`
+	ContextLength    int      `yaml:"context_length"`
+	APIKeys          []string `yaml:"api_keys"` // 多 Key 轮换
+	SimpleModel      string   `yaml:"simple_model"`
+	SimpleProvider   string   `yaml:"simple_provider"`
+	SimpleBaseURL    string   `yaml:"simple_base_url"`
+	FallbackModel    string   `yaml:"fallback_model"`    // 主模型失败时的备用模型
+	FallbackProvider string   `yaml:"fallback_provider"` // 备用模型 provider
+	FallbackBaseURL  string   `yaml:"fallback_base_url"` // 备用模型 base URL
+	FallbackAPIKey   string   `yaml:"fallback_api_key"`  // 备用模型 API Key（留空则复用主 Key）
+	MaxStep          int      `yaml:"max_step"`          // Agent 最大工具调用步数（默认 25）
+	ToolMaxBytes     int      `yaml:"tool_max_bytes"`    // 工具结果最大字节数（默认 30KB）
+	SystemPrompt     string   `yaml:"system_prompt"`     // 自定义 system prompt（追加到默认 prompt）
+	Temperature      *float32 `yaml:"temperature"`       // 采样温度（nil = 使用模型默认值）
+	MaxTokens        int      `yaml:"max_tokens"`        // 最大输出 token 数（0 = 使用模型默认值）
+	ReasoningEffort  string   `yaml:"reasoning_effort"`  // 推理力度: low, medium, high（仅 o1/o3 等推理模型）
+	ToolTimeout      int      `yaml:"tool_timeout"`      // 工具执行默认超时秒数（0 = 无限制）
+	LLMTimeout       int      `yaml:"llm_timeout"`       // LLM 单次请求超时秒数（0 = 无限制，建议 120）
 }
 
 type GatewayConfig struct {
@@ -67,12 +67,12 @@ type GatewayConfig struct {
 
 // HTTPConfig HTTP API 网关配置
 type HTTPConfig struct {
-	APIToken       string   `yaml:"api_token"`        // 可选 Bearer Token 认证
-	CORS           []string `yaml:"cors_origins"`     // CORS 允许的域名，["*"] 为全部
-	SessionTimeout int      `yaml:"session_timeout"`  // 会话超时（分钟），默认 30
-	RequestTimeout int      `yaml:"request_timeout"`  // 请求超时（秒），默认 300
-	SessionDir     string   `yaml:"session_dir"`      // 会话持久化目录，空则不持久化
-	RateLimit      int      `yaml:"rate_limit"`       // 每分钟请求限制（0 = 不限制）
+	APIToken       string   `yaml:"api_token"`       // 可选 Bearer Token 认证
+	CORS           []string `yaml:"cors_origins"`    // CORS 允许的域名，["*"] 为全部
+	SessionTimeout int      `yaml:"session_timeout"` // 会话超时（分钟），默认 30
+	RequestTimeout int      `yaml:"request_timeout"` // 请求超时（秒），默认 300
+	SessionDir     string   `yaml:"session_dir"`     // 会话持久化目录，空则不持久化
+	RateLimit      int      `yaml:"rate_limit"`      // 每分钟请求限制（0 = 不限制）
 }
 
 type QQConfig struct {
@@ -108,11 +108,20 @@ type STTConfig struct {
 }
 
 type ToolsConfig struct {
-	Sandbox    string `yaml:"sandbox"`
-	TavilyKey  string `yaml:"tavily_key"`
-	SmitheryKey string `yaml:"smithery_key"`
-	SkillsDir  string `yaml:"skills_dir"`
-	SkillNudge int    `yaml:"skill_nudge_interval"`
+	Sandbox      string           `yaml:"sandbox"`
+	TavilyKey    string           `yaml:"tavily_key"`
+	SmitheryKey  string           `yaml:"smithery_key"`
+	SkillsDir    string           `yaml:"skills_dir"`
+	SkillNudge   int              `yaml:"skill_nudge_interval"`
+	Capabilities CapabilityConfig `yaml:"capabilities"`
+}
+
+type CapabilityConfig struct {
+	Enabled  bool   `yaml:"enabled"`
+	Endpoint string `yaml:"endpoint"`
+	APIKey   string `yaml:"api_key"`
+	Timeout  int    `yaml:"timeout"`
+	Stub     bool   `yaml:"stub"`
 }
 
 type MCPServer struct {
@@ -220,6 +229,11 @@ func applyEnvFallback(cfg *Config) {
 	envStr(&cfg.Tools.SmitheryKey, "SMITHERY_API_KEY")
 	envStr(&cfg.Tools.SkillsDir, "GOCLAW_SKILLS_DIR")
 	envInt(&cfg.Tools.SkillNudge, "GOCLAW_SKILL_NUDGE_INTERVAL")
+	envBool(&cfg.Tools.Capabilities.Enabled, "GOCLAW_CAPABILITIES_ENABLED")
+	envStr(&cfg.Tools.Capabilities.Endpoint, "GOCLAW_CAPABILITIES_ENDPOINT")
+	envStr(&cfg.Tools.Capabilities.APIKey, "GOCLAW_CAPABILITIES_API_KEY")
+	envInt(&cfg.Tools.Capabilities.Timeout, "GOCLAW_CAPABILITIES_TIMEOUT")
+	envBool(&cfg.Tools.Capabilities.Stub, "GOCLAW_CAPABILITIES_STUB")
 
 	// HTTP Gateway
 	if cfg.Gateway.HTTP == nil {
@@ -336,6 +350,16 @@ func envInt(target *int, key string) {
 	if *target == 0 {
 		if val := os.Getenv(key); val != "" {
 			if v, err := strconv.Atoi(val); err == nil {
+				*target = v
+			}
+		}
+	}
+}
+
+func envBool(target *bool, key string) {
+	if !*target {
+		if val := os.Getenv(key); val != "" {
+			if v, err := strconv.ParseBool(val); err == nil {
 				*target = v
 			}
 		}

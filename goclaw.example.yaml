@@ -76,6 +76,12 @@ tools:
   # smithery_key: ${SMITHERY_API_KEY}
   skills_dir: skills
   skill_nudge_interval: 8        # 每 N 轮检查是否需要学习新技能
+  capabilities:
+    enabled: false               # 启用后注册 invoke_capability 高层能力路由工具
+    endpoint: ""                 # POST endpoint，例如 http://127.0.0.1:8080/capabilities/invoke
+    api_key: ""                  # 可选 Bearer Token
+    timeout: 30
+    stub: true                   # 无后端时返回可观测 stub 结果
 
 # MCP Server 配置
 # mcp_servers:

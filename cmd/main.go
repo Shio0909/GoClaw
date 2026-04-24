@@ -157,6 +157,18 @@ func setupInfra(cfg *config.Config) *infra {
 	tools.InitSandbox()
 	registry := tools.NewRegistry()
 	tools.RegisterBuiltins(registry)
+	if cfg.Tools.Capabilities.Enabled {
+		capTimeout := time.Duration(cfg.Tools.Capabilities.Timeout) * time.Second
+		if capTimeout <= 0 {
+			capTimeout = 30 * time.Second
+		}
+		registry.Register(tools.NewInvokeCapabilityTool(tools.CapabilityToolConfig{
+			Endpoint: cfg.Tools.Capabilities.Endpoint,
+			APIKey:   cfg.Tools.Capabilities.APIKey,
+			Timeout:  capTimeout,
+			Stub:     cfg.Tools.Capabilities.Stub,
+		}))
+	}
 	if cfg.Agent.ToolTimeout > 0 {
 		registry.SetDefaultTimeout(time.Duration(cfg.Agent.ToolTimeout) * time.Second)
 	}
